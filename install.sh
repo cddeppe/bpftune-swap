@@ -72,7 +72,7 @@ esac
 HAVE_NGINX=0; command -v nginx >/dev/null && HAVE_NGINX=1
 HAVE_GIT=0;   command -v git   >/dev/null && HAVE_GIT=1 || warn "git not found — dashboard install needs git"
 
-REPO="${BPFTUNE_REPO:-cddeppe/bpftune}"
+REPO="${BPFTUNE_REPO:-cddeppe/bpftune-swap-swap}"
 BACKUP_DIR="${BPFTUNE_BACKUP_DIR:-/mnt/backup}"
 
 printf "\n${BOLD}=== bpftune fork installer ===${NC}\n"

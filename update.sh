@@ -63,7 +63,7 @@ case "$ARCH" in
     *) fail "Unsupported architecture: $ARCH" ;;
 esac
 
-REPO="${BPFTUNE_REPO:-cddeppe/bpftune}"
+REPO="${BPFTUNE_REPO:-cddeppe/bpftune-swap}"
 BACKUP_DIR="${BPFTUNE_BACKUP_DIR:-/mnt/backup}"
 DASH_BIN=/opt/bpftune-dashboard/bin
 SERVED=/var/lib/bpftune/history

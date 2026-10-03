@@ -37,29 +37,29 @@
         /tmp/bpftune-collector-go-$VERSION-arm64 \
         --title "v$VERSION - <short description>" \
         --notes "<longer description>" \
-        --repo cddeppe/bpftune
+        --repo cddeppe/bpftune-swap
 
     # Upload non-versioned assets (for update.sh compatibility)
     gh release upload v$VERSION \
         /tmp/bpftune-collector-go-amd64 \
         /tmp/bpftune-collector-go-arm64 \
-        --repo cddeppe/bpftune
+        --repo cddeppe/bpftune-swap
 
     # Verify 4 assets exist
-    gh release view v$VERSION --repo cddeppe/bpftune --json assets
+    gh release view v$VERSION --repo cddeppe/bpftune-swap --json assets
 
 ## Deploy to all servers
 
 On each server (5 total):
 
     # Option A: use update.sh (downloads from GitHub Releases)
-    curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune/main/update.sh | sudo bash -s -- --dashboard-only
+    curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/update.sh | sudo bash -s -- --dashboard-only
 
     # Option B: direct download
     systemctl stop bpftune-collector-go
     ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && ARCH=amd64; [ "$ARCH" = "aarch64" ] && ARCH=arm64
     curl -L -o /opt/bpftune-dashboard/bin/bpftune-collector-go \
-        https://github.com/cddeppe/bpftune/releases/download/v$VERSION/bpftune-collector-go-$VERSION-$ARCH
+        https://github.com/cddeppe/bpftune-swap/releases/download/v$VERSION/bpftune-collector-go-$VERSION-$ARCH
     chmod +x /opt/bpftune-dashboard/bin/bpftune-collector-go
     systemctl start bpftune-collector-go
     sleep 35

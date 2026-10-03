@@ -7,7 +7,7 @@ per gateway), not just single-path datacenters.
 
 ## Repo & fleet
 
-- Fork: https://github.com/cddeppe/bpftune  (active branch: `main`)
+- Fork: https://github.com/cddeppe/bpftune-swap  (active branch: `main`)
 - `diag/metric-terms` is a stale pointer (fast-forwarded into `main`).
 - Latest commit: see `git log -1` (0.4.79 tip)
 - Latest release: 0.4.87
@@ -3332,10 +3332,10 @@ every netns. `tools/bucket-leaders.py` flattens them — needs a map-ID column.
 
 Fetched on target hosts by SHA-pinned URL (branch name has a slash, so
 `raw.githubusercontent.com/<branch>/...` doesn't work):
-    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune/<SHA>/tools/bucket-leaders.py -o /usr/local/bin/bucket-leaders.py
-    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune/<SHA>/tools/swap-effectsize.py -o /usr/local/bin/swap-effectsize.py
-    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune/<SHA>/tools/swap-trend.py -o /usr/local/bin/swap-trend.py
-    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune/<SHA>/tools/swap-outcomes-bydir.py -o /usr/local/bin/swap-outcomes-bydir.py
+    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune-swap/<SHA>/tools/bucket-leaders.py -o /usr/local/bin/bucket-leaders.py
+    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune-swap/<SHA>/tools/swap-effectsize.py -o /usr/local/bin/swap-effectsize.py
+    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune-swap/<SHA>/tools/swap-trend.py -o /usr/local/bin/swap-trend.py
+    sudo curl -sSLf https://raw.githubusercontent.com/cddeppe/bpftune-swap/<SHA>/tools/swap-outcomes-bydir.py -o /usr/local/bin/swap-outcomes-bydir.py
     sudo chmod +x /usr/local/bin/bucket-leaders.py /usr/local/bin/swap-effectsize.py /usr/local/bin/swap-trend.py /usr/local/bin/swap-outcomes-bydir.py /usr/local/bin/bucket-spread.py
 
 ## Known operational issues (cumulative)

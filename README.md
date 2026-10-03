@@ -1,4 +1,4 @@
-# bpftune fork — per-destination TCP congestion control learning
+# bpftune-swap — per-destination TCP congestion control learning
 
 Custom fork of Oracle's [bpftune](https://github.com/oracle/bpftune). The original bpftune is a general-purpose BPF auto-tuner that handles TCP buffer sizing, net device budgets, route tables, and more. This fork keeps all of that and **extends the TCP connection tuner** with per-destination algorithm learning, mid-socket swapping, sustained-rate scoring, and a full web dashboard with real-time SSE updates.
 
@@ -489,7 +489,7 @@ Override lives at `/etc/systemd/system/bpftune.service.d/override.conf`, survive
 ### Quick install (fresh host)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune/main/install.sh | sudo bash -s -- --yes
+curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/install.sh | sudo bash -s -- --yes
 ```
 
 Flags: `--yes` (non-interactive), `--no-dashboard` (tuner only), `--dashboard-only` (dashboard only), `--help`.
@@ -499,7 +499,7 @@ The installer detects arch (amd64/arm64), finds `.deb` in a local backup directo
 ### Update an existing host
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune/main/update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/update.sh | sudo bash
 ```
 
 Flags: `--tuner-only`, `--dashboard-only`, `--force-downgrade` (if needed), `--help`.
@@ -526,7 +526,7 @@ Once both arch `.deb`s are in your backup directory, run the atomic release push
 On each target host:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune/main/update.sh | sudo bash -s -- --dashboard-only
+curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/update.sh | sudo bash -s -- --dashboard-only
 ```
 
 Pulls `origin/dashboard`, builds Go binary (or downloads from GitHub Releases), syncs to `/opt/bpftune-dashboard/bin/`, restarts `bpftune-collector-go`, verifies on port 8080.

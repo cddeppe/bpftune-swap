@@ -34,7 +34,7 @@ df -h /opt
 ### Interactive (recommended for first-time users)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash
 ```
 
 The installer prompts:
@@ -50,7 +50,7 @@ Answer `Y` (or press Enter for yes).
 ### Non-interactive (for automation/scripts)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash -s -- --with-dashboard
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --with-dashboard
 ```
 
 ### What it does
@@ -85,7 +85,7 @@ files. Charts will populate as data accumulates.
 ## Option B: Install bpftune only (headless)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash -s -- --no-dashboard
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --no-dashboard
 ```
 
 This installs only the bpftune kernel module. No web UI. bpftune runs
@@ -111,7 +111,7 @@ Use this if bpftune is already installed and you just want to add the
 monitoring dashboard:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash -s -- --dashboard-only
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --dashboard-only
 ```
 
 ### Verify bpftune is installed first
@@ -165,7 +165,7 @@ sudo systemctl enable --now bpftune.service
 ### Build the dashboard
 
 ```bash
-git clone https://github.com/cddeppe/bpftune.git
+git clone https://github.com/cddeppe/bpftune-swap.git
 cd bpftune/dashboard/bin/go
 
 # Build for the current architecture
