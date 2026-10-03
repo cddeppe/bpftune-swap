@@ -13,7 +13,7 @@ and historical charts.
 ### Install bpftune + dashboard (recommended)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash
 ```
 
 This installs the bpftune kernel module AND the dashboard. The installer
@@ -23,7 +23,7 @@ for non-interactive use).
 ### Install bpftune only (headless)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash -s -- --no-dashboard
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --no-dashboard
 ```
 
 bpftune runs perfectly fine without the dashboard. Use this on production
@@ -32,7 +32,7 @@ servers where you don't need local monitoring.
 ### Install dashboard only (bpftune already running)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune/main/dashboard/install.sh | bash -s -- --dashboard-only
+curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --dashboard-only
 ```
 
 ## What is bpftune?
