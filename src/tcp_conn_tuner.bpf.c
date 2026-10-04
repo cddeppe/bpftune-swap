@@ -493,6 +493,19 @@ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
                 if (ratio_q > 1024) ratio_q = 1024;
         }
 
+        /* 0.4.90: if post_swap_rate_max is 0, the rate window never
+         * populated post-swap (app-limited, idle, or short-lived socket).
+         * Scoring this as a loss (ratio_q=0) hammers scores to near-zero
+         * during cold start.  Skip — the swap has no measurable outcome.
+         * swap_target stays pending; the next vote will retry with more
+         * data.  If the socket closes, C3 will retry on close. */
+        if (statep->post_swap_rate_max == 0 && cur_alg == tgt) {
+                if (bpftune_debug)
+                        bpf_printk("swapscore cookie=%llu tgt=%u skip (no post-swap rate)",
+                                   bpf_get_socket_cookie(ops), (__u32)tgt);
+                return;
+        }
+
         /* 0.4.89 (C1 + Q3): seq-wrap the delegated swap-outcome update. */
         __sync_fetch_and_add(&rh->seq, 1);
         apply_swap_outcome(rh, tgt, ratio_q);
@@ -551,6 +564,11 @@ score_pending_rejected(struct bpf_sock_ops *ops, struct remote_host *rh,
          * current rate happens to look high; the socket leaving the
          * target is the signal, not the momentary rate. */
         ratio_q = pre ? (statep->post_swap_rate_max * SWAP_SCORE_NEUTRAL) / pre : 0;
+        /* 0.4.90: if post_swap_rate_max is 0, no measurable rate was
+         * produced before the socket was swapped away.  Treat as null
+         * (ratio_q=256) rather than loss — the swap was inconclusive. */
+        if (statep->post_swap_rate_max == 0)
+                ratio_q = SWAP_SCORE_NEUTRAL;
         /* 0.4.82: last-chance — use actual ratio if >=30s elapsed */
         if ((now - statep->last_swap_at) < LAST_CHANCE_MIN_NS)
                 if (ratio_q > 230) ratio_q = 230;
