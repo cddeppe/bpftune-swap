@@ -378,7 +378,7 @@ The original [bpftune](https://github.com/oracle/bpftune) is a general-purpose B
 
 ## Tuning & Customization
 
-`bpftune` exposes standard CLI flags plus three custom flags added by this fork. The custom flags are NOT in `bpftune --help` (help text never updated), but they work — call them directly.
+`bpftune` exposes standard CLI flags plus four custom flags added by this fork. The custom flags are now in `bpftune --help` (updated 0.4.91).
 
 ### Standard CLI flags
 
@@ -396,6 +396,7 @@ The original [bpftune](https://github.com/oracle/bpftune) is a general-purpose B
 | `-p, --port PORT` | Query TCP port (default: ephemeral) |
 | `-a, --allow NAME.so` | Allow only specific tuner(s) |
 | `-L, --legacy` | Force legacy mode |
+| `-x, --reset-state` | Delete tcp_conn_tuner state file (cold start) |
 | `-q, --query QUERY` | Query state (see below) |
 | `-V, --version` / `-h, --help` | Version / help |
 
@@ -408,6 +409,8 @@ Write to `/var/lib/bpftune/` for persistence; daemon restores on restart. Live u
 **`--prefix6=N`** (added later) — IPv6 bucket prefix width, 1-128. Default 32 (`/32`). `--prefix6=48` = group /48s (ISP allocation). `--prefix6=64` = group /64s (end-site). Persists to `/var/lib/bpftune/prefix6`. Slot 2.
 
 **`--exp` / `--exp=N`** (added 0.4.64) — Exploration %, 0-100. `--exp` prints current. `--exp=0` = deterministic (no exploration). `--exp=100` = explore every fresh socket (**default**). Persists to `/var/lib/bpftune/explore_pct`. Slot 0. BPF map pinned at `/sys/fs/bpf/bpftune/tcp_conn/explore`.
+
+**`--bpf-debug[=0|1]`** (added 0.4.91) — Toggle BPF trace output live. `--bpf-debug=0` silences all `bpf_printk` calls (saves CPU on production hosts). `--bpf-debug=1` enables verbose (default). `--bpf-debug` prints current. No daemon restart needed — BPF reads `tuner_config_map` slot 3 on every ESTABLISHED/vote. Persists to `/var/lib/bpftune/bpftune_debug`.
 
 ### Querying state
 
