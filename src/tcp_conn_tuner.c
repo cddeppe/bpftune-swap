@@ -122,6 +122,7 @@ static void stop_reanchor(void);
 #define EXPLORE_STATE    "/var/lib/bpftune/explore_pct"
 #define PREFIX4_STATE    "/var/lib/bpftune/prefix4"
 #define PREFIX6_STATE    "/var/lib/bpftune/prefix6"
+#define DEBUG_STATE      "/var/lib/bpftune/bpftune_debug"
 #define ALIAS_PIN_PATH   EXPLORE_PIN_DIR "/aliases"
 #define ALIAS_FILE       "/etc/bpftune/aliases"
 #define LABELS_FILE      "/var/lib/bpftune/aliases.labels.json"
@@ -206,6 +207,26 @@ static int pin_explore_map(struct bpftuner *tuner)
                         bpftune_log(BPFTUNE_LOG_LEVEL,
                                     "prefix6: pinned at %s, pfx6=%u\n",
                                     EXPLORE_PIN_PATH, pfx6);
+        }
+        /* 0.4.91: slot 3 = bpf_debug (0=quiet, 1=verbose). */
+        {
+                __u32 dbg = 1;
+                FILE *df = fopen(DEBUG_STATE, "r");
+                if (df) {
+                        unsigned int v;
+                        if (fscanf(df, "%u", &v) == 1 && v <= 1)
+                                dbg = v;
+                        fclose(df);
+                }
+                key = 3;
+                if (bpf_map_update_elem(fd, &key, &dbg, BPF_ANY))
+                        bpftune_log(LOG_ERR,
+                                    "bpf-debug: init failed: %s\n",
+                                    strerror(errno));
+                else
+                        bpftune_log(BPFTUNE_LOG_LEVEL,
+                                    "bpf-debug: pinned at %s, debug=%u\n",
+                                    EXPLORE_PIN_PATH, dbg);
         }
         bpftune_log(BPFTUNE_LOG_LEVEL,
                     "explore: pinned at %s, pct=%u\n", EXPLORE_PIN_PATH, pct);

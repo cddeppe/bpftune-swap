@@ -1,3 +1,14 @@
+bpftune (0.4.91) unstable; urgency=medium
+
+  * Feature: add --bpf-debug CLI flag to toggle BPF trace output live.
+    bpftune_debug moved from BPF global to tuner_config_map slot 3.
+    'bpftune --bpf-debug=0' silences all bpf_printk calls.
+    'bpftune --bpf-debug=1' enables (default).
+    'bpftune --bpf-debug' prints current setting.
+    Value persists across restarts via /var/lib/bpftune/bpftune_debug.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Sat, 04 Oct 2026 18:00:00 +0200
+
 bpftune (0.4.90) unstable; urgency=medium
 
   * Fix: cold-start score hammering.  score_pending_swap and

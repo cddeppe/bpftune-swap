@@ -268,6 +268,10 @@ void do_help(void)
 		"		     { -s|--stderr}\n"
 		"		     { -S|--suppport}\n"
 		"		     { -V|--version}}\n",
+                "                    { --explore[=N]}\n"
+                "                    { --prefix4[=N]}\n"
+                "                    { --prefix6[=N]}\n"
+                "                    { --bpf-debug[=0|1]}\n",
 		bin_name);
 }
 
@@ -309,6 +313,7 @@ void print_support_level(enum bpftune_support_level support_level)
 #define EXPLORE_STATE    "/var/lib/bpftune/explore_pct"
 #define PREFIX4_STATE    "/var/lib/bpftune/prefix4"
 #define PREFIX6_STATE    "/var/lib/bpftune/prefix6"
+#define DEBUG_STATE      "/var/lib/bpftune/bpftune_debug"
 #define EXPLORE_PCT_MAX  100
 
 /* 0.4.64: 'bpftune --exp[=N]'.  Reads or updates the pinned
@@ -492,6 +497,60 @@ static int do_prefix4(const char *arg)
         return 0;
 }
 
+/* 0.4.91: 'bpftune --bpf-debug[=N]'.  Slot 3 of tuner_config_map. */
+static int do_bpf_debug(const char *arg)
+{
+	__u32 key = 3, val;
+	int fd;
+
+	fd = bpf_obj_get(EXPLORE_PIN_PATH);
+	if (fd < 0) {
+		fprintf(stderr, "bpftune: no pinned map at %s\n", EXPLORE_PIN_PATH);
+		return 1;
+	}
+	if (bpf_map_lookup_elem(fd, &key, &val)) {
+		fprintf(stderr, "bpftune: read failed: %s\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+	if (!arg) {
+		printf("bpf-debug: %u (%s)\n", val, val ? "verbose" : "quiet");
+		close(fd);
+		return 0;
+	}
+	{
+		char *end = NULL;
+		long v = strtol(arg, &end, 10);
+		__u32 old = val, nv;
+
+		if (end == arg || *end != '\0' || v < 0 || v > 1) {
+			fprintf(stderr, "bpftune: bpf-debug must be 0 or 1\n");
+			close(fd);
+			return 1;
+		}
+		nv = (__u32)v;
+		if (bpf_map_update_elem(fd, &key, &nv, BPF_ANY)) {
+			fprintf(stderr, "bpftune: update failed: %s\n", strerror(errno));
+			close(fd);
+			return 1;
+		}
+		{
+			FILE *f = fopen(DEBUG_STATE ".tmp", "w");
+			if (f) {
+				fprintf(f, "%u\n", nv);
+				fclose(f);
+				rename(DEBUG_STATE ".tmp", DEBUG_STATE);
+			}
+		}
+		if (old == nv)
+			printf("bpf-debug: %u (%s)\n", nv, nv ? "verbose" : "quiet");
+		else
+			printf("bpf-debug: %u -> %u (%s)\n", old, nv, nv ? "verbose" : "quiet");
+	}
+	close(fd);
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	static const struct option options[] = {
@@ -514,6 +573,7 @@ int main(int argc, char *argv[])
             { "explore",    optional_argument,   NULL,   'e' },
 		{ "prefix4",    optional_argument,   NULL,  1000 },
 		{ "prefix6",    optional_argument,   NULL,  1001 },
+		{ "bpf-debug",  optional_argument,   NULL, 1002 },
 		{ 0 }
 	};
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
@@ -529,8 +589,12 @@ int main(int argc, char *argv[])
 	const char *explore_arg = NULL;
 	int prefix4_seen = 0;
 	int prefix6_seen = 0;
+
+	int bpf_debug_seen = 0;
 	const char *prefix4_arg = NULL;
 	const char *prefix6_arg = NULL;
+
+	const char *bpf_debug_arg = NULL;
 	bool explore_seen = false;
 	int interval = 100;
 	unsigned short port = 0;
@@ -607,6 +671,11 @@ int main(int argc, char *argv[])
                         prefix6_seen = 1;
                         prefix6_arg = optarg;
                         break;
+
+                case 1002:
+                        bpf_debug_seen = 1;
+                        bpf_debug_arg = optarg;
+                        break;
                 case 'e':
                         explore_seen = true;
                         explore_arg = optarg;
@@ -628,12 +697,15 @@ int main(int argc, char *argv[])
 	/* 0.4.87: run all matched flags in order, not just the first.
 	 * Previously 'bpftune --prefix4=16 --prefix6=32' silently
 	 * ignored --prefix6 because do_prefix4 returned early. */
-	if (prefix4_seen || prefix6_seen || explore_seen) {
+	if (prefix4_seen || prefix6_seen || explore_seen || bpf_debug_seen) {
 		int rc = 0;
 		if (prefix4_seen)
 			rc = do_prefix4(prefix4_arg);
 		if (!rc && prefix6_seen)
 			rc = do_prefix6(prefix6_arg);
+		if (!rc && bpf_debug_seen)
+			rc = do_bpf_debug(bpf_debug_arg);
+
 		if (!rc && explore_seen)
 			rc = do_explore(explore_arg);
 		return rc;

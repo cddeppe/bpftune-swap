@@ -28,11 +28,13 @@ __u64 tcp_cong_choices[NUM_TCP_CONG_ALGS];
 
 long long tcp_thin_lto = 0;
 
-/* 0.4.89 (Q5): debug toggle.  Default 1 (verbose, matching pre-0.4.89
- * behavior).  Set to 0 via 'bpftune --quiet' to silence bpf_printk
- * calls in the vote path.  Read on every vote; the cost is one map
- * lookup, which is negligible compared to the printk itself. */
-__u64 bpftune_debug = 1;
+/* 0.4.91: debug toggle.  Stored in tuner_config_map slot 3 (not a
+ * BPF global) so the CLI can update it live via 'bpftune --bpf-debug=N'
+ * without restarting the daemon.  BPF reads it from the map on every
+ * ESTABLISHED and vote, and updates this local variable.  Default 1
+ * (verbose, matching pre-0.4.89 behavior).  Set to 0 to silence all
+ * bpf_printk calls. */
+__u32 bpftune_debug = 1;
 
 BPF_MAP_DEF(remote_host_map, BPF_MAP_TYPE_LRU_HASH, struct in6_addr, struct remote_host, 4096, 0);
 
@@ -40,12 +42,12 @@ BPF_MAP_DEF(sk_storage_map, BPF_MAP_TYPE_SK_STORAGE, int, struct conn_state, 0, 
 
 BPF_MAP_DEF(midsamp_map, BPF_MAP_TYPE_SK_STORAGE, int, __u64, 0, BPF_F_NO_PREALLOC);
 
-/* 0.4.64: runtime config map.  Currently a single __u32 at key 0:
- * exploration percent for fresh sockets.  Pinned by the userspace
- * daemon so 'bpftune --exp=N' can update it live. */
-/* slot 0 = exp_pct, slot 1 = v4 bucket prefix (1-32),
- * slot 2 = reserved. */
-BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 3, 0);
+/* 0.4.64: runtime config map.  Pinned by the userspace daemon so
+ * 'bpftune --exp=N', --prefix4=N, --prefix6=N, --bpf-debug=N can
+ * update values live without restarting.
+ * slot 0 = exp_pct, slot 1 = prefix4, slot 2 = prefix6,
+ * slot 3 = bpf_debug (0=quiet, 1=verbose). */
+BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 4, 0);
 
 /* 0.4.79: alias table.  Key is the raw destination as it arrives
  * from the socket (v4-mapped or v6/32 top bits); value is the
@@ -294,6 +296,13 @@ SEC("sockops")
 int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 {
     int cb_flags = BPF_SOCK_OPS_STATE_CB_FLAG|BPF_SOCK_OPS_RETRANS_CB_FLAG|BPF_SOCK_OPS_RTT_CB_FLAG;
+    /* 0.4.91: read debug flag from tuner_config_map slot 3 so the
+     * CLI can toggle it live via 'bpftune --bpf-debug=0'. */
+    {
+        __u32 dk = 3;
+        __u32 *dv = bpf_map_lookup_elem(&tuner_config_map, &dk);
+        if (dv) bpftune_debug = *dv;
+    }
     struct remote_host *remote_host;
     struct in6_addr raddr = {};
     struct in6_addr *key = &raddr;
@@ -606,6 +615,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     __u64 now;
     bool allow_ref = false;
     __u64 tc_progress = 0;
+
+    /* 0.4.91: read debug flag from tuner_config_map slot 3 so the
+     * CLI can toggle it live via 'bpftune --bpf-debug=0'. */
+    {
+        __u32 dk = 3;
+        __u32 *dv = bpf_map_lookup_elem(&tuner_config_map, &dk);
+        if (dv) bpftune_debug = *dv;
+    }
 
     switch (ops->op) {
     case BPF_SOCK_OPS_RTT_CB: {
