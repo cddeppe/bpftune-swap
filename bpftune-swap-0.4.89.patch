@@ -1,0 +1,2895 @@
+diff --git a/debian/changelog b/debian/changelog
+index 6edb3c8..d829312 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,82 @@
++bpftune (0.4.89) unstable; urgency=medium
++
++  * Fix: reanchor-vs-BPF race via sequence counter (C1).  Added __u64 seq
++    to struct remote_host; BPF wraps every in-place update with
++    __sync_fetch_and_add(&rh->seq, 1).  Userspace reanchor_best and
++    apply_truth_corrections retry read-modify-write if seq changed.
++    Caps at 4 retries per bucket, logs and skips on persistent flux.
++    Without this, the read-modify-write of the 792-byte struct clobbered
++    any BPF vote that landed between lookup and update.
++  * Fix: reset rate_win_ts_ns and rate_win_bytes on swap (C2).  The
++    first sustained_bps measurement after a swap straddled the swap
++    point -- mixing pre-swap and post-swap bytes -- and could inflate
++    post_swap_rate_max if the pre-swap alg was carrying a higher rate.
++  * Fix: score pending swap on socket close if >=30s elapsed (C3).  A
++    socket that swapped then closed before its next segment-rung vote
++    was never scored; the pending swap_target stayed unscored.  Uses
++    the LAST_CHANCE_MIN_NS (30s) gate matching score_pending_rejected.
++  * Fix: replace TRUTH_MAX_BUCKETS=256 fixed array with 4096-slot
++    open-addressing hash table (C4).  Old code silently dropped
++    corrections for buckets past 256 -- a real cap on busy multi-CDN
++    hosts.  Also fixes the O(n²) linear scan-per-line.
++  * Fix: fsync before rename in save_remote_host_map (C5).  A crash
++    between rename and the actual disk flush could leave STATE_PATH
++    with a zero-length or partially-written file.  Also fsync the
++    parent directory so the rename itself is durable.
++  * Fix: atomic increments for tcp_cong_choices and tcp_thin_lto_choices
++    (C6).  Plain ++ raced across CPUs and undercounted.  Same
++    __sync_fetch_and_add pattern already used for instances.
++  * Fix: remove swap_score=0 reset to neutral in reanchor (M1).  The
++    reset defeated loss-driven demotion: score_pending_swap legitimately
++    drives swap_score to 0 after enough losses, and reanchor was
++    resetting it to 256 every 30s.  Bad_streak penalty still applies.
++  * Fix: drop unused cur_rate parameter from score_pending_rejected (M2).
++    The function uses post_swap_rate_max (running peak), not a momentary
++    rate.  Call sites updated.
++  * Fix: widen sockets_alive/good/proved from __u16 to __u32 (M6).
++    High-churn CDN buckets hit 65k sockets per alg in days, at which
++    point __u16 wraps to 0 and the guarded decrement pins it there
++    forever.  STATE_LAYOUT bumped 1 -> 2; old state files refuse to
++    load (caught by the size check).  Map rebuilds from zero on first
++    boot after upgrade.
++  * Fix: special-case first sample after poisoned ~0 sentinel (Q4).
++    The EMA formula happened to produce the right answer when __div=1,
++    but with __div>1 it produced a still-huge value that passed the
++    v != ~0 filter and entered the best_v tracker as a poisoned value.
++  * Refactor: extract apply_swap_outcome() helper (Q3).  score_pending_swap
++    and score_pending_rejected shared ~50 lines of score/streak update
++    logic; now both delegate to a shared __always_inline helper.
++  * Refactor: factor rate-EMA->B/s and socket-vs-leader ratio magic
++    into socket_under_pct_of_leader() helper (Q2).  Replaces
++    `last_rate_bps * 150 < rate_best_v * 100000ULL * 100` with named,
++    unit-correct math.
++  * Refactor: remove migrate_remote_host + STATE_EPOCH (Q1).  The
++    epoch mechanism was a no-op body that served only as a footgun
++    for the next maintainer who bumped STATE_EPOCH expecting migration
++    to run.  Future semantic changes bump STATE_LAYOUT (wiping the
++    map and rebuilding from zero).
++  * Refactor: remove dead tcp_iter_fd variable (Q6).
++  * Fix: escape JSON special chars in alias labels (M7).  A label
++    containing " or \ would produce malformed JSON and break the
++    dashboard's parser.
++  * Fix: check bpftuner_cgroup_attach return in retry loop (M8).  Was
++    silently ignored; failures now logged.  Also log when popen(bpftool)
++    fails so a missing binary is visible.
++  * Fix: document the 30s vs 180s threshold asymmetry (M3).  The 30s
++    gate in score_pending_rejected (last-chance for preempted swaps)
++    vs 180s in score_pending_swap (settling for completed swaps) is
++    intentional.
++  * Fix: bounds math comment for reanchor pass-3 weighted product (M5).
++  * Fix: use getline() instead of fixed 512-byte buf in truth parser (M4).
++    Truth lines can exceed 512 chars with labels and timestamps.
++  * Feature: bpftune_debug BPF variable (Q5).  Defaults to 1 (verbose,
++    matching pre-0.4.89 behavior).  All bpf_printk calls in the vote
++    path are now gated behind `if (bpftune_debug)`.  Set to 0 via
++    `bpftune --quiet` (or by writing the BPF global directly) to
++    silence kernel log noise on production hosts.
++
++ -- Christophe Deppe <cdeppe@gmail.com>  Sat, 04 Oct 2026 02:00:00 +0200
++
+ bpftune (0.4.88) unstable; urgency=medium
+ 
+   * Fix: re-enable swap_score write in score_pending_rejected (Bug T1).
+diff --git a/src/tcp_conn_tuner.bpf.c b/src/tcp_conn_tuner.bpf.c
+index cfd0e4f..b996b8e 100644
+--- a/src/tcp_conn_tuner.bpf.c
++++ b/src/tcp_conn_tuner.bpf.c
+@@ -22,12 +22,18 @@
+ _Static_assert(sizeof(struct remote_host) <= 1024,
+                "remote_host too large for BPF memset");
+ 
+-#define TCP_THIN_LINEAR_TIMEOUTS	16
++#define TCP_THIN_LINEAR_TIMEOUTS        16
+ 
+ __u64 tcp_cong_choices[NUM_TCP_CONG_ALGS];
+ 
+ long long tcp_thin_lto = 0;
+ 
++/* 0.4.89 (Q5): debug toggle.  Default 1 (verbose, matching pre-0.4.89
++ * behavior).  Set to 0 via 'bpftune --quiet' to silence bpf_printk
++ * calls in the vote path.  Read on every vote; the cost is one map
++ * lookup, which is negligible compared to the printk itself. */
++__u64 bpftune_debug = 1;
++
+ BPF_MAP_DEF(remote_host_map, BPF_MAP_TYPE_LRU_HASH, struct in6_addr, struct remote_host, 4096, 0);
+ 
+ BPF_MAP_DEF(sk_storage_map, BPF_MAP_TYPE_SK_STORAGE, int, struct conn_state, 0, BPF_F_NO_PREALLOC);
+@@ -54,39 +60,44 @@ BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
+  * makes struct remote_host 792 bytes, exceeding the 512-byte stack limit).
+  */
+ BPF_MAP_DEF(remote_host_scratch, BPF_MAP_TYPE_PERCPU_ARRAY, __u32,
+-	    struct remote_host, 1, 0);
++            struct remote_host, 1, 0);
+ 
+ /* if we have not looked up the host >= REMOTE_HOST_MIN_INSTANCES, return NULL.
+  * This ensures we only apply RL to hosts with which we have multiple
+  * interactions.
+  */
+ static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
+-							   bool initial)
++                                                           bool initial)
+ {
+-	__u32 zero = 0;
+-	struct remote_host *remote_host;
+-	struct remote_host *scratch;
+-
+-	remote_host = bpf_map_lookup_elem(&remote_host_map, key);
+-	if (remote_host) {
+-		if (initial)
+-			__sync_fetch_and_add(&remote_host->instances, 1);
+-	} else {
+-		/* Use per-CPU scratch to avoid a >512B stack temporary.
+-		 * bpf_map_update_elem copies sizeof(*scratch) bytes from
+-		 * the kernel-memory scratch buffer into the hash map.
+-		 */
+-		scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
+-		if (!scratch)
+-			return NULL;
+-		__builtin_memset(scratch, 0, sizeof(*scratch));
+-		scratch->instances = 1;
+-		bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
+-		return NULL;
+-	}
+-	if (remote_host->instances < REMOTE_HOST_MIN_INSTANCES)
+-		return NULL;
+-	return remote_host;
++        __u32 zero = 0;
++        struct remote_host *remote_host;
++        struct remote_host *scratch;
++
++        remote_host = bpf_map_lookup_elem(&remote_host_map, key);
++        if (remote_host) {
++                if (initial) {
++                        /* 0.4.89 (C1): seq-wrap the instances++ so
++                         * reanchor's read-modify-write sees the change. */
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                        __sync_fetch_and_add(&remote_host->instances, 1);
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                }
++        } else {
++                /* Use per-CPU scratch to avoid a >512B stack temporary.
++                 * bpf_map_update_elem copies sizeof(*scratch) bytes from
++                 * the kernel-memory scratch buffer into the hash map.
++                 */
++                scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
++                if (!scratch)
++                        return NULL;
++                __builtin_memset(scratch, 0, sizeof(*scratch));
++                scratch->instances = 1;
++                bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
++                return NULL;
++        }
++        if (remote_host->instances < REMOTE_HOST_MIN_INSTANCES)
++                return NULL;
++        return remote_host;
+ }
+ 
+ /* 0.4.64: explore with probability pct% (0=never, 100=always).
+@@ -95,12 +106,12 @@ static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
+ static __always_inline int
+ epsilon_greedy_pct(__u32 greedy_state, __u32 num_states, __u32 pct)
+ {
+-	__u32 r = bpf_get_prandom_u32();
++        __u32 r = bpf_get_prandom_u32();
+ 
+     if (pct < 100 && (r % 100) >= pct)
+-		return greedy_state;
+-	r = bpf_get_prandom_u32();
+-	return r % num_states;
++                return greedy_state;
++        r = bpf_get_prandom_u32();
++        return r % num_states;
+ }
+ 
+ /* 0.4.66: number of votes a freshly-assigned socket is protected
+@@ -117,16 +128,16 @@ epsilon_greedy_pct(__u32 greedy_state, __u32 num_states, __u32 pct)
+  * applies consistently to all sockets immediately. */
+ static __always_inline __u32 explore_protect_votes(void)
+ {
+-	__u32 zero = 0;
+-	__u32 pct = EXPLORE_PCT_DEFAULT;
+-	__u32 *p = bpf_map_lookup_elem(&tuner_config_map, &zero);
+-	if (p)
+-		pct = *p;
+-	if (pct > EXPLORE_PCT_MAX)
+-		pct = EXPLORE_PCT_MAX;
+-	if (pct >= 100)
+-		return 0;
+-	return (EXPLORE_PROTECT_VOTES * (100 - pct)) / 95;
++        __u32 zero = 0;
++        __u32 pct = EXPLORE_PCT_DEFAULT;
++        __u32 *p = bpf_map_lookup_elem(&tuner_config_map, &zero);
++        if (p)
++                pct = *p;
++        if (pct > EXPLORE_PCT_MAX)
++                pct = EXPLORE_PCT_MAX;
++        if (pct >= 100)
++                return 0;
++        return (EXPLORE_PROTECT_VOTES * (100 - pct)) / 95;
+ }
+ 
+ /* 0.4.79: v4 bucket prefix, read live from tuner_config_map[1].
+@@ -218,48 +229,53 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
+                                     struct remote_host *remote_host,
+                                     __u8 i)
+ {
+-	int ret;
+-
+-	ret = bpf_setsockopt(ops, SOL_TCP, TCP_CONGESTION, (void *)congs[i],
+-	                     sizeof(congs[i]));
+-	if (ret)
+-		return ret;
+-	tcp_cong_choices[i & (NUM_TCP_CONG_ALGS - 1)]++;
+-	/* update state */
+-	struct bpf_sock *sk = ops->sk;
+-	struct conn_state *statep;
+-
+-	if (!sk)
+-		return 0;
+-	statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
+-	                            BPF_SK_STORAGE_GET_F_CREATE);
+-	if (statep) {
+-		/* 0.4.86: init swap_target to 0xff on fresh storage.
+-		 * Fresh sk_storage is zeroed, so swap_target == 0 (cubic).
+-		 * score_pending_swap checks for 0xff, so it did not early-return
+-		 * on fresh sockets.  Every fresh socket triggered score_pending_swap
+-		 * with tgt=0 (cubic), and if cur_alg != 0, ratio_q was forced to 0
+-		 * (catastrophic loss for cubic).  This is why cubic was
+-		 * disproportionately punished. */
+-		if (statep->last_swap_at == 0) {
+-			statep->swap_target = 0xff;
+-		}
+-		/* 0.4.44: count socket against alg on first contact. */
+-		__u8 idx = i & (NUM_TCP_CONG_ALGS - 1);
+-		__u64 bit = 1ULL << idx;
+-		if (remote_host && !(statep->touched_bitmap & bit)) {
+-			statep->touched_bitmap |= bit;
+-			remote_host->metrics[idx].sockets_alive++;
+-			/* 0.4.62: initialize swap_score to neutral the first time
+-			 * this algorithm runs on this bucket.  Makes the map
+-			 * self-describing -- 0 never appears for an untested alg,
+-			 * so picker and dashboard both trust the raw field. */
+-			if (remote_host->metrics[idx].swap_score == 0)
+-				remote_host->metrics[idx].swap_score =
+-					SWAP_SCORE_NEUTRAL;
+-		}
+-		statep->state = (__u64)i;
+-		statep->bad_checkpoints = 0;
++        int ret;
++
++        ret = bpf_setsockopt(ops, SOL_TCP, TCP_CONGESTION, (void *)congs[i],
++                             sizeof(congs[i]));
++        if (ret)
++                return ret;
++        /* 0.4.89 (C6): atomic increment; was plain `++` which races
++         * across CPUs and undercounts. */
++        __sync_fetch_and_add(&tcp_cong_choices[i & (NUM_TCP_CONG_ALGS - 1)], 1);
++        /* update state */
++        struct bpf_sock *sk = ops->sk;
++        struct conn_state *statep;
++
++        if (!sk)
++                return 0;
++        statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
++                                    BPF_SK_STORAGE_GET_F_CREATE);
++        if (statep) {
++                /* 0.4.86: init swap_target to 0xff on fresh storage.
++                 * Fresh sk_storage is zeroed, so swap_target == 0 (cubic).
++                 * score_pending_swap checks for 0xff, so it did not early-return
++                 * on fresh sockets.  Every fresh socket triggered score_pending_swap
++                 * with tgt=0 (cubic), and if cur_alg != 0, ratio_q was forced to 0
++                 * (catastrophic loss for cubic).  This is why cubic was
++                 * disproportionately punished. */
++                if (statep->last_swap_at == 0) {
++                        statep->swap_target = 0xff;
++                }
++                /* 0.4.44: count socket against alg on first contact. */
++                __u8 idx = i & (NUM_TCP_CONG_ALGS - 1);
++                __u64 bit = 1ULL << idx;
++                if (remote_host && !(statep->touched_bitmap & bit)) {
++                        statep->touched_bitmap |= bit;
++                        /* 0.4.89 (C1): seq-wrap the proof-counter bump. */
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                        remote_host->metrics[idx].sockets_alive++;
++                        /* 0.4.62: initialize swap_score to neutral the first time
++                         * this algorithm runs on this bucket.  Makes the map
++                         * self-describing -- 0 never appears for an untested alg,
++                         * so picker and dashboard both trust the raw field. */
++                        if (remote_host->metrics[idx].swap_score == 0)
++                                remote_host->metrics[idx].swap_score =
++                                        SWAP_SCORE_NEUTRAL;
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                }
++                statep->state = (__u64)i;
++                statep->bad_checkpoints = 0;
+                 /* 0.4.54: exploration pick = neither leader. */
+                 if (remote_host &&
+                     (__u64)i != (remote_host->best_i & (NUM_TCP_CONG_ALGS - 1)) &&
+@@ -268,8 +284,8 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
+                 else
+                         statep->exploring = 0;
+                 statep->votes_on_alg = 0;
+-	}
+-	return 0;
++        }
++        return 0;
+ }
+ 
+ __u64 tcp_thin_lto_choices;
+@@ -297,7 +313,8 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
+                 int one = 1;
+                 if (!bpf_setsockopt(ops, SOL_TCP, TCP_THIN_LINEAR_TIMEOUTS,
+                                     &one, sizeof(one)))
+-                    tcp_thin_lto_choices++;
++                    /* 0.4.89 (C6): atomic increment; was plain `++`. */
++                    __sync_fetch_and_add(&tcp_thin_lto_choices, 1);
+             }
+         }
+         return 1;
+@@ -344,10 +361,14 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
+ 
+         if (remote_host->selection_count < 2 * NUM_TCP_CONN_METRICS) {
+             __u8 forced = remote_host->selection_count & (NUM_TCP_CONN_METRICS - 1);
++            /* 0.4.89 (C1): seq-wrap selection_count++. */
++            __sync_fetch_and_add(&remote_host->seq, 1);
+             remote_host->selection_count++;
++            __sync_fetch_and_add(&remote_host->seq, 1);
+             if (set_cong(ops, remote_host, forced)) {
+                 remote_host->metrics[forced].metric_value = ~((__u64)0);
+             } else {
++                if (bpftune_debug)
+                 bpf_printk("estab cookie=%llu alg=%u forced=1 dest=%u dest6=%u dest6b=%u",
+                            bpf_get_socket_cookie(ops), (__u32)forced,
+                            (__u32)bpf_ntohl(ops->remote_ip4),
+@@ -385,8 +406,11 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
+              * pair.  No new variables — the loop already found minindex
+              * and metric_min; we just persist them. */
+             if (remote_host->metrics[minindex].metric_count > 0) {
++                /* 0.4.89 (C1): seq-wrap the tracker update. */
++                __sync_fetch_and_add(&remote_host->seq, 1);
+                 remote_host->best_i = minindex;
+                 remote_host->best_v = metric_min;
++                __sync_fetch_and_add(&remote_host->seq, 1);
+             }
+             {
+                 __u32 zero = 0;
+@@ -408,6 +432,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
+             if (set_cong(ops, remote_host, s)) {
+                 remote_host->metrics[s].metric_value = ~((__u64)0);
+             } else {
++                if (bpftune_debug)
+                 bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
+                            bpf_get_socket_cookie(ops), (__u32)s,
+                            (__u32)bpf_ntohl(ops->remote_ip4),
+@@ -420,7 +445,15 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
+ 
+ /* 0.4.56: score the pending swap once >=60s have elapsed.  Cur rate
+  * vs the captured pre-swap rate sets target alg's swap_score; 256 is
+- * neutral.  Called from the vote path. */
++ * neutral.  Called from the vote path.
++ *
++ * 0.4.89: also called from the close path if elapsed >= 30s (C3).
++ * Closes the gap where a socket swapped then closed before its next
++ * segment-rung vote -- the pending swap was never scored.
++ *
++ * 0.4.89 (Q3): the score/streak update logic is now in
++ * apply_swap_outcome() in the header; this function computes ratio_q
++ * per its gating rules and delegates. */
+ static __always_inline void
+ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
+                    struct conn_state *statep, __u64 now,
+@@ -460,78 +493,15 @@ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
+                 if (ratio_q > 1024) ratio_q = 1024;
+         }
+ 
+-        /* read-modify-write u16 field via pointer cast */
+-        {
+-                __u16 cur16 = rh->metrics[tgt].swap_score;
+-                __u32 cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
+-                /* 0.4.60: asymmetric scoring.  Wins move by 1/16
+-                 * (unchanged).  Nulls pull toward neutral 256 by
+-                 * 1/4 so a high score cannot coast through
+-                 * inactivity.  Losses pull toward the observed
+-                 * ratio by 1/2 -- bigger misses drop the score more.
+-                 * No signed division; take the unsigned difference,
+-                 * then add or subtract based on which is larger. */
+-                if (ratio_q >= 282) {
+-                        if (ratio_q >= cur32) {
+-                                __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_STEP_DIV;
+-                                cur32 += step;
+-                        } else {
+-                                __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_STEP_DIV;
+-                                cur32 = (drop > cur32) ? 0 : cur32 - drop;
+-                        }
+-                } else if (ratio_q > 230) {
+-                        /* 0.4.74: null is a no-op.  The streak
+-                         * counters (bad_streak / null_streak,
+-                         * incremented below) are the fast recency
+-                         * demotion in pass 3.  Having the score ALSO
+-                         * decay toward neutral on nulls double-counted
+-                         * the punishment, and the /2 loss weight was
+-                         * already pulling every population-average
+-                         * target to ~188. */
+-                } else {
+-                        if (ratio_q >= cur32) {
+-                                __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_LOSS_DIV;
+-                                cur32 += step;
+-                        } else {
+-                                __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_LOSS_DIV;
+-                                cur32 = (drop > cur32) ? 0 : cur32 - drop;
+-                        }
+-                }
+-                if (cur32 > 1024) cur32 = 1024;
+-                /* 0.4.84: re-enabled in-kernel score write.  The
+-                 * collector's streak_writeback was supposed to own
+-                 * this but only patches bad_streak/null_streak, not
+-                 * swap_score.  On hosts where pre_swap_rate=0
+-                 * (app-limited), swap_score stayed at 256 forever. */
+-                rh->metrics[tgt].swap_score = (__u16)cur32;
+-        }
+-        /* 0.4.58: consecutive failed swaps to this alg.  Two in a
+-         * row is a pattern; a later rising rate_ema clears it in the
+-         * vote path.  Win/null clears; loss increments. */
+-        /* 0.4.59: ratio_q = post/pre * 256.  Three outcomes:
+-         *   <= 230   loss  (ratio <= 0.9)   -> bad_streak++
+-         *   >= 282   win   (ratio >= 1.1)   -> both = 0
+-         *   between  null  (no change)      -> null_streak++
+-         * A null isn't proof of failure but it isn't a win either --
+-         * three in a row and the target gets excluded. */
+-        /* 0.4.82: re-enabled in-kernel streak updates. Truth file owns
+-         * swap_score but was NOT updating streaks (all values were 0).
+-         * Penalty multiplier 16/(16+bad*4+null*2) was always 1.0. */
+-        if (ratio_q >= 282) {
+-                rh->metrics[tgt].bad_streak = 0;
+-                rh->metrics[tgt].null_streak = 0;
+-        } else if (ratio_q <= 230) {
+-                if (rh->metrics[tgt].bad_streak < 255)
+-                        rh->metrics[tgt].bad_streak++;
+-                rh->metrics[tgt].null_streak = 0;
+-        } else {
+-                if (rh->metrics[tgt].null_streak < 255)
+-                        rh->metrics[tgt].null_streak++;
+-        }
+-        bpf_printk("swapscore cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
+-                   bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
+-                   (__u32)rh->metrics[tgt].bad_streak,
+-                   (__u32)rh->metrics[tgt].null_streak);
++        /* 0.4.89 (C1 + Q3): seq-wrap the delegated swap-outcome update. */
++        __sync_fetch_and_add(&rh->seq, 1);
++        apply_swap_outcome(rh, tgt, ratio_q);
++        __sync_fetch_and_add(&rh->seq, 1);
++        if (bpftune_debug)
++                bpf_printk("swapscore cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
++                           bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
++                           (__u32)rh->metrics[tgt].bad_streak,
++                           (__u32)rh->metrics[tgt].null_streak);
+         statep->swap_target = 0xff;
+         statep->pre_swap_rate = 0;
+ }
+@@ -545,15 +515,31 @@ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
+  *
+  * The caller always overwrites statep->swap_target and pre_swap_rate
+  * with the new pending values right after this call, so no clearing
+- * is done here. */
++ * is done here.
++ *
++ * 0.4.89 (M2): dropped the unused cur_rate parameter; the function
++ * uses post_swap_rate_max (the peak across the post-swap window),
++ * not a momentary rate.
++ *
++ * 0.4.89 (Q3): score/streak update delegated to apply_swap_outcome.
++ * Note: score_pending_rejected caps ratio_q at 230 if <30s elapsed
++ * (the "last chance" gate), so the win path in apply_swap_outcome
++ * (ratio_q >= 282) only fires if >=30s elapsed AND the socket
++ * happened to deliver >110% of pre-swap -- rare for a rejected swap
++ * but possible.
++ *
++ * 0.4.89 (M3): the 30s threshold here vs 180s in score_pending_swap
++ * is intentional.  score_pending_swap scores a COMPLETED swap
++ * (socket stayed on the target); 180s lets slow-start settle.
++ * score_pending_rejected scores a PREEMPTED swap (socket left the
++ * target); 30s is the "last chance" -- if at least 30s of post-swap
++ * data exists, use the actual ratio; otherwise force loss-class. */
+ static __always_inline void
+ score_pending_rejected(struct bpf_sock_ops *ops, struct remote_host *rh,
+-                       struct conn_state *statep, __u64 now, __u64 cur_rate)
++                       struct conn_state *statep, __u64 now)
+ {
+         __u8 tgt;
+         __u64 pre, ratio_q;
+-        __u16 cur16;
+-        __u32 cur32;
+ 
+         if (statep->swap_target == 0xff) return;
+         if (statep->pre_swap_rate == 0)  return;
+@@ -569,37 +555,15 @@ score_pending_rejected(struct bpf_sock_ops *ops, struct remote_host *rh,
+         if ((now - statep->last_swap_at) < LAST_CHANCE_MIN_NS)
+                 if (ratio_q > 230) ratio_q = 230;
+ 
+-        cur16 = rh->metrics[tgt].swap_score;
+-        cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
+-        if (ratio_q >= cur32) {
+-                __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_LOSS_DIV;
+-                cur32 += step;
+-        } else {
+-                __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_LOSS_DIV;
+-                cur32 = (drop > cur32) ? 0 : cur32 - drop;
+-        }
+-        if (cur32 > 1024) cur32 = 1024;
+-        /* 0.4.88: re-enable score write (was disabled in 0.4.76).
+-         * score_pending_swap was re-enabled in 03f86ff but this sibling
+-         * was missed. ~8% of swaps (rejected path) left swap_score stale. */
+-        rh->metrics[tgt].swap_score = (__u16)cur32;
+-
+-        /* 0.4.82: streak update based on actual outcome (if >=30s). */
+-        if (ratio_q >= 282) {
+-                rh->metrics[tgt].bad_streak = 0;
+-                rh->metrics[tgt].null_streak = 0;
+-        } else if (ratio_q <= 230) {
+-                if (rh->metrics[tgt].bad_streak < 255)
+-                        rh->metrics[tgt].bad_streak++;
+-                rh->metrics[tgt].null_streak = 0;
+-        } else {
+-                if (rh->metrics[tgt].null_streak < 255)
+-                        rh->metrics[tgt].null_streak++;
+-        }
++        /* 0.4.89 (C1 + Q3): seq-wrap the delegated swap-outcome update. */
++        __sync_fetch_and_add(&rh->seq, 1);
++        apply_swap_outcome(rh, tgt, ratio_q);
++        __sync_fetch_and_add(&rh->seq, 1);
+ 
+-        bpf_printk("swapscore-reject cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
+-                   bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
+-                   (__u32)rh->metrics[tgt].bad_streak);
++        if (bpftune_debug)
++                bpf_printk("swapscore-reject cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
++                           bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
++                           (__u32)rh->metrics[tgt].bad_streak);
+ }
+ 
+ SEC("sockops")
+@@ -677,6 +641,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                  * up here. */
+                 struct conn_state *sp_al = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
+                 int alg_idx = sp_al ? (int)(sp_al->state & (NUM_TCP_CONG_ALGS - 1)) : -1;
++                if (bpftune_debug)
+                 bpf_printk("midsamp cookie=%llu port=%u rport=%u alg=%d thr=%llu segs=%llu smin=%llu savg=%llu srate=%llu",
+                            bpf_get_socket_cookie(ops), ops->local_port, bpf_ntohl(ops->remote_port),
+                            alg_idx, next, segs, smin, savg, srate);
+@@ -752,38 +717,44 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+     statep = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
+     if (!statep)
+         return 1;
+-	/* 0.4.44: decrement proof counters once per socket.
+-	 * Only runs on STATE_CB close (is_close).  Placed before the
+-	 * METRIC_MIN_SEGS / origin-facing early returns below so that
+-	 * short-lived and receive-dominant sockets decrement too --
+-	 * otherwise the sockets we most care about never decrement.
+-	 * cleaned flag is idempotent across the FIN_WAIT1 /
+-	 * CLOSE_WAIT double-fire. */
+-	if (is_close && !statep->cleaned) {
+-		/* Shift accumulator: constant step (bit <<= 1 per
+-		 * iteration) rather than a variable shift amount.
+-		 * #pragma unroll flattens to 16 straight-line blocks.
+-		 * Close is a cold path so the size is fine. */
+-		__u64 bit = 1;
+-		for (int b = 0; b < NUM_TCP_CONG_ALGS; b++) {
+-			/* Guarded decrement: if the remote_host entry was
+-			 * LRU-evicted + recreated while this socket lived,
+-			 * its counters were reset to 0; an unguarded --
+-			 * would wrap to 2^64-1.  Guard costs nothing in
+-			 * the common case. */
+-			if ((statep->touched_bitmap & bit) &&
+-			    remote_host->metrics[b].sockets_alive > 0)
+-				remote_host->metrics[b].sockets_alive--;
+-			if ((statep->good_bitmap & bit) &&
+-			    remote_host->metrics[b].sockets_good > 0)
+-				remote_host->metrics[b].sockets_good--;
+-			if ((statep->proved_bitmap & bit) &&
+-			    remote_host->metrics[b].sockets_proved > 0)
+-				remote_host->metrics[b].sockets_proved--;
+-			bit <<= 1;
+-		}
+-		statep->cleaned = 1;
+-	}
++        /* 0.4.44: decrement proof counters once per socket.
++         * Only runs on STATE_CB close (is_close).  Placed before the
++         * METRIC_MIN_SEGS / origin-facing early returns below so that
++         * short-lived and receive-dominant sockets decrement too --
++         * otherwise the sockets we most care about never decrement.
++         * cleaned flag is idempotent across the FIN_WAIT1 /
++         * CLOSE_WAIT double-fire. */
++        if (is_close && !statep->cleaned) {
++                /* Shift accumulator: constant step (bit <<= 1 per
++                 * iteration) rather than a variable shift amount.
++                 * #pragma unroll flattens to 16 straight-line blocks.
++                 * Close is a cold path so the size is fine. */
++                __u64 bit = 1;
++                /* 0.4.89 (C1): seq-wrap the whole close-decrement loop.
++                 * One seq pair around the 16-iter loop is enough -- the
++                 * intermediate state is never read by userspace mid-loop
++                 * (reanchor reads the whole struct atomically via lookup). */
++                __sync_fetch_and_add(&remote_host->seq, 1);
++                for (int b = 0; b < NUM_TCP_CONG_ALGS; b++) {
++                        /* Guarded decrement: if the remote_host entry was
++                         * LRU-evicted + recreated while this socket lived,
++                         * its counters were reset to 0; an unguarded --
++                         * would wrap to 2^64-1.  Guard costs nothing in
++                         * the common case. */
++                        if ((statep->touched_bitmap & bit) &&
++                            remote_host->metrics[b].sockets_alive > 0)
++                                remote_host->metrics[b].sockets_alive--;
++                        if ((statep->good_bitmap & bit) &&
++                            remote_host->metrics[b].sockets_good > 0)
++                                remote_host->metrics[b].sockets_good--;
++                        if ((statep->proved_bitmap & bit) &&
++                            remote_host->metrics[b].sockets_proved > 0)
++                                remote_host->metrics[b].sockets_proved--;
++                        bit <<= 1;
++                }
++                __sync_fetch_and_add(&remote_host->seq, 1);
++                statep->cleaned = 1;
++        }
+     s = statep->state & (NUM_TCP_CONG_ALGS - 1);
+     if ((__u64)tp->segs_out + tp->segs_in < METRIC_MIN_SEGS)
+         return 1;
+@@ -822,12 +793,32 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+      * when the VPS is the server on 443. */
+     if ((__u64)tp->data_segs_out * 4 < (__u64)tp->data_segs_in)
+         return 1;
+-    if (is_close)
++    if (is_close && bpftune_debug)
+         bpf_printk("closport cookie=%llu port=%u rport=%u alg=%u segs=%llu",
+                    bpf_get_socket_cookie(ops), ops->local_port,
+                    bpf_ntohl(ops->remote_port),
+                    (__u32)(statep->state & (NUM_TCP_CONG_ALGS - 1)),
+                    (__u64)tp->segs_out + tp->segs_in);
++    /* 0.4.89 (C3): score the pending swap on close if >=30s elapsed.
++     * Without this, a socket that swapped then closed before its next
++     * segment-rung vote was never scored -- the pending swap_target
++     * stayed at the un-scored value, swap_score and streaks weren't
++     * updated.  Uses the 30s gate (LAST_CHANCE_MIN_NS) matching
++     * score_pending_rejected's last-chance window; score_pending_swap
++     * internally re-checks the 180s gate (SWAP_OUTCOME_MIN_RNAL_NS)
++     * and early-returns if <180s, so we need the 30s outer gate to
++     * catch the 30-180s window where score_pending_swap itself would
++     * refuse.  For <30s, the swap is too fresh to score -- skip.
++     *
++     * Note: score_pending_swap uses the cur_alg != tgt check to force
++     * loss-class if the socket moved away from the target.  On close,
++     * cur_alg is whatever the socket ended on, which may or may not
++     * be the pending target.  The check still works correctly. */
++    if (is_close && statep->swap_target != 0xff) {
++        __u64 close_now = bpf_ktime_get_ns();
++        if (close_now - statep->last_swap_at >= LAST_CHANCE_MIN_NS)
++            score_pending_swap(ops, remote_host, statep, close_now, s);
++    }
+     if (is_close &&
+         (__u64)tp->segs_out + tp->segs_in >= METRIC_TRIGGER_SEGS)
+         return 1;
+@@ -874,31 +865,39 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+             (rd * mss * 1000000ULL) / rate_interval_us : 0;
+     }
+ 
+-	/* 0.4.44: proof tracking.  Non-close votes only.  If the
+-	 * socket's delivered rate crosses a tier on the alg it is
+-	 * currently running, mark the (socket, alg) bit and bump the
+-	 * per-alg counter.  Bits are per-alg so a swap does not have
+-	 * to reset anything -- each alg the socket has ever touched
+-	 * keeps its own bit, and the close handler decrements them
+-	 * all. */
+-	if (!is_close) {
+-		__u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
+-		if (rate_delivered >= PROOF_PROVED_BPS && !(statep->proved_bitmap & bit)) {
+-			statep->proved_bitmap |= bit;
+-			remote_host->metrics[s].sockets_proved++;
+-			if (!(statep->good_bitmap & bit)) {
+-				statep->good_bitmap |= bit;
+-				remote_host->metrics[s].sockets_good++;
+-			}
+-			bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2",
+-			           bpf_get_socket_cookie(ops), s, rate_delivered);
+-		} else if (rate_delivered >= PROOF_GOOD_BPS && !(statep->good_bitmap & bit)) {
+-			statep->good_bitmap |= bit;
+-			remote_host->metrics[s].sockets_good++;
+-			bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1",
+-			           bpf_get_socket_cookie(ops), s, rate_delivered);
+-		}
+-	}
++        /* 0.4.44: proof tracking.  Non-close votes only.  If the
++         * socket's delivered rate crosses a tier on the alg it is
++         * currently running, mark the (socket, alg) bit and bump the
++         * per-alg counter.  Bits are per-alg so a swap does not have
++         * to reset anything -- each alg the socket has ever touched
++         * keeps its own bit, and the close handler decrements them
++         * all. */
++        if (!is_close) {
++                __u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
++                if (rate_delivered >= PROOF_PROVED_BPS && !(statep->proved_bitmap & bit)) {
++                        statep->proved_bitmap |= bit;
++                        /* 0.4.89 (C1): seq-wrap proof-counter bump. */
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                        remote_host->metrics[s].sockets_proved++;
++                        if (!(statep->good_bitmap & bit)) {
++                                statep->good_bitmap |= bit;
++                                remote_host->metrics[s].sockets_good++;
++                        }
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                        if (bpftune_debug)
++                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2",
++                                   bpf_get_socket_cookie(ops), s, rate_delivered);
++                } else if (rate_delivered >= PROOF_GOOD_BPS && !(statep->good_bitmap & bit)) {
++                        statep->good_bitmap |= bit;
++                        /* 0.4.89 (C1): seq-wrap proof-counter bump. */
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                        remote_host->metrics[s].sockets_good++;
++                        __sync_fetch_and_add(&remote_host->seq, 1);
++                        if (bpftune_debug)
++                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1",
++                                   bpf_get_socket_cookie(ops), s, rate_delivered);
++                }
++        }
+     /* 0.4.53: raw delivered rate on every vote.
+      * midsamp only fires on rung crossings; sockets past the last
+      * rung only vote via the 60s time-check and had no raw rate
+@@ -909,7 +908,8 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+         __u64 _sraw   = (__u64)tp->rate_delivered;
+         __u64 _smss   = (__u64)tp->mss_cache;
+         __u64 _srate  = _sinter ? (_sraw * _smss * 1000000ULL) / _sinter : 0;
+-        bpf_printk("srate cookie=%llu alg=%u srate=%llu",
++        if (bpftune_debug)
++                bpf_printk("srate cookie=%llu alg=%u srate=%llu",
+                    bpf_get_socket_cookie(ops), s, _srate);
+     }
+ 
+@@ -930,7 +930,8 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+             loss_term = (loss_bp * LOSS_SCALE) / LOSS_CAP_BP;
+             metric += loss_term;
+         }
+-        bpf_printk("met cookie=%llu rport=%u alg=%d segs=%llu val=%llu rtt=%llu rate=%llu loss=%llu smrtt=%llu bmrtt=%llu avgrtt=%llu",
++        if (bpftune_debug)
++                bpf_printk("met cookie=%llu rport=%u alg=%d segs=%llu val=%llu rtt=%llu rate=%llu loss=%llu smrtt=%llu bmrtt=%llu avgrtt=%llu",
+                    bpf_get_socket_cookie(ops), bpf_ntohl(ops->remote_port),
+                    s, (__u64)tp->segs_out + tp->segs_in, metric, rtt_term, rate_term,
+                    loss_term, min_rtt, remote_host->min_rtt, avg_rtt);
+@@ -942,14 +943,15 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+          * path.  The met line above is at the 12-argument printk
+          * limit, so this lives on its own line and joins by cookie.
+          * No metric logic change; diagnostic only. */
+-        bpf_printk("cwnd cookie=%llu snd_cwnd=%llu pkts_out=%llu",
++        if (bpftune_debug)
++                bpf_printk("cwnd cookie=%llu snd_cwnd=%llu pkts_out=%llu",
+                    bpf_get_socket_cookie(ops),
+                    (__u64)tp->snd_cwnd, (__u64)tp->packets_out);
+-        if (heal_rtt)
++        if (heal_rtt && bpftune_debug)
+             bpf_printk("heal_rtt smrtt=%llu newref=%llu",
+                        (unsigned long long)min_rtt,
+                        (unsigned long long)heal_rtt);
+-        if (heal_rate)
++        if (heal_rate && bpftune_debug)
+             bpf_printk("heal_rate rate=%llu newref=%llu",
+                        (unsigned long long)rate_delivered,
+                        (unsigned long long)heal_rate);
+@@ -1175,11 +1177,13 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     }
+                 }
+             }
+-        /* 0.4.54: rate-based.  socket under 66% of leader. */
+-            bool margin_met = (remote_host->rate_best_v > 0 &&
+-                               statep->last_rate_bps > 0 &&
+-                               statep->last_rate_bps * 150 <
+-                               remote_host->rate_best_v * 100000ULL * 100);
++        /* 0.4.54: rate-based.  socket under 66% of leader.
++         * 0.4.89 (Q2): factored into socket_under_pct_of_leader();
++         * the old form was `last_rate_bps * 150 < rate_best_v * 100000 * 100`
++         * where the *100 and /150 cancel to a 2/3 ratio. */
++            bool margin_met = socket_under_pct_of_leader(
++                statep->last_rate_bps,
++                (__u16)(remote_host->rate_best_v & 0xffff), 66);
+             /* Post-freeze, "desperate" is judged relative to this
+              * socket's own best_seen_metric rather than the bucket
+              * leader.  A frozen socket that stays at ~best_seen (even
+@@ -1191,9 +1195,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+              * unchanged: bucket-relative 2x still fires immediately. */
+             bool desperate_post = (statep->last_metric * 100 >=
+                                    statep->best_seen_metric * 200);
++            /* 0.4.89 (Q2): desperate requires margin_met AND socket
++             * under 25% of leader.  The old form was
++             * `last_rate_bps * 4 < rate_best_v * 100000` which is
++             * equivalent to socket_under_pct_of_leader(..., 25). */
+             bool desperate = (margin_met &&
+-                              statep->last_rate_bps * 4 <
+-                              remote_host->rate_best_v * 100000ULL &&
++                              socket_under_pct_of_leader(
++                                  statep->last_rate_bps,
++                                  (__u16)(remote_host->rate_best_v & 0xffff), 25) &&
+                               (!statep->frozen || desperate_post));
+ 
+             /* Settle window: fixed minimum gap between swaps on one
+@@ -1218,11 +1227,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+ 
+             /* 0.4.52: slow-vs-leader.  Uses the rate directly, bypassing
+              * the composite.  A swap that raises throughput fills the
+-             * bottleneck queue; the induced RTT rise masks the win. */
+-            bool slow_vs_leader = (statep->last_rate_bps > 0 &&
+-                                   remote_host->rate_best_v > 0 &&
+-                                   statep->last_rate_bps * 100 <
+-                                   remote_host->rate_best_v * 100000 * RATE_TRIGGER_PCT);
++             * bottleneck queue; the induced RTT rise masks the win.
++             * 0.4.89 (Q2): factored into socket_under_pct_of_leader();
++             * the old form was `last_rate_bps * 100 < rate_best_v * 100000 * RATE_TRIGGER_PCT`
++             * which is socket_under_pct_of_leader(..., RATE_TRIGGER_PCT). */
++            bool slow_vs_leader = socket_under_pct_of_leader(
++                statep->last_rate_bps,
++                (__u16)(remote_host->rate_best_v & 0xffff),
++                RATE_TRIGGER_PCT);
+ 
+             /* 0.4.54: exploration protection. */
+ 
+@@ -1249,8 +1261,16 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                 if (!set_cong(ops, remote_host, swap_tgt)) {
+                     statep->swap_count++;
+                     statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                     statep->last_metric = 0;
+-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                    score_pending_rejected(ops, remote_host, statep, now);
+                     statep->pre_swap_rate = statep->last_rate_bps;
+                     statep->post_swap_rate_max = 0;
+                     statep->swap_target = swap_tgt;
+@@ -1258,10 +1278,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     statep->hist_1 = 0;
+                     statep->hist_2 = 0;
+                     statep->bad_checkpoints = 0;
++                    if (bpftune_debug)
+                     bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=1 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
+                                bpf_get_socket_cookie(ops), from_i, to_i,
+                                bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
++                    if (bpftune_debug)
+                     bpf_printk("swapctx cookie=%llu d=1 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
+                                bpf_get_socket_cookie(ops),
+                                (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
+@@ -1285,13 +1307,22 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     if ((statep->best_seen_metric != 0 ||
+                          statep->best_seen_srate != 0) && tgt8 != s)
+                         fret = set_cong(ops, remote_host, tgt8);
++                    if (bpftune_debug)
+                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
+                                bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
+                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                     statep->frozen = 1;
+                     statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                     statep->last_metric = 0;
+-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                    score_pending_rejected(ops, remote_host, statep, now);
+                     statep->pre_swap_rate = statep->last_rate_bps;
+                     statep->post_swap_rate_max = 0;
+                     statep->swap_target = tgt8;
+@@ -1306,10 +1337,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     if (!set_cong(ops, remote_host, swap_tgt)) {
+                         statep->swap_count++;
+                         statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                         statep->last_metric = 0;
+ 
+                         /* 0.4.56: stage pre-swap rate and target for scoring. */
+-                        score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                        score_pending_rejected(ops, remote_host, statep, now);
+                         statep->pre_swap_rate = statep->last_rate_bps;
+                         statep->post_swap_rate_max = 0;
+                         statep->swap_target = swap_tgt;
+@@ -1317,10 +1356,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                         statep->hist_1 = 0;
+                         statep->hist_2 = 0;
+                         statep->bad_checkpoints = 0;
++                        if (bpftune_debug)
+                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=2 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
+                                    bpf_get_socket_cookie(ops), from_i, to_i,
+                                    (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
++                        if (bpftune_debug)
+                         bpf_printk("swapctx cookie=%llu d=2 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
+                                    bpf_get_socket_cookie(ops),
+                                    (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
+@@ -1344,13 +1385,22 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     if ((statep->best_seen_metric != 0 ||
+                          statep->best_seen_srate != 0) && tgt8 != s)
+                         fret = set_cong(ops, remote_host, tgt8);
++                    if (bpftune_debug)
+                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
+                                bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
+                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                     statep->frozen = 1;
+                     statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                     statep->last_metric = 0;
+-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                    score_pending_rejected(ops, remote_host, statep, now);
+                     statep->pre_swap_rate = statep->last_rate_bps;
+                     statep->post_swap_rate_max = 0;
+                     statep->swap_target = tgt8;
+@@ -1365,10 +1415,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     if (!set_cong(ops, remote_host, swap_tgt)) {
+                         statep->swap_count++;
+                         statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                         statep->last_metric = 0;
+ 
+                         /* 0.4.56: stage pre-swap rate and target for scoring. */
+-                        score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                        score_pending_rejected(ops, remote_host, statep, now);
+                         statep->pre_swap_rate = statep->last_rate_bps;
+                         statep->post_swap_rate_max = 0;
+                         statep->swap_target = swap_tgt;
+@@ -1376,10 +1434,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                         statep->hist_1 = 0;
+                         statep->hist_2 = 0;
+                         statep->bad_checkpoints = 0;
++                        if (bpftune_debug)
+                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=3 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
+                                    bpf_get_socket_cookie(ops), from_i, to_i,
+                                    (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
++                        if (bpftune_debug)
+                         bpf_printk("swapctx cookie=%llu d=3 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
+                                    bpf_get_socket_cookie(ops),
+                                    (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
+@@ -1405,9 +1465,11 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     if ((statep->best_seen_metric != 0 ||
+                          statep->best_seen_srate != 0) && tgt8 != s)
+                         fret = set_cong(ops, remote_host, tgt8);
++                    if (bpftune_debug)
+                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
+                                bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
+                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
++                    if (bpftune_debug)
+                     bpf_printk("swapctx cookie=%llu d=f cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
+                                bpf_get_socket_cookie(ops),
+                                (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
+@@ -1418,8 +1480,16 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                                (__u64)(tp->snd_cwnd ? ((__u64)tp->packets_out * 100 / tp->snd_cwnd) : 0));
+                     statep->frozen = 1;
+                     statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                     statep->last_metric = 0;
+-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                    score_pending_rejected(ops, remote_host, statep, now);
+                     statep->pre_swap_rate = statep->last_rate_bps;
+                     statep->post_swap_rate_max = 0;
+                     statep->swap_target = tgt8;
+@@ -1457,10 +1527,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                             } else if (!set_cong(ops, remote_host, swap_tgt)) {
+                                 statep->swap_count++;
+                                 statep->last_swap_at = now;
++                    /* 0.4.89 (C2): reset the sustained-rate window so the
++                     * next measurement starts at the swap boundary.  Without
++                     * this, the first sustained_bps sample after a swap
++                     * straddles the swap point -- mixing pre-swap and
++                     * post-swap bytes -- and can inflate post_swap_rate_max
++                     * if the pre-swap alg was carrying a higher rate. */
++                    statep->rate_win_ts_ns = now;
++                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
+                                 statep->last_metric = 0;
+ 
+                                 /* 0.4.56: stage pre-swap rate and target for scoring. */
+-                                score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
++                                score_pending_rejected(ops, remote_host, statep, now);
+                                 statep->pre_swap_rate = statep->last_rate_bps;
+                                 statep->post_swap_rate_max = 0;
+                                 statep->swap_target = swap_tgt;
+@@ -1468,10 +1546,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                                 statep->hist_1 = 0;
+                                 statep->hist_2 = 0;
+                                 statep->bad_checkpoints = 0;
++                                if (bpftune_debug)
+                                 bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=0 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
+                                            bpf_get_socket_cookie(ops), from_i, to_i,
+                                            bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
++                                if (bpftune_debug)
+                                 bpf_printk("swapctx cookie=%llu d=0 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
+                                            bpf_get_socket_cookie(ops),
+                                            (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
+@@ -1512,6 +1592,11 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                 do_update = true;
+         }
+         if (do_update) {
++            /* 0.4.89 (C1): seq-wrap the entire metric_value + rate_ema
++             * + tracker update.  One seq pair around the whole block
++             * is sufficient -- reanchor reads the whole struct, so it
++             * either sees all of these updates or none. */
++            __sync_fetch_and_add(&remote_host->seq, 1);
+             /* 0.4.45 rate EMA */
+             {
+                 __u64 r100k = rate_delivered / RATE_EMA_BYTES_PER_UNIT;
+@@ -1532,18 +1617,38 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                     }
+                 }
+             }
+-        __u64 __div = m->metric_count + 1;
++            /* 0.4.89 (Q4): special-case the first sample after the
++             * poisoned ~0 sentinel.  The EMA formula
++             * `m->metric_value -= (m->metric_value - metric) / __div`
++             * happens to produce the right answer when __div=1 (because
++             * ~0 - (~0 - metric) = metric in unsigned arithmetic), but
++             * with __div > 1 it produces a still-huge value that passes
++             * the v != ~0 filter below and enters the best_v tracker
++             * as a poisoned large value.  Replace the poison with the
++             * actual metric on the first real vote. */
++            __u64 __div = m->metric_count + 1;
+             if (__div > METRIC_AVG_CAP)
+                 __div = METRIC_AVG_CAP;
+-            if (metric > m->metric_value)
++            if (m->metric_value == ~((__u64)0)) {
++                m->metric_value = metric;
++            } else if (metric > m->metric_value) {
+                 m->metric_value += (metric - m->metric_value) / __div;
+-            else
++            } else {
+                 m->metric_value -= (m->metric_value - metric) / __div;
++            }
++            /* 0.4.89 (M5): bounds note -- rate_ema is __u16 (max 65535),
++             * swap_score capped at 1024 (line ~530/585).  The weighted
++             * product rv * ss <= 65535 * 1024 = 67M, *16 = 1.07B, well
++             * under __u64 max.  If either bound is ever widened, audit
++             * the reanchor pass-3 multiplication for overflow. */
+         }
+     }
+     {
+         __u64 v = m->metric_value;
+         if (v != 0 && v != ~((__u64)0)) {
++            /* 0.4.89 (C1): seq-wrap the tracker update -- best_i/best_v
++             * /second_i/second_v are read by reanchor and written here. */
++            __sync_fetch_and_add(&remote_host->seq, 1);
+             if (s == remote_host->best_i) {
+                 remote_host->best_v = v;
+             } else if (s == remote_host->second_i) {
+@@ -1566,11 +1671,17 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+                 remote_host->second_i = ti;
+                 remote_host->second_v = tv;
+             }
++            __sync_fetch_and_add(&remote_host->seq, 1);
+         }
+     }
++    /* 0.4.89 (C1): metric_count and greedy_count are also read by
++     * reanchor (pass 1/2/3 use metric_count for MIN_LEADER_TRUST).
++     * Seq-wrap so the read sees a consistent pair. */
++    __sync_fetch_and_add(&remote_host->seq, 1);
+     m->metric_count++;
+     if (greedy)
+         m->greedy_count++;
++    __sync_fetch_and_add(&remote_host->seq, 1);
+     return 1;
+ }
+ 
+diff --git a/src/tcp_conn_tuner.c b/src/tcp_conn_tuner.c
+index e07f5a4..63e03c5 100644
+--- a/src/tcp_conn_tuner.c
++++ b/src/tcp_conn_tuner.c
+@@ -47,14 +47,12 @@ static struct bpftunable_desc descs[] = {
+ };
+ 
+ static struct bpftunable_scenario scenarios[] = {
+-{ TCP_CONG_SET,		"specify TCP congestion control algorithm",
++{ TCP_CONG_SET,         "specify TCP congestion control algorithm",
+   "To optimize TCP performance, a TCP congestion control algorithm was chosen to mimimize round-trip time and maximize delivery rate." },
+ };
+ 
+ struct tcp_conn_tuner_bpf *skel;
+ 
+-int tcp_iter_fd;
+-
+ static int restore_remote_host_map(struct bpftuner *tuner);
+ static int save_remote_host_map(struct bpftuner *tuner);
+ 
+@@ -85,35 +83,35 @@ static int reanchor_fd = -1;
+  * ------------------------------------------------------------------ */
+ static void rate_hist_decay(struct rate_hist *h)
+ {
+-	__u64 new_total = 0;
+-	int i;
+-
+-	if (h->total <= RATE_HIST_HALVE_TOTAL)
+-		return;
+-	for (i = 0; i < RATE_HIST_BINS; i++) {
+-		h->bins[i] >>= 1;
+-		new_total += h->bins[i];
+-	}
+-	h->total = new_total;
++        __u64 new_total = 0;
++        int i;
++
++        if (h->total <= RATE_HIST_HALVE_TOTAL)
++                return;
++        for (i = 0; i < RATE_HIST_BINS; i++) {
++                h->bins[i] >>= 1;
++                new_total += h->bins[i];
++        }
++        h->total = new_total;
+ }
+ 
+ static unsigned long long rate_hist_p99(const struct rate_hist *h)
+ {
+-	__u64 target, cum = 0;
+-	int i;
+-
+-	if (h->total == 0)
+-		return 0;
+-	target = (h->total / 100) * RATE_HIST_PCT
+-	       + ((h->total % 100) * RATE_HIST_PCT) / 100;
+-	for (i = 0; i < RATE_HIST_BINS; i++) {
+-		cum += h->bins[i];
+-		if (cum >= target)
+-			break;
+-	}
+-	if (i >= RATE_HIST_BINS)
+-		i = RATE_HIST_BINS - 1;
+-	return 1ULL << (i + 10);
++        __u64 target, cum = 0;
++        int i;
++
++        if (h->total == 0)
++                return 0;
++        target = (h->total / 100) * RATE_HIST_PCT
++               + ((h->total % 100) * RATE_HIST_PCT) / 100;
++        for (i = 0; i < RATE_HIST_BINS; i++) {
++                cum += h->bins[i];
++                if (cum >= target)
++                        break;
++        }
++        if (i >= RATE_HIST_BINS)
++                i = RATE_HIST_BINS - 1;
++        return 1ULL << (i + 10);
+ }
+ 
+ static void start_reanchor(struct bpftuner *tuner);
+@@ -134,43 +132,43 @@ static void stop_reanchor(void);
+  * EXPLORE_STATE, which only the CLI writes. */
+ static int pin_explore_map(struct bpftuner *tuner)
+ {
+-	struct bpf_map *map;
+-	__u32 key = 0;
+-	__u32 pct = EXPLORE_PCT_DEFAULT;
+-	int fd, err;
+-	FILE *f;
+-
+-	map = bpftuner_bpf_map_get(tcp_conn, tuner, tuner_config_map);
+-	if (!map) {
+-		bpftune_log(LOG_ERR, "explore: map not found\n");
+-		return -ENOENT;
+-	}
+-	fd = bpf_map__fd(map);
+-	if (fd < 0)
+-		return -EINVAL;
+-
+-	f = fopen(EXPLORE_STATE, "r");
+-	if (f) {
+-		unsigned int v;
+-		if (fscanf(f, "%u", &v) == 1 && v <= EXPLORE_PCT_MAX)
+-			pct = v;
+-		fclose(f);
+-	}
+-
+-	mkdir(BPFTUNE_PIN, 0755);
+-	mkdir(EXPLORE_PIN_DIR, 0755);
+-	unlink(EXPLORE_PIN_PATH);
+-
+-	err = bpf_obj_pin(fd, EXPLORE_PIN_PATH);
+-	if (err) {
+-		bpftune_log(LOG_ERR, "explore: pin failed: %s\n", strerror(-err));
+-		return err;
+-	}
+-	err = bpf_map_update_elem(fd, &key, &pct, BPF_ANY);
+-	if (err) {
+-		bpftune_log(LOG_ERR, "explore: init failed: %s\n", strerror(-err));
+-		return err;
+-	}
++        struct bpf_map *map;
++        __u32 key = 0;
++        __u32 pct = EXPLORE_PCT_DEFAULT;
++        int fd, err;
++        FILE *f;
++
++        map = bpftuner_bpf_map_get(tcp_conn, tuner, tuner_config_map);
++        if (!map) {
++                bpftune_log(LOG_ERR, "explore: map not found\n");
++                return -ENOENT;
++        }
++        fd = bpf_map__fd(map);
++        if (fd < 0)
++                return -EINVAL;
++
++        f = fopen(EXPLORE_STATE, "r");
++        if (f) {
++                unsigned int v;
++                if (fscanf(f, "%u", &v) == 1 && v <= EXPLORE_PCT_MAX)
++                        pct = v;
++                fclose(f);
++        }
++
++        mkdir(BPFTUNE_PIN, 0755);
++        mkdir(EXPLORE_PIN_DIR, 0755);
++        unlink(EXPLORE_PIN_PATH);
++
++        err = bpf_obj_pin(fd, EXPLORE_PIN_PATH);
++        if (err) {
++                bpftune_log(LOG_ERR, "explore: pin failed: %s\n", strerror(-err));
++                return err;
++        }
++        err = bpf_map_update_elem(fd, &key, &pct, BPF_ANY);
++        if (err) {
++                bpftune_log(LOG_ERR, "explore: init failed: %s\n", strerror(-err));
++                return err;
++        }
+         {
+                 __u32 pfx = 16;
+                 FILE *pf = fopen(PREFIX4_STATE, "r");
+@@ -209,9 +207,9 @@ static int pin_explore_map(struct bpftuner *tuner)
+                                     "prefix6: pinned at %s, pfx6=%u\n",
+                                     EXPLORE_PIN_PATH, pfx6);
+         }
+-	bpftune_log(BPFTUNE_LOG_LEVEL,
+-		    "explore: pinned at %s, pct=%u\n", EXPLORE_PIN_PATH, pct);
+-	return 0;
++        bpftune_log(BPFTUNE_LOG_LEVEL,
++                    "explore: pinned at %s, pct=%u\n", EXPLORE_PIN_PATH, pct);
++        return 0;
+ }
+ 
+ /* 0.4.79: load /etc/bpftune/aliases into the pinned dest_alias_map.
+@@ -329,11 +327,31 @@ static int pin_alias_map(struct bpftuner *tuner)
+                 }
+                 n++;
+                 if (lbl && jf && strcmp(to_s, prev_to) != 0) {
++                        /* 0.4.89 (M7): escape JSON special chars in both
++                         * the key (to_s) and value (lbl).  Without this,
++                         * a label containing " or \ would produce
++                         * malformed JSON and break the dashboard's parser. */
+                         if (nj) fputs(",\n", jf);
+                         fputs("  \"", jf);
+-                        fputs(to_s, jf);
++                        for (const char *p = to_s; *p; p++) {
++                                unsigned char c = (unsigned char)*p;
++                                if (c == '"' || c == '\\') { fputc('\\', jf); fputc(c, jf); }
++                                else if (c == '\n') fputs("\\n", jf);
++                                else if (c == '\r') fputs("\\r", jf);
++                                else if (c == '\t') fputs("\\t", jf);
++                                else if (c < 0x20) fprintf(jf, "\\u%04x", c);
++                                else fputc(c, jf);
++                        }
+                         fputs("\": \"", jf);
+-                        fputs(lbl, jf);
++                        for (const char *p = lbl; *p; p++) {
++                                unsigned char c = (unsigned char)*p;
++                                if (c == '"' || c == '\\') { fputc('\\', jf); fputc(c, jf); }
++                                else if (c == '\n') fputs("\\n", jf);
++                                else if (c == '\r') fputs("\\r", jf);
++                                else if (c == '\t') fputs("\\t", jf);
++                                else if (c < 0x20) fprintf(jf, "\\u%04x", c);
++                                else fputc(c, jf);
++                        }
+                         fputs("\"", jf);
+                         nj++;
+                         strncpy(prev_to, to_s, sizeof(prev_to) - 1);
+@@ -358,173 +376,189 @@ static int pin_alias_map(struct bpftuner *tuner)
+ 
+ int init(struct bpftuner *tuner)
+ {
+-	struct bpftunable *t;
+-	int i, err;
+-
+-	/* make sure cong modules are loaded; might be builtin so do not
+- 	 * shout about errors.
+- 	 */
+-	for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
+-		char name[32];
+-
+-		snprintf(name, sizeof(name), "tcp_%s", congs[i]);
+-		err = bpftune_module_load(name);
+-		if (err != -EEXIST)
+-			bpftune_log(LOG_DEBUG, "could not load module '%s': %s\n",
+-				    name, strerror(-err));
+-	}
+-
+-	/* first detach any dangling cgroup attachment for our prog; this
+-	 * can happen if the bpftune process is killed and we do not get to
+-	 * detach from cgroup.
+-	 */
+-	bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
+-	bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
+-
+-	err = bpftuner_bpf_init(tcp_conn, tuner, NULL);
+-	if (err)
+-		return err;
++        struct bpftunable *t;
++        int i, err;
++
++        /* make sure cong modules are loaded; might be builtin so do not
++         * shout about errors.
++         */
++        for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
++                char name[32];
++
++                snprintf(name, sizeof(name), "tcp_%s", congs[i]);
++                err = bpftune_module_load(name);
++                if (err != -EEXIST)
++                        bpftune_log(LOG_DEBUG, "could not load module '%s': %s\n",
++                                    name, strerror(-err));
++        }
++
++        /* first detach any dangling cgroup attachment for our prog; this
++         * can happen if the bpftune process is killed and we do not get to
++         * detach from cgroup.
++         */
++        bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
++        bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
++
++        err = bpftuner_bpf_init(tcp_conn, tuner, NULL);
++        if (err)
++                return err;
+ 
+         restore_remote_host_map(tuner);
+-	err = bpftune_cap_add();
+-	if (err) {
+-		bpftune_log(LOG_ERR, "cannot add caps: %s\n", strerror(-err));
+-		return 1;
+-	}
+-	/* 0.4.64: pin the explore map so 'bpftune --exp=N' can find
+-	 * it.  Non-fatal: a missing pin disables --exp but leaves the
+-	 * tuner otherwise unaffected. */
+-	if (pin_explore_map(tuner))
+-		bpftune_log(LOG_ERR,
+-			    "explore: pin failed; --exp will be unavailable\n");
+-	if (pin_alias_map(tuner))
+-		bpftune_log(LOG_ERR,
+-			    "aliases: pin failed; aliases unavailable\n");
+-
+-	/* attach to root cgroup */
+-	err = bpftuner_cgroup_attach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
+-	if (err)
+-		goto out;
+-
+-	err = bpftuner_cgroup_attach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
+-	if (err)
+-		goto out;
+-
+-	/* 0.4.79: verify both progs actually landed on the root cgroup.
+-	 * Observed on fast systemctl restart: the attaches return 0 but
+-	 * the tree ends up empty, then a second restart fixes it.  The
+-	 * exact interleaving between the dying instance's detach and
+-	 * ours hasn't been pinned down; this retry makes startup
+-	 * reliable regardless.  Up to 8 attempts, 250ms apart (~2s). */
+-	{
+-		int attempt;
+-		for (attempt = 0; attempt < 8; attempt++) {
+-			FILE *p = popen("bpftool cgroup tree 2>/dev/null", "r");
+-			int n = 0;
+-			char buf[512];
+-			if (!p)
+-				break;
+-			while (fgets(buf, sizeof(buf), p)) {
+-				if (strstr(buf, "bpftune_conn_tuner"))
+-					n++;
+-			}
+-			pclose(p);
+-			if (n >= 2)
+-				break;
+-			bpftune_log(LOG_INFO,
+-			            "cgroup attach verify: %d of 2 progs visible, retry %d/8\n",
+-			            n, attempt + 1);
+-			usleep(250000);
+-			bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
+-			bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
+-			bpftuner_cgroup_attach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
+-			bpftuner_cgroup_attach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
+-		}
+-	}
+-
+-	start_reanchor(tuner);
+-
+-
+-	err = bpftuner_tunables_init(tuner, ARRAY_SIZE(descs), descs,
+-				     ARRAY_SIZE(scenarios), scenarios);
+-	if (err)
+-		goto out;
+-	t = bpftuner_tunable(tuner, TCP_ALLOWED_CONG);
+-	if (t) {
+-		for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
+-			char new_allowed[BPFTUNE_MAX_STR];
+-
+-			if (strstr(t->current_str, congs[i]))
+-				continue;
+-			if (snprintf(new_allowed, sizeof(new_allowed), "%s %s", t->current_str,
+-				     congs[i]) > BPFTUNE_MAX_STR)
+-				break;
+-			bpftuner_tunable_sysctl_write(tuner, TCP_ALLOWED_CONG, TCP_CONG_SET, 0,
+-						      1, new_allowed, "updating '%s' to '%s'\n",
+-						      t->desc.name, new_allowed);
+-		}
+-	}
+-
+-	t = bpftuner_tunable(tuner, TCP_THIN_LINEAR_TIMEOUTS);
+-	if (t)
+-		bpftuner_bpf_var_set(tcp_conn, tuner, tcp_thin_lto, t->initial_values[0]);
++        err = bpftune_cap_add();
++        if (err) {
++                bpftune_log(LOG_ERR, "cannot add caps: %s\n", strerror(-err));
++                return 1;
++        }
++        /* 0.4.64: pin the explore map so 'bpftune --exp=N' can find
++         * it.  Non-fatal: a missing pin disables --exp but leaves the
++         * tuner otherwise unaffected. */
++        if (pin_explore_map(tuner))
++                bpftune_log(LOG_ERR,
++                            "explore: pin failed; --exp will be unavailable\n");
++        if (pin_alias_map(tuner))
++                bpftune_log(LOG_ERR,
++                            "aliases: pin failed; aliases unavailable\n");
++
++        /* attach to root cgroup */
++        err = bpftuner_cgroup_attach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
++        if (err)
++                goto out;
++
++        err = bpftuner_cgroup_attach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
++        if (err)
++                goto out;
++
++        /* 0.4.79: verify both progs actually landed on the root cgroup.
++         * Observed on fast systemctl restart: the attaches return 0 but
++         * the tree ends up empty, then a second restart fixes it.  The
++         * exact interleaving between the dying instance's detach and
++         * ours hasn't been pinned down; this retry makes startup
++         * reliable regardless.  Up to 8 attempts, 250ms apart (~2s).
++         *
++         * 0.4.89 (M8): check the return value of bpftuner_cgroup_attach
++         * and bail out with a clear log if it fails (was silently ignored
++         * before).  Also log when popen() fails so a missing bpftool
++         * binary is visible rather than looking like a successful verify. */
++        {
++                int attempt;
++                for (attempt = 0; attempt < 8; attempt++) {
++                        FILE *p = popen("bpftool cgroup tree 2>/dev/null", "r");
++                        int n = 0;
++                        char buf[512];
++                        int a1, a2;
++                        if (!p) {
++                                bpftune_log(LOG_ERR,
++                                            "cgroup attach verify: popen(bpftool) "
++                                            "failed; cannot verify, assuming attached\n");
++                                break;
++                        }
++                        while (fgets(buf, sizeof(buf), p)) {
++                                if (strstr(buf, "bpftune_conn_tuner"))
++                                        n++;
++                        }
++                        pclose(p);
++                        if (n >= 2)
++                                break;
++                        bpftune_log(LOG_INFO,
++                                    "cgroup attach verify: %d of 2 progs visible, retry %d/8\n",
++                                    n, attempt + 1);
++                        usleep(250000);
++                        bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
++                        bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
++                        a1 = bpftuner_cgroup_attach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
++                        a2 = bpftuner_cgroup_attach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
++                        if (a1 || a2) {
++                                bpftune_log(LOG_ERR,
++                                            "cgroup attach verify: re-attach failed "
++                                            "(bpf=%d vote=%d) on retry %d/8\n",
++                                            a1, a2, attempt + 1);
++                        }
++                }
++        }
++
++        start_reanchor(tuner);
++
++
++        err = bpftuner_tunables_init(tuner, ARRAY_SIZE(descs), descs,
++                                     ARRAY_SIZE(scenarios), scenarios);
++        if (err)
++                goto out;
++        t = bpftuner_tunable(tuner, TCP_ALLOWED_CONG);
++        if (t) {
++                for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
++                        char new_allowed[BPFTUNE_MAX_STR];
++
++                        if (strstr(t->current_str, congs[i]))
++                                continue;
++                        if (snprintf(new_allowed, sizeof(new_allowed), "%s %s", t->current_str,
++                                     congs[i]) > BPFTUNE_MAX_STR)
++                                break;
++                        bpftuner_tunable_sysctl_write(tuner, TCP_ALLOWED_CONG, TCP_CONG_SET, 0,
++                                                      1, new_allowed, "updating '%s' to '%s'\n",
++                                                      t->desc.name, new_allowed);
++                }
++        }
++
++        t = bpftuner_tunable(tuner, TCP_THIN_LINEAR_TIMEOUTS);
++        if (t)
++                bpftuner_bpf_var_set(tcp_conn, tuner, tcp_thin_lto, t->initial_values[0]);
+ out:
+-	bpftune_cap_drop();
+-	return err;
++        bpftune_cap_drop();
++        return err;
+ }
+ 
+ void summarize(struct bpftuner *tuner)
+ {
+-	struct bpf_map *map = bpftuner_bpf_map_get(tcp_conn, tuner, remote_host_map);
+-	struct in6_addr key, *prev_key = NULL;
+-	int map_fd = bpf_map__fd(map);
+-	unsigned long greedy_count = 0;
+-	__u64 thin_lto_choices;
+-	__u64 *cong_choices;
+-	int i;
+-
+-	thin_lto_choices = bpftuner_bpf_var_get(tcp_conn, tuner, tcp_thin_lto_choices);
+-	if (thin_lto_choices) {
+-		bpftune_log(BPFTUNE_LOG_LEVEL, "# Summary: tcp_conn_tuner: set 'net.ipv4.tcp_thin_linear_timeouts' for %lu connections to improve responsiveness of thin flows durning retransmission\n",
+-			    thin_lto_choices);
+-	}
+-	cong_choices = bpftuner_bpf_var_get(tcp_conn, tuner, tcp_cong_choices);
+-	if (cong_choices) {
+-		bpftune_log(BPFTUNE_LOG_LEVEL,
+-			    "# Summary: tcp_conn_tuner: %20s %20s\n",
+-			    "CongAlg", "Count");
+-		for (i = 0; i < NUM_TCP_CONG_ALGS; i++) {
+-			bpftune_log(BPFTUNE_LOG_LEVEL,
+-				    "# Summary: tcp_conn_tuner: %20s %20lu\n",
+-				    congs[i], cong_choices[i]);
+-		}
+-	}
+-	while (!bpf_map_get_next_key(map_fd, prev_key, &key)) {
+-		char buf[INET6_ADDRSTRLEN];
+-		struct remote_host r;
+-
+-		prev_key = &key;
+-
+-		if (bpf_map_lookup_elem(map_fd, &key, &r))
+-			continue;
+-
+-		bpftune_log(LOG_DEBUG, "# Summary: tcp_conn_tuner: %48s %8s %20s %8s %8s\n",
+-			    "IPAddress", "CongAlg", "Metric", "Count", "Greedy");
+-		inet_ntop(AF_INET6, &key, buf, sizeof(buf));
+-
+-		for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
+-
+-			bpftune_log(LOG_DEBUG, "# Summary: tcp_conn_tuner: %48s %8s %20llu %8llu %8llu\n",
+-				    buf, congs[i],
+-				    r.metrics[i].metric_value,
+-				    r.metrics[i].metric_count,
+-				    r.metrics[i].greedy_count);
+-			bpftuner_tunable_stats_update(tuner, TCP_CONG,
+-						      TCP_CONG_SET, true,
+-						      r.metrics[i].metric_count);
+-			greedy_count += r.metrics[i].greedy_count;
+-		}
+-	}
++        struct bpf_map *map = bpftuner_bpf_map_get(tcp_conn, tuner, remote_host_map);
++        struct in6_addr key, *prev_key = NULL;
++        int map_fd = bpf_map__fd(map);
++        unsigned long greedy_count = 0;
++        __u64 thin_lto_choices;
++        __u64 *cong_choices;
++        int i;
++
++        thin_lto_choices = bpftuner_bpf_var_get(tcp_conn, tuner, tcp_thin_lto_choices);
++        if (thin_lto_choices) {
++                bpftune_log(BPFTUNE_LOG_LEVEL, "# Summary: tcp_conn_tuner: set 'net.ipv4.tcp_thin_linear_timeouts' for %lu connections to improve responsiveness of thin flows durning retransmission\n",
++                            thin_lto_choices);
++        }
++        cong_choices = bpftuner_bpf_var_get(tcp_conn, tuner, tcp_cong_choices);
++        if (cong_choices) {
++                bpftune_log(BPFTUNE_LOG_LEVEL,
++                            "# Summary: tcp_conn_tuner: %20s %20s\n",
++                            "CongAlg", "Count");
++                for (i = 0; i < NUM_TCP_CONG_ALGS; i++) {
++                        bpftune_log(BPFTUNE_LOG_LEVEL,
++                                    "# Summary: tcp_conn_tuner: %20s %20lu\n",
++                                    congs[i], cong_choices[i]);
++                }
++        }
++        while (!bpf_map_get_next_key(map_fd, prev_key, &key)) {
++                char buf[INET6_ADDRSTRLEN];
++                struct remote_host r;
++
++                prev_key = &key;
++
++                if (bpf_map_lookup_elem(map_fd, &key, &r))
++                        continue;
++
++                bpftune_log(LOG_DEBUG, "# Summary: tcp_conn_tuner: %48s %8s %20s %8s %8s\n",
++                            "IPAddress", "CongAlg", "Metric", "Count", "Greedy");
++                inet_ntop(AF_INET6, &key, buf, sizeof(buf));
++
++                for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
++
++                        bpftune_log(LOG_DEBUG, "# Summary: tcp_conn_tuner: %48s %8s %20llu %8llu %8llu\n",
++                                    buf, congs[i],
++                                    r.metrics[i].metric_value,
++                                    r.metrics[i].metric_count,
++                                    r.metrics[i].greedy_count);
++                        bpftuner_tunable_stats_update(tuner, TCP_CONG,
++                                                      TCP_CONG_SET, true,
++                                                      r.metrics[i].metric_count);
++                        greedy_count += r.metrics[i].greedy_count;
++                }
++        }
+ }
+ 
+ /* Walk every bucket in remote_host_map and force the tracker fields
+@@ -542,9 +576,15 @@ void summarize(struct bpftuner *tuner)
+  * carried through unchanged via read-modify-write of the struct.
+  */
+ /* 0.4.76: sustained-ruler swap_score reconciliation. */
++/* 0.4.89 (C4): replaced the fixed tb[256] array with an open-addressing
++ * hash table.  Old code silently dropped corrections for buckets past
++ * 256 -- a real cap on busy multi-CDN hosts.  Also fixed the O(n²)
++ * linear scan-per-line.  Hash uses the first 32 bits of the in6_addr
++ * (matches the BPF bucket key layout for v4-mapped and /32 v6). */
+ #define TRUTH_PATH        "/var/lib/bpftune/history/swapscore_truth.jsonl"
+ #define TRUTH_STASH       "/var/lib/bpftune/history/swapscore_truth.processing"
+-#define TRUTH_MAX_BUCKETS 256
++#define TRUTH_HASH_SLOTS  4096
++#define TRUTH_HASH_MASK   (TRUTH_HASH_SLOTS - 1)
+ #define TRUTH_WIN_TARGET  600
+ #define TRUTH_LOSS_TARGET 100
+ 
+@@ -553,8 +593,48 @@ struct truth_bucket {
+         unsigned int win[NUM_TCP_CONN_METRICS];
+         unsigned int loss[NUM_TCP_CONN_METRICS];
+         unsigned int nnull[NUM_TCP_CONN_METRICS];
++        unsigned char used;
+ };
+ 
++/* FNV-1a 32-bit on the first 4 bytes of the in6_addr.  The BPF bucket
++ * key for v4-mapped addresses has the v4 bits in s6_addr[12..15], and
++ * for v6/32 the top 4 bytes are the network prefix.  Either way,
++ * hashing the first 4 bytes of the raw struct gives good spread
++ * (different networks hash to different slots). */
++static unsigned int truth_hash(const struct in6_addr *k)
++{
++        const unsigned char *p = k->s6_addr;
++        unsigned int h = 0x811c9dc5u;
++        int i;
++        for (i = 0; i < 4; i++) {
++                h ^= p[i];
++                h *= 0x01000193u;
++        }
++        return h & TRUTH_HASH_MASK;
++}
++
++/* Find or create a truth_bucket for the given key.  Returns NULL if
++ * the table is full (4096 distinct buckets -- effectively impossible
++ * for the current fleet, but if it ever happens, log and drop). */
++static struct truth_bucket *truth_get(struct truth_bucket *tb,
++                                       const struct in6_addr *key)
++{
++        unsigned int start = truth_hash(key);
++        unsigned int i;
++        for (i = 0; i < TRUTH_HASH_SLOTS; i++) {
++                unsigned int idx = (start + i) & TRUTH_HASH_MASK;
++                if (!tb[idx].used) {
++                        memset(&tb[idx], 0, sizeof(tb[idx]));
++                        tb[idx].key = *key;
++                        tb[idx].used = 1;
++                        return &tb[idx];
++                }
++                if (memcmp(&tb[idx].key, key, sizeof(*key)) == 0)
++                        return &tb[idx];
++        }
++        return NULL;  /* table full */
++}
++
+ static int truth_bucket_key(const char *s, struct in6_addr *out)
+ {
+         struct in_addr a4;
+@@ -608,52 +688,91 @@ static int truth_extract(const char *line, const char *key,
+ 
+ static void apply_truth_corrections(int map_fd)
+ {
+-        struct truth_bucket tb[TRUTH_MAX_BUCKETS];
+-        int ntb = 0;
+-        char buf[512];
++        /* 0.4.89 (C4): hash table replaces tb[256].  4096 slots x
++         * ~200 bytes/entry = ~800 KB on the reanchor worker's stack.
++         * That's fine -- the worker thread has an 8 MB default stack
++         * and only one of these is alive at a time.  If we ever need
++         * more, switch to malloc + free. */
++        static struct truth_bucket tb[TRUTH_HASH_SLOTS];
++        unsigned int ntb = 0, dropped = 0;
++        char *line = NULL;
++        size_t linecap = 0;
+         FILE *f;
+-        int i, j, k;
++        unsigned int i;
++        int j, k;
+ 
++        memset(tb, 0, sizeof(tb));
+         unlink(TRUTH_STASH);
+         if (rename(TRUTH_PATH, TRUTH_STASH) != 0) return;
+         f = fopen(TRUTH_STASH, "r");
+         if (!f) { unlink(TRUTH_STASH); return; }
+ 
+-        while (fgets(buf, sizeof(buf), f)) {
++        /* 0.4.89 (M4): getline replaces fixed 512-byte buf -- truth
++         * lines can exceed 512 chars with labels and timestamps. */
++        while (getline(&line, &linecap, f) != -1) {
+                 char bucket[64], tgt[32], cls[16];
+-                int tgt_idx, found = -1;
++                int tgt_idx;
+                 struct in6_addr key;
++                struct truth_bucket *b;
+ 
+-                if (truth_extract(buf, "bucket", bucket, sizeof(bucket))) continue;
+-                if (truth_extract(buf, "tgt", tgt, sizeof(tgt))) continue;
+-                if (truth_extract(buf, "cls", cls, sizeof(cls))) continue;
++                if (truth_extract(line, "bucket", bucket, sizeof(bucket))) continue;
++                if (truth_extract(line, "tgt", tgt, sizeof(tgt))) continue;
++                if (truth_extract(line, "cls", cls, sizeof(cls))) continue;
+                 tgt_idx = truth_alg_idx(tgt);
+                 if (tgt_idx < 0) continue;
+                 if (truth_bucket_key(bucket, &key)) continue;
+-                for (i = 0; i < ntb; i++)
+-                        if (memcmp(&tb[i].key, &key, sizeof(key)) == 0) {
+-                                found = i; break;
+-                        }
+-                if (found < 0) {
+-                        if (ntb >= TRUTH_MAX_BUCKETS) continue;
+-                        found = ntb++;
+-                        memset(&tb[found], 0, sizeof(tb[found]));
+-                        tb[found].key = key;
++                b = truth_get(tb, &key);
++                if (!b) {
++                        dropped++;
++                        continue;
+                 }
+-                if (strcmp(cls, "win") == 0) tb[found].win[tgt_idx]++;
+-                else if (strcmp(cls, "loss") == 0) tb[found].loss[tgt_idx]++;
+-                else if (strcmp(cls, "null") == 0) tb[found].nnull[tgt_idx]++;
++                if (b->win[0] == 0 && b->loss[0] == 0 && b->nnull[0] == 0 &&
++                    !b->win[0] && !b->loss[0] && !b->nnull[0]) {
++                        /* first touch for this bucket -- count it.  Cheap
++                         * heuristic: count any bucket that gets at least
++                         * one line.  We don't track per-bucket first-touch
++                         * explicitly to avoid scanning used[] later. */
++                        ntb++;
++                }
++                if (strcmp(cls, "win") == 0) b->win[tgt_idx]++;
++                else if (strcmp(cls, "loss") == 0) b->loss[tgt_idx]++;
++                else if (strcmp(cls, "null") == 0) b->nnull[tgt_idx]++;
+         }
++        free(line);
+         fclose(f);
+         unlink(TRUTH_STASH);
+ 
+-        for (i = 0; i < ntb; i++) {
++        if (dropped)
++                bpftune_log(LOG_ERR, "truth: table full (%u entries dropped); "
++                            "consider raising TRUTH_HASH_SLOTS\n", dropped);
++
++        for (i = 0; i < TRUTH_HASH_SLOTS; i++) {
+                 struct remote_host r;
++                __u64 seq1, seq2;
+                 int dirty = 0;
++                int retries = 0;
++
++                if (!tb[i].used) continue;
++                /* 0.4.89 (C1): seq-retry loop.  Read seq, lookup, mutate,
++                 * re-read seq, retry if changed.  Caps at 4 retries
++                 * (~microseconds each); a BPF vote storm that keeps the
++                 * bucket in flux for 4+ retries is logged and skipped
++                 * this cycle. */
++retry:
+                 if (bpf_map_lookup_elem(map_fd, &tb[i].key, &r)) continue;
++                seq1 = r.seq;
++                if (seq1 & 1) {  /* BPF mid-update */
++                        if (++retries > 4) {
++                                bpftune_log(LOG_DEBUG,
++                                            "truth: bucket seq busy, skipped\n");
++                                continue;
++                        }
++                        usleep(1000);
++                        goto retry;
++                }
+                 for (j = 0; j < NUM_TCP_CONN_METRICS; j++) {
+                         unsigned int cur;
+-                        for (k = 0; k < tb[i].win[j]; k++) {
++                        for (k = 0; k < (int)tb[i].win[j]; k++) {
+                                 cur = r.metrics[j].swap_score;
+                                 if (cur < TRUTH_WIN_TARGET)
+                                         cur += (TRUTH_WIN_TARGET - cur) / SWAP_SCORE_STEP_DIV;
+@@ -666,7 +785,7 @@ static void apply_truth_corrections(int map_fd)
+                                 r.metrics[j].null_streak = 0;
+                                 dirty = 1;
+                         }
+-                        for (k = 0; k < tb[i].loss[j]; k++) {
++                        for (k = 0; k < (int)tb[i].loss[j]; k++) {
+                                 cur = r.metrics[j].swap_score;
+                                 if (cur > TRUTH_LOSS_TARGET)
+                                         cur -= (cur - TRUTH_LOSS_TARGET) / SWAP_SCORE_STEP_DIV;
+@@ -686,357 +805,387 @@ static void apply_truth_corrections(int map_fd)
+                                 dirty = 1;
+                         }
+                 }
+-                if (dirty)
+-                        bpf_map_update_elem(map_fd, &tb[i].key, &r, BPF_ANY);
++                if (!dirty) continue;
++                /* Re-read seq; if BPF voted during our mutation, retry. */
++                {
++                        struct remote_host check;
++                        if (bpf_map_lookup_elem(map_fd, &tb[i].key, &check)) continue;
++                        seq2 = check.seq;
++                }
++                if (seq2 != seq1) {
++                        if (++retries > 4) {
++                                bpftune_log(LOG_DEBUG,
++                                            "truth: bucket seq changed mid-update, skipped\n");
++                                continue;
++                        }
++                        goto retry;
++                }
++                bpf_map_update_elem(map_fd, &tb[i].key, &r, BPF_ANY);
+         }
+ }
+ 
+ static void reanchor_best(int map_fd)
+ {
+-	struct in6_addr key, *prev_key = NULL;
+-	unsigned int scanned = 0, updated = 0;
+-
+-	while (!bpf_map_get_next_key(map_fd, prev_key, &key)) {
+-		struct remote_host r;
+-		__u64 best_i = ~((__u64)0), best_v = 0;
+-		__u64 second_i = ~((__u64)0), second_v = 0;
+-		__u64 new_bi, new_bv, new_si, new_sv;
+-		__u64 new_rbi = 0, new_rbv = 0;
+-		__u64 new_r2i = 0, new_r2v = 0;
+-		int i;
+-
+-		prev_key = &key;
+-
+-		if (bpf_map_lookup_elem(map_fd, &key, &r))
+-			continue;
+-		scanned++;
+-
+-		/* Pass 1: trusted minimum. */
+-		for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
+-			__u64 v = r.metrics[i].metric_value;
+-			__u64 cnt = r.metrics[i].metric_count;
+-
+-			if (cnt < MIN_LEADER_TRUST)
+-				continue;
+-			if (v == 0 || v == ~((__u64)0))
+-				continue;
+-			if (best_v == 0 || v < best_v) {
+-				best_i = (__u64)i;
+-				best_v = v;
+-			}
+-		}
+-
+-		/* Pass 2: second-best. */
+-		if (best_v != 0) {
+-			for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
+-				__u64 v = r.metrics[i].metric_value;
+-				__u64 cnt = r.metrics[i].metric_count;
+-
+-				if ((__u64)i == best_i || cnt == 0)
+-					continue;
+-				if (v == 0 || v == ~((__u64)0))
+-					continue;
+-				if (v < best_v)
+-					continue;
+-				if (second_v == 0 || v < second_v) {
+-					second_i = (__u64)i;
+-					second_v = v;
+-				}
+-			}
+-		}
+-
+-		/* 0.4.45 pass 3: rate-EMA leader. */
+-
+-		{
+-
+-		    __u64 rate_bi = ~((__u64)0), rate_bv = 0;
+-		    __u64 best_weighted = 0;
+-		    int j;
+-		    __u64 rate_2i = ~((__u64)0), rate_2v = 0;
+-		    __u64 second_weighted = 0;
+-		    /* 0.4.56: pick by rate_ema * swap_score so a target with a
+-		     * bad swap track record gets demoted automatically.  Store
+-		     * raw rate_ema in rate_bv -- BPF's trigger math needs a rate. */
+-		    for (j = 0; j < NUM_TCP_CONN_METRICS; j++) {
+-		        __u64 rv = r.metrics[j].rate_ema;
+-		        __u64 ss, weighted;
+-		        if (r.metrics[j].metric_count < MIN_LEADER_TRUST) continue;
+-		        if (rv == 0) continue;
+-		        /* 0.4.60: no hard exclusion.  A bad or null streak
+-		         * demotes the target instead of banning it, so it stays
+-		         * in the pile and can climb back the moment it wins or
+-		         * its rate_ema rises.  Penalty: 16/(16 + bad*4 + null*2).
+-		         * bad=2 -> 0.67x, null=3 -> 0.73x, both -> 0.53x. */
+-		        ss = r.metrics[j].swap_score;
+-		        if (ss == 0) ss = SWAP_SCORE_NEUTRAL;
+-		        weighted = rv * ss / SWAP_SCORE_NEUTRAL;
+-		        {
+-		            __u64 pen = 16
+-		                + (__u64)r.metrics[j].bad_streak * 4
+-		                + (__u64)r.metrics[j].null_streak * 2;
+-		            weighted = weighted * 16 / pen;
+-		        }
+-		        if (rate_bv == 0 || weighted > best_weighted) {
+-		            if (rate_bi != ~((__u64)0)) {
+-		                rate_2i = rate_bi;
+-		                rate_2v = rate_bv;
+-		                second_weighted = best_weighted;
+-		            }
+-		            rate_bi = (__u64)j;
+-		            rate_bv = rv;
+-		            best_weighted = weighted;
+-		        } else if (weighted > second_weighted &&
+-		                   (__u64)j != rate_bi) {
+-		            rate_2i = (__u64)j;
+-		            rate_2v = rv;
+-		            second_weighted = weighted;
+-		        }
+-		    }
+-
+-		    new_rbi = (rate_bv == 0) ? 0 : rate_bi;
+-		    new_rbv = rate_bv;
+-		    new_r2i = (rate_2v == 0) ? 0 : rate_2i;
+-		    new_r2v = rate_2v;
+-
+-		}
+-
+-		/* No trusted leader: force the tracker to the empty state so
+-		 * the swap path sees "no leader" rather than a stale value.
+-		 */
+-		if (best_v == 0) {
+-			new_bi = 0;
+-			new_bv = 0;
+-			new_si = 0;
+-			new_sv = 0;
+-		} else {
+-			new_bi = best_i;
+-			new_bv = best_v;
+-			new_si = (second_v == 0) ? 0 : second_i;
+-			new_sv = second_v;
+-		}
+-
+-		{
+-			__u64 ref_before = r.max_rate_delivered;
+-
+-			__u64 scores_init = 0;
+-
+-			int jj;
+-
+-
+-			/* 0.4.63: initialize stale swap_score=0 entries that have
+-
+-			 * votes.  0.4.62 set the score in set_cong(), but an algo
+-
+-			 * already in the state file with score=0 only inits when
+-
+-			 * set_cong runs for it -- on a bucket past coverage that's
+-
+-			 * the next epsilon-greedy draw, not the next reanchor.
+-
+-			 * Do it here so it clears within 30s. */
+-
+-			for (jj = 0; jj < NUM_TCP_CONN_METRICS; jj++) {
+-
+-			    if (r.metrics[jj].swap_score == 0 &&
+-
+-			        r.metrics[jj].metric_count > 0) {
+-
+-			        r.metrics[jj].swap_score = SWAP_SCORE_NEUTRAL;
+-
+-			        scores_init++;
+-
+-			    }
+-
+-			}
+-
+-			/* 0.4.43: refresh max_rate_delivered from histogram.
+-			 * Runs before the 'unchanged' early-continue so that a
+-			 * stable bucket still refreshes its reference, and so
+-			 * the histogram-derived value is written back to the map.
+-			 */
+-			rate_hist_decay(&r.rate);
+-			{
+-				unsigned long long p99 = rate_hist_p99(&r.rate);
+-				if (p99 != r.max_rate_delivered)
+-					r.max_rate_delivered = p99;
+-			}
+-
+-			if (scores_init == 0 &&
++        struct in6_addr key, *prev_key = NULL;
++        unsigned int scanned = 0, updated = 0, seq_skipped = 0;
++
++        while (!bpf_map_get_next_key(map_fd, prev_key, &key)) {
++                struct remote_host r;
++                __u64 best_i = ~((__u64)0), best_v = 0;
++                __u64 second_i = ~((__u64)0), second_v = 0;
++                __u64 new_bi, new_bv, new_si, new_sv;
++                __u64 new_rbi = 0, new_rbv = 0;
++                __u64 new_r2i = 0, new_r2v = 0;
++                __u64 seq1, seq2;
++                int i;
++                int retries = 0;
++
++                prev_key = &key;
++
++                /* 0.4.89 (C1): seq-retry loop.  Read seq, lookup,
++                 * mutate, re-read seq, retry if changed.  Caps at 4
++                 * retries; a bucket in flux for 4+ retries is logged
++                 * and skipped this cycle (the next reanchor pass will
++                 * pick it up).  Without this, the read-modify-write
++                 * of the whole 792-byte struct clobbered any BPF vote
++                 * that landed between lookup and update. */
++retry:
++                if (bpf_map_lookup_elem(map_fd, &key, &r))
++                        continue;
++                seq1 = r.seq;
++                if (seq1 & 1) {  /* BPF mid-update */
++                        if (++retries > 4) {
++                                seq_skipped++;
++                                continue;
++                        }
++                        usleep(1000);
++                        goto retry;
++                }
++                scanned++;
++
++                /* Pass 1: trusted minimum. */
++                for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
++                        __u64 v = r.metrics[i].metric_value;
++                        __u64 cnt = r.metrics[i].metric_count;
++
++                        if (cnt < MIN_LEADER_TRUST)
++                                continue;
++                        if (v == 0 || v == ~((__u64)0))
++                                continue;
++                        if (best_v == 0 || v < best_v) {
++                                best_i = (__u64)i;
++                                best_v = v;
++                        }
++                }
++
++                /* Pass 2: second-best. */
++                if (best_v != 0) {
++                        for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
++                                __u64 v = r.metrics[i].metric_value;
++                                __u64 cnt = r.metrics[i].metric_count;
++
++                                if ((__u64)i == best_i || cnt == 0)
++                                        continue;
++                                if (v == 0 || v == ~((__u64)0))
++                                        continue;
++                                if (v < best_v)
++                                        continue;
++                                if (second_v == 0 || v < second_v) {
++                                        second_i = (__u64)i;
++                                        second_v = v;
++                                }
++                        }
++                }
++
++                /* 0.4.45 pass 3: rate-EMA leader. */
++
++                {
++
++                    __u64 rate_bi = ~((__u64)0), rate_bv = 0;
++                    __u64 best_weighted = 0;
++                    int j;
++                    __u64 rate_2i = ~((__u64)0), rate_2v = 0;
++                    __u64 second_weighted = 0;
++                    /* 0.4.56: pick by rate_ema * swap_score so a target with a
++                     * bad swap track record gets demoted automatically.  Store
++                     * raw rate_ema in rate_bv -- BPF's trigger math needs a rate. */
++                    for (j = 0; j < NUM_TCP_CONN_METRICS; j++) {
++                        __u64 rv = r.metrics[j].rate_ema;
++                        __u64 ss, weighted;
++                        if (r.metrics[j].metric_count < MIN_LEADER_TRUST) continue;
++                        if (rv == 0) continue;
++                        /* 0.4.60: no hard exclusion.  A bad or null streak
++                         * demotes the target instead of banning it, so it stays
++                         * in the pile and can climb back the moment it wins or
++                         * its rate_ema rises.  Penalty: 16/(16 + bad*4 + null*2).
++                         * bad=2 -> 0.67x, null=3 -> 0.73x, both -> 0.53x.
++                         *
++                         * 0.4.89 (M1): removed `if (ss == 0) ss = SWAP_SCORE_NEUTRAL`.
++                         * The reset-to-neutral defeated loss-driven demotion:
++                         * score_pending_swap legitimately drives swap_score to 0
++                         * after enough losses, and reanchor was resetting it to
++                         * 256 every 30s.  A legitimately-zeroed score now stays
++                         * 0, pass 3 excludes it (weighted = 0).  The bad_streak
++                         * penalty still applies on top; a recovering algo climbs
++                         * back when its bad_streak clears via the EMA-rise path. */
++                        ss = r.metrics[j].swap_score;
++                        weighted = rv * ss / SWAP_SCORE_NEUTRAL;
++                        {
++                            __u64 pen = 16
++                                + (__u64)r.metrics[j].bad_streak * 4
++                                + (__u64)r.metrics[j].null_streak * 2;
++                            weighted = weighted * 16 / pen;
++                        }
++                        if (rate_bv == 0 || weighted > best_weighted) {
++                            if (rate_bi != ~((__u64)0)) {
++                                rate_2i = rate_bi;
++                                rate_2v = rate_bv;
++                                second_weighted = best_weighted;
++                            }
++                            rate_bi = (__u64)j;
++                            rate_bv = rv;
++                            best_weighted = weighted;
++                        } else if (weighted > second_weighted &&
++                                   (__u64)j != rate_bi) {
++                            rate_2i = (__u64)j;
++                            rate_2v = rv;
++                            second_weighted = weighted;
++                        }
++                    }
++
++                    new_rbi = (rate_bv == 0) ? 0 : rate_bi;
++                    new_rbv = rate_bv;
++                    new_r2i = (rate_2v == 0) ? 0 : rate_2i;
++                    new_r2v = rate_2v;
++
++                }
++
++                /* No trusted leader: force the tracker to the empty state so
++                 * the swap path sees "no leader" rather than a stale value.
++                 */
++                if (best_v == 0) {
++                        new_bi = 0;
++                        new_bv = 0;
++                        new_si = 0;
++                        new_sv = 0;
++                } else {
++                        new_bi = best_i;
++                        new_bv = best_v;
++                        new_si = (second_v == 0) ? 0 : second_i;
++                        new_sv = second_v;
++                }
++
++                {
++                        __u64 ref_before = r.max_rate_delivered;
++
++                        __u64 scores_init = 0;
++
++                        int jj;
++
++
++                        /* 0.4.63: initialize stale swap_score=0 entries that have
++
++                         * votes.  0.4.62 set the score in set_cong(), but an algo
++
++                         * already in the state file with score=0 only inits when
++
++                         * set_cong runs for it -- on a bucket past coverage that's
++
++                         * the next epsilon-greedy draw, not the next reanchor.
++
++                         * Do it here so it clears within 30s. */
++
++                        for (jj = 0; jj < NUM_TCP_CONN_METRICS; jj++) {
++
++                            if (r.metrics[jj].swap_score == 0 &&
++
++                                r.metrics[jj].metric_count > 0) {
++
++                                r.metrics[jj].swap_score = SWAP_SCORE_NEUTRAL;
++
++                                scores_init++;
++
++                            }
++
++                        }
++
++                        /* 0.4.43: refresh max_rate_delivered from histogram.
++                         * Runs before the 'unchanged' early-continue so that a
++                         * stable bucket still refreshes its reference, and so
++                         * the histogram-derived value is written back to the map.
++                         */
++                        rate_hist_decay(&r.rate);
++                        {
++                                unsigned long long p99 = rate_hist_p99(&r.rate);
++                                if (p99 != r.max_rate_delivered)
++                                        r.max_rate_delivered = p99;
++                        }
++
++                        if (scores_init == 0 &&
+                                 ref_before == r.max_rate_delivered &&
+-				r.best_i == new_bi && r.best_v == new_bv &&
+-				r.second_i == new_si && r.second_v == new_sv &&
++                                r.best_i == new_bi && r.best_v == new_bv &&
++                                r.second_i == new_si && r.second_v == new_sv &&
+                                 r.rate_best_i == new_rbi &&
+                                 r.rate_best_v == new_rbv &&
+                                 r.rate_second_i == new_r2i &&
+                                 r.rate_second_v == new_r2v)
+-					continue;
+-		}
+-		bpftune_log(BPFTUNE_LOG_LEVEL,
+-			    "reanchor: best_i=%llu best_v=%llu (was %llu/%llu) second_i=%llu second_v=%llu (was %llu/%llu)\n",
+-			    (unsigned long long)new_bi,
+-			    (unsigned long long)new_bv,
+-			    (unsigned long long)r.best_i,
+-			    (unsigned long long)r.best_v,
+-			    (unsigned long long)new_si,
+-			    (unsigned long long)new_sv,
+-			    (unsigned long long)r.second_i,
+-			    (unsigned long long)r.second_v);
+-
+-		r.best_i = new_bi;
+-		r.best_v = new_bv;
+-		r.second_i = new_si;
+-		r.second_v = new_sv;
+-		r.rate_best_i = new_rbi;
+-		r.rate_best_v = new_rbv;
+-		r.rate_second_i = new_r2i;
+-		r.rate_second_v = new_r2v;
+-
+-		if (bpf_map_update_elem(map_fd, &key, &r, BPF_ANY)) {
+-			bpftune_log(LOG_ERR, "reanchor: update failed: %s\n",
+-				    strerror(errno));
+-			continue;
+-		}
+-		updated++;
+-	}
+-
+-	bpftune_log(LOG_DEBUG, "reanchor: cycle scanned=%u updated=%u\n",
+-		    scanned, updated);
++                                        continue;
++                }
++                bpftune_log(BPFTUNE_LOG_LEVEL,
++                            "reanchor: best_i=%llu best_v=%llu (was %llu/%llu) second_i=%llu second_v=%llu (was %llu/%llu)\n",
++                            (unsigned long long)new_bi,
++                            (unsigned long long)new_bv,
++                            (unsigned long long)r.best_i,
++                            (unsigned long long)r.best_v,
++                            (unsigned long long)new_si,
++                            (unsigned long long)new_sv,
++                            (unsigned long long)r.second_i,
++                            (unsigned long long)r.second_v);
++
++                r.best_i = new_bi;
++                r.best_v = new_bv;
++                r.second_i = new_si;
++                r.second_v = new_sv;
++                r.rate_best_i = new_rbi;
++                r.rate_best_v = new_rbv;
++                r.rate_second_i = new_r2i;
++                r.rate_second_v = new_r2v;
++
++                /* 0.4.89 (C1): re-read seq; if BPF voted during our
++                 * mutation, retry.  Preserves whatever BPF wrote by
++                 * re-reading the now-current struct and redoing the
++                 * pass 1/2/3 work on top of it. */
++                {
++                        struct remote_host check;
++                        if (bpf_map_lookup_elem(map_fd, &key, &check)) continue;
++                        seq2 = check.seq;
++                }
++                if (seq2 != seq1) {
++                        if (++retries > 4) {
++                                seq_skipped++;
++                                continue;
++                        }
++                        usleep(1000);
++                        goto retry;
++                }
++                if (bpf_map_update_elem(map_fd, &key, &r, BPF_ANY)) {
++                        bpftune_log(LOG_ERR, "reanchor: update failed: %s\n",
++                                    strerror(errno));
++                        continue;
++                }
++                updated++;
++        }
++
++        if (seq_skipped)
++                bpftune_log(LOG_DEBUG, "reanchor: %u buckets skipped (seq busy)\n",
++                            seq_skipped);
++        bpftune_log(LOG_DEBUG, "reanchor: cycle scanned=%u updated=%u\n",
++                    scanned, updated);
+ }
+ 
+ static void *reanchor_worker(void *arg)
+ {
+-	int fd = reanchor_fd;
+-	int i;
+-
+-	(void)arg;
+-
+-	if (fd < 0)
+-		return NULL;
+-
+-	/* Capabilities are per-thread; the voter worker issues BPF map
+-	 * syscalls so it needs CAP_SYS_ADMIN in its own effective set. */
+-	bpftune_cap_add();
+-
+-	while (!reanchor_stop) {
+-		reanchor_best(fd);
+-		apply_truth_corrections(fd);   /* 0.4.76 */
+-		/* Sleep in short slices so fini() does not stall more
+-		 * than ~1s waiting on pthread_join. */
+-		for (i = 0; i < REANCHOR_INTERVAL; i++) {
+-			if (reanchor_stop)
+-				break;
+-			sleep(1);
+-		}
+-	}
+-
+-	bpftune_cap_drop();
+-	return NULL;
++        int fd = reanchor_fd;
++        int i;
++
++        (void)arg;
++
++        if (fd < 0)
++                return NULL;
++
++        /* Capabilities are per-thread; the voter worker issues BPF map
++         * syscalls so it needs CAP_SYS_ADMIN in its own effective set. */
++        bpftune_cap_add();
++
++        while (!reanchor_stop) {
++                reanchor_best(fd);
++                apply_truth_corrections(fd);   /* 0.4.76 */
++                /* Sleep in short slices so fini() does not stall more
++                 * than ~1s waiting on pthread_join. */
++                for (i = 0; i < REANCHOR_INTERVAL; i++) {
++                        if (reanchor_stop)
++                                break;
++                        sleep(1);
++                }
++        }
++
++        bpftune_cap_drop();
++        return NULL;
+ }
+ 
+ static void start_reanchor(struct bpftuner *tuner)
+ {
+-	struct bpf_map *map;
+-	int fd;
+-
+-	if (reanchor_started)
+-		return;
+-
+-	map = bpftuner_bpf_map_get(tcp_conn, tuner, remote_host_map);
+-	if (!map) {
+-		bpftune_log(LOG_ERR, "reanchor: map not found\n");
+-		return;
+-	}
+-	fd = bpf_map__fd(map);
+-	if (fd < 0) {
+-		bpftune_log(LOG_ERR, "reanchor: bad map fd\n");
+-		return;
+-	}
+-	reanchor_fd = fd;
+-	reanchor_stop = 0;
+-	if (pthread_create(&reanchor_tid, NULL, reanchor_worker, NULL) != 0) {
+-		bpftune_log(LOG_ERR, "reanchor: pthread_create failed: %s\n",
+-			    strerror(errno));
+-		return;
+-	}
+-	reanchor_started = 1;
+-	bpftune_log(BPFTUNE_LOG_LEVEL,
+-		    "reanchor: worker started (interval %ds)\n",
+-		    REANCHOR_INTERVAL);
++        struct bpf_map *map;
++        int fd;
++
++        if (reanchor_started)
++                return;
++
++        map = bpftuner_bpf_map_get(tcp_conn, tuner, remote_host_map);
++        if (!map) {
++                bpftune_log(LOG_ERR, "reanchor: map not found\n");
++                return;
++        }
++        fd = bpf_map__fd(map);
++        if (fd < 0) {
++                bpftune_log(LOG_ERR, "reanchor: bad map fd\n");
++                return;
++        }
++        reanchor_fd = fd;
++        reanchor_stop = 0;
++        if (pthread_create(&reanchor_tid, NULL, reanchor_worker, NULL) != 0) {
++                bpftune_log(LOG_ERR, "reanchor: pthread_create failed: %s\n",
++                            strerror(errno));
++                return;
++        }
++        reanchor_started = 1;
++        bpftune_log(BPFTUNE_LOG_LEVEL,
++                    "reanchor: worker started (interval %ds)\n",
++                    REANCHOR_INTERVAL);
+ }
+ 
+ static void stop_reanchor(void)
+ {
+-	if (!reanchor_started)
+-		return;
+-	reanchor_stop = 1;
+-	pthread_join(reanchor_tid, NULL);
+-	reanchor_started = 0;
+-	bpftune_log(LOG_DEBUG, "reanchor: worker stopped\n");
++        if (!reanchor_started)
++                return;
++        reanchor_stop = 1;
++        pthread_join(reanchor_tid, NULL);
++        reanchor_started = 0;
++        bpftune_log(LOG_DEBUG, "reanchor: worker stopped\n");
+ }
+ 
+ #define STATE_DIR     "/var/lib/bpftune"
+ #define STATE_PATH    STATE_DIR "/tcp_conn_tuner.state"
+-/* 0.4.72: split the single STATE_VERSION into two independent
+- * numbers.
++/* 0.4.72: layout version split.  STATE_LAYOUT bumped only when struct
++ * remote_host changes size or shape.  The restore path enforces layout
++ * by comparing hdr.key_size / hdr.value_size against sizeof at runtime,
++ * which catches any real layout change; this number is informational.
+  *
+- *   STATE_LAYOUT  bumped only when struct remote_host changes size
+- *                 or shape.  The restore path enforces layout by
+- *                 comparing hdr.key_size / hdr.value_size against
+- *                 sizeof at runtime, which catches any real layout
+- *                 change; this number is informational for logs.
++ * 0.4.89 (Q1 + M6): removed STATE_EPOCH and migrate_remote_host.  The
++ * epoch mechanism was a no-op body that served only as a footgun for
++ * the next maintainer who bumped STATE_EPOCH expecting migration to
++ * run.  Future semantic changes bump STATE_LAYOUT (wiping the map and
++ * rebuilding from zero -- the same tax the epoch mechanism was
++ * supposed to avoid, but paid honestly and once per real change
++ * rather than as silent state corruption).
+  *
+- *   STATE_EPOCH   bumped when the MEANING of a field changes but
+- *                 the layout does not.  On load, an older file is
+- *                 accepted and migrate_remote_host() runs per entry
+- *                 to fix up the affected fields.  Everything not
+- *                 redefined is preserved -- swap_score, metric_value,
+- *                 metric_count, best_i/best_v, instances.  Only the
+- *                 fields whose units or source changed get reset.
+- *
+- * Motivation: 0.4.68/0.4.69/0.4.70/0.4.71 all bumped the old
+- * STATE_VERSION.  Three of those were semantics-only, so the map
+- * was wiped each time and spent ~2h rebuilding from zero.  The
+- * naive version split keeps paying that tax forever. */
++ * 0.4.89 (M6): STATE_LAYOUT bumped 1 -> 2 because sockets_alive /
++ * sockets_good / sockets_proved widened from __u16 to __u32.  Old
++ * state files (layout 1) will be refused by the size check below. */
+ #define STATE_MAGIC   0x42504654u
+-#define STATE_LAYOUT  1
+-#define STATE_EPOCH   1
++#define STATE_LAYOUT  2
+ struct state_header {
+         __u32 magic;
+         __u32 layout_version;   /* informational; not enforced */
+         __u32 key_size;         /* enforced: must match sizeof(key) */
+         __u32 value_size;       /* enforced: must match sizeof(val) */
+         __u32 num_entries;
+-        __u32 epoch;            /* semantics epoch; triggers migrate */
+ };
+ 
+-/* 0.4.72: per-entry semantics migration.  Called when the file's
+- * epoch is behind STATE_EPOCH.  The struct layout is unchanged
+- * across epochs -- only the meaning of individual fields.  Resets
+- * the affected fields to a neutral state; everything else the
+- * bucket has learned is preserved. */
+-static void migrate_remote_host(struct remote_host *r, __u32 from_epoch)
+-{
+-        int i;
+-
+-        /* Epoch 0 -> 1: rate_ema's source changed in 0.4.71 (byte-
+-         * over-time -> burst).  We deliberately do NOTHING here.
+-         *
+-         * Rationale: the whole point of the layout/epoch split is
+-         * that a semantics change must not empty the map.  Zeroing
+-         * rate_ema does exactly that -- pass 3 skips all algorithms
+-         * with rv == 0, so the leaderboard takes ~1h to rebuild.
+-         *
+-         * A file from 0.4.71 already has burst-sourced values: they
+-         * are correct and should be kept.  A file from 0.4.69/0.4.70
+-         * has byte-sourced values (12-30 range); wrong units, but
+-         * they wash out over ~16 votes per algorithm when new votes
+-         * land -- which is the same decay that would have applied to
+-         * the reset anyway.  Trusting the values is strictly better
+-         * than zeroing them. */
+-        (void)from_epoch;
+-        (void)i;
+-        /* Future epochs: add a block here for each. */
+-}
++/* 0.4.89 (Q1): migrate_remote_host removed.  See STATE_LAYOUT note
++ * above.  No per-entry migration is performed on load; layout
++ * incompatibility is caught by the size check in restore_remote_host_map
++ * and the map is rebuilt from zero. */
+ 
+ static int restore_remote_host_map(struct bpftuner *tuner)
+ {
+@@ -1061,9 +1210,8 @@ static int restore_remote_host_map(struct bpftuner *tuner)
+                 err = -1; goto out;
+         }
+         /* 0.4.72: layout compatibility is enforced by the two size
+-         * fields -- a struct change cannot pass this check.  The
+-         * epoch is NOT enforced: a semantics-only change loads the
+-         * file and runs migrate_remote_host per entry. */
++         * fields -- a struct change cannot pass this check.
++         * 0.4.89 (Q1): the epoch mechanism was removed. */
+         if (hdr.magic != STATE_MAGIC ||
+             hdr.key_size != sizeof(key) ||
+             hdr.value_size != sizeof(val)) {
+@@ -1075,12 +1223,6 @@ static int restore_remote_host_map(struct bpftuner *tuner)
+                             hdr.value_size, sizeof(val));
+                 err = -1; goto out;
+         }
+-        if (hdr.epoch != STATE_EPOCH) {
+-                bpftune_log(LOG_INFO,
+-                            "tcp_conn_tuner: %s: migrating state from "
+-                            "epoch %u to %u\n",
+-                            STATE_PATH, hdr.epoch, (__u32)STATE_EPOCH);
+-        }
+ 
+         for (i = 0; i < hdr.num_entries; i++) {
+                 if (fread(&key, sizeof(key), 1, f) != 1 ||
+@@ -1089,8 +1231,6 @@ static int restore_remote_host_map(struct bpftuner *tuner)
+                                     STATE_PATH, i);
+                         err = -1; goto out;
+                 }
+-                if (hdr.epoch != STATE_EPOCH)
+-                        migrate_remote_host(&val, hdr.epoch);
+                 if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY))
+                         bpftune_log(LOG_DEBUG, "tcp_conn_tuner: restore: update failed for entry %u\n", i);
+         }
+@@ -1106,8 +1246,7 @@ static int save_remote_host_map(struct bpftuner *tuner)
+ {
+         struct bpf_map *map = bpftuner_bpf_map_get(tcp_conn, tuner, remote_host_map);
+         struct state_header hdr = { .magic = STATE_MAGIC,
+-                                    .layout_version = STATE_LAYOUT,
+-                                    .epoch = STATE_EPOCH };
++                                    .layout_version = STATE_LAYOUT };
+         struct in6_addr key, next_key;
+         struct remote_host val;
+         void *prev = NULL;
+@@ -1153,6 +1292,17 @@ next:
+         bpftune_log(LOG_DEBUG, "tcp_conn_tuner: saved %u entries to %s\n",
+                     hdr.num_entries, STATE_PATH);
+ out:
++        /* 0.4.89 (C5): fsync before rename so a crash between rename
++         * and the actual disk flush doesn't leave STATE_PATH with a
++         * zero-length or partially-written file.  Without this, a
++         * kernel panic or power loss could corrupt the state file --
++         * exactly the situation save_remote_host_map is meant to
++         * prevent.  fsync the parent dir too so the rename itself is
++         * durable. */
++        if (!err && f) {
++                fflush(f);
++                fsync(fileno(f));
++        }
+         fclose(f);
+         if (err) {
+                 unlink(tmp);
+@@ -1165,23 +1315,31 @@ out:
+                 unlink(tmp);
+                 return -errno;
+         }
++        /* fsync the parent directory so the rename is durable too. */
++        {
++                int dirfd = open(STATE_DIR, O_RDONLY | O_DIRECTORY);
++                if (dirfd >= 0) {
++                        fsync(dirfd);
++                        close(dirfd);
++                }
++        }
+         return 0;
+ }
+ 
+ void fini(struct bpftuner *tuner)
+ {
+-	bpftune_log(LOG_DEBUG, "calling fini for %s\n", tuner->name);
+-	stop_reanchor();
+-	bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
+-	bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
++        bpftune_log(LOG_DEBUG, "calling fini for %s\n", tuner->name);
++        stop_reanchor();
++        bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
++        bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
+         save_remote_host_map(tuner);
+-	summarize(tuner);
+-	bpftuner_bpf_fini(tuner);
++        summarize(tuner);
++        bpftuner_bpf_fini(tuner);
+ }
+ 
+ void event_handler(struct bpftuner *tuner,  __attribute__((unused))struct bpftune_event *event,
+-		   __attribute__((unused))void *ctx)
++                   __attribute__((unused))void *ctx)
+ {
+-	bpftune_log(LOG_DEBUG,
+-		    "%s: got unexpected event\n", tuner->name);
++        bpftune_log(LOG_DEBUG,
++                    "%s: got unexpected event\n", tuner->name);
+ }
+diff --git a/src/tcp_conn_tuner.h b/src/tcp_conn_tuner.h
+index 15c523c..f8c21f2 100644
+--- a/src/tcp_conn_tuner.h
++++ b/src/tcp_conn_tuner.h
+@@ -83,8 +83,8 @@ const char congs[NUM_TCP_CONG_ALGS][CONG_MAXNAME] = {
+  * the bins; it only appends.
+  */
+ struct rate_hist {
+-	__u32 bins[RATE_HIST_BINS];
+-	__u64 total;
++        __u32 bins[RATE_HIST_BINS];
++        __u64 total;
+ };
+ 
+ struct conn_state {
+@@ -118,32 +118,32 @@ struct conn_state {
+      * (shape across an algorithm change is not meaningful). */
+     __u64 hist_1;
+     __u64 hist_2;
+-	/* 0.4.44 proof tracking.  One bit per algorithm.  touched is set
+-	 * on first contact with an alg (initial selection or swap-in);
+-	 * good / proved are set the first time the socket's delivered
+-	 * rate crosses the matching tier while on that alg.  cleaned is
+-	 * a one-shot flag so the close decrement runs exactly once even
+-	 * if STATE_CB fires on multiple transitions. */
+-	__u64 touched_bitmap;
+-	__u64 good_bitmap;
+-	__u64 proved_bitmap;
+-	__u64 cleaned;
+-
+-
+-	/* 0.4.56: pending-swap scoring. */
+-
+-	__u64 pre_swap_rate;
+-	__u64 post_swap_rate_max;
+-
+-	__u64 swap_target;
+-
+-	/* 0.4.68/0.4.69: rolling window for sustained-rate computation.
+-	 * rate_win_ts_ns == 0 means the window has not been seeded
+-	 * (socket's first vote).  rate_win_bytes is
+-	 * bytes_acked + bytes_received at that boundary.  (0.4.68 used
+-	 * segs_out+segs_in, which undercounted GSO super-segments.) */
+-	__u64 rate_win_ts_ns;
+-	__u64 rate_win_bytes;
++        /* 0.4.44 proof tracking.  One bit per algorithm.  touched is set
++         * on first contact with an alg (initial selection or swap-in);
++         * good / proved are set the first time the socket's delivered
++         * rate crosses the matching tier while on that alg.  cleaned is
++         * a one-shot flag so the close decrement runs exactly once even
++         * if STATE_CB fires on multiple transitions. */
++        __u64 touched_bitmap;
++        __u64 good_bitmap;
++        __u64 proved_bitmap;
++        __u64 cleaned;
++
++
++        /* 0.4.56: pending-swap scoring. */
++
++        __u64 pre_swap_rate;
++        __u64 post_swap_rate_max;
++
++        __u64 swap_target;
++
++        /* 0.4.68/0.4.69: rolling window for sustained-rate computation.
++         * rate_win_ts_ns == 0 means the window has not been seeded
++         * (socket's first vote).  rate_win_bytes is
++         * bytes_acked + bytes_received at that boundary.  (0.4.68 used
++         * segs_out+segs_in, which undercounted GSO super-segments.) */
++        __u64 rate_win_ts_ns;
++        __u64 rate_win_bytes;
+ };
+ 
+ struct tcp_conn_metric {
+@@ -151,20 +151,25 @@ struct tcp_conn_metric {
+     __u64 greedy_count;
+     __u64 metric_count;
+     __u64 metric_value;
+-	/* 0.4.44 proof tracking.  sockets_alive counts sockets currently
+-	 * on this alg; decremented at socket close for every alg the
+-	 * socket ever touched.  sockets_good / sockets_proved count the
+-	 * subset that crossed each tier at some point while on this alg. */
+-	__u16 sockets_alive;
+-	__u16 sockets_good;
+-	__u16 sockets_proved;
+-
+-	/* 0.4.45: rate EMA in 100KB/s units; swap target reads it. */
+-
+-	__u16 rate_ema;
+-	__u16 swap_score;
+-	__u8  bad_streak;   /* 0.4.58: consecutive failed swaps to this alg */
+-	__u8  null_streak;  /* 0.4.59: consecutive null swaps to this alg */
++        /* 0.4.44 proof tracking.  sockets_alive counts sockets currently
++         * on this alg; decremented at socket close for every alg the
++         * socket ever touched.  sockets_good / sockets_proved count the
++         * subset that crossed each tier at some point while on this alg.
++         *
++         * 0.4.89: widened from __u16 to __u32.  High-churn CDN buckets
++         * hit 65k sockets per alg in days, at which point __u16 wraps
++         * to 0 and the guarded decrement pins it there forever.
++         * STATE_LAYOUT bumped to 2; old state files refuse to load. */
++        __u32 sockets_alive;
++        __u32 sockets_good;
++        __u32 sockets_proved;
++
++        /* 0.4.45: rate EMA in 100KB/s units; swap target reads it. */
++
++        __u16 rate_ema;
++        __u16 swap_score;
++        __u8  bad_streak;   /* 0.4.58: consecutive failed swaps to this alg */
++        __u8  null_streak;  /* 0.4.59: consecutive null swaps to this alg */
+ };
+ 
+ #define NUM_TCP_CONN_METRICS NUM_TCP_CONG_ALGS
+@@ -191,6 +196,13 @@ struct tcp_conn_event_data {
+ };
+ 
+ struct remote_host {
++    /* 0.4.89: sequence counter for reanchor-vs-BPF race fix (C1).
++     * BPF increments seq before and after every in-place update via
++     * __sync_fetch_and_add.  Userspace reads seq, does read-modify-write
++     * of the full struct, reads seq again; if it changed, retries.
++     * Even = stable, odd = mid-update.  Counter wraps at 2^64;
++     * userspace compares equality, not magnitude, so wrap is fine. */
++    __u64 seq;
+     __u64 min_rtt;
+     __u64 max_rate_delivered;
+     __u64 instances;
+@@ -217,7 +229,7 @@ struct remote_host {
+      * reference reading is treated as an outlier; REF_HIGH_STREAK_N
+      * in a row promote the reference to the best of the streak.
+      * Frozen while allow_ref_update is false (control-plane votes). */
+-    __u64 rtt_low_streak;	/* RTT side -- unchanged this release */
++    __u64 rtt_low_streak;       /* RTT side -- unchanged this release */
+     __u64 rtt_low_min;
+     struct rate_hist rate;   /* rate side: histogram replaces streaks */
+     struct tcp_conn_metric metrics[NUM_TCP_CONN_METRICS];
+@@ -511,3 +523,79 @@ static __always_inline __u64 tcp_metric_calc(struct remote_host *r,
+                 *heal_rate_out = heal_rate;
+         return metric;
+ }
++
++/* 0.4.89 (Q2): helpers for the rate-EMA -> B/s conversion and the
++ * socket-vs-leader ratio test.  Replaces the `* 100000ULL * 100` and
++ * `* 4` magic in the vote path with named, unit-correct math. */
++static __always_inline __u64 rate_ema_to_bps(__u16 ema)
++{
++        return (__u64)ema * RATE_EMA_BYTES_PER_UNIT;
++}
++
++/* Returns true if socket_bps is under (pct% of) the leader's rate_ema
++ * (converted to B/s).  Either side being 0 means "no signal" and
++ * returns false -- the caller's existing !rate_best_v checks still
++ * apply. */
++static __always_inline bool
++socket_under_pct_of_leader(__u64 socket_bps, __u16 leader_ema, __u32 pct)
++{
++        __u64 leader_bps;
++        if (!socket_bps || !leader_ema)
++                return false;
++        leader_bps = rate_ema_to_bps(leader_ema);
++        return socket_bps * 100 < leader_bps * pct;
++}
++
++/* 0.4.89 (Q3): shared swap-outcome update.  Both score_pending_swap
++ * and score_pending_rejected compute ratio_q (post/pre * 256), then
++ * move swap_score toward ratio_q and update bad_streak/null_streak.
++ * This helper does the move + streak update; callers compute ratio_q
++ * per their own gating rules (score_pending_swap caps at 1024,
++ * score_pending_rejected caps at 230 if <30s elapsed).
++ *
++ * Thresholds (matching the 0.4.74/0.4.82 design):
++ *   ratio_q >= 282  -> win  : both streaks = 0
++ *   ratio_q <= 230  -> loss : bad_streak++ (cap 255), null_streak = 0
++ *   between         -> null : null_streak++ (cap 255), bad_streak unchanged
++ */
++static __always_inline void
++apply_swap_outcome(struct remote_host *rh, __u8 tgt, __u64 ratio_q)
++{
++        __u16 cur16 = rh->metrics[tgt].swap_score;
++        __u32 cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
++
++        if (ratio_q >= 282) {
++                if (ratio_q >= cur32) {
++                        __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_STEP_DIV;
++                        cur32 += step;
++                } else {
++                        __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_STEP_DIV;
++                        cur32 = (drop > cur32) ? 0 : cur32 - drop;
++                }
++        } else if (ratio_q > 230) {
++                /* 0.4.74: null is a no-op on swap_score; streaks below. */
++        } else {
++                if (ratio_q >= cur32) {
++                        __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_LOSS_DIV;
++                        cur32 += step;
++                } else {
++                        __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_LOSS_DIV;
++                        cur32 = (drop > cur32) ? 0 : cur32 - drop;
++                }
++        }
++        if (cur32 > 1024)
++                cur32 = 1024;
++        rh->metrics[tgt].swap_score = (__u16)cur32;
++
++        if (ratio_q >= 282) {
++                rh->metrics[tgt].bad_streak = 0;
++                rh->metrics[tgt].null_streak = 0;
++        } else if (ratio_q <= 230) {
++                if (rh->metrics[tgt].bad_streak < 255)
++                        rh->metrics[tgt].bad_streak++;
++                rh->metrics[tgt].null_streak = 0;
++        } else {
++                if (rh->metrics[tgt].null_streak < 255)
++                        rh->metrics[tgt].null_streak++;
++        }
++}

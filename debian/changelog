@@ -1,3 +1,82 @@
+bpftune (0.4.89) unstable; urgency=medium
+
+  * Fix: reanchor-vs-BPF race via sequence counter (C1).  Added __u64 seq
+    to struct remote_host; BPF wraps every in-place update with
+    __sync_fetch_and_add(&rh->seq, 1).  Userspace reanchor_best and
+    apply_truth_corrections retry read-modify-write if seq changed.
+    Caps at 4 retries per bucket, logs and skips on persistent flux.
+    Without this, the read-modify-write of the 792-byte struct clobbered
+    any BPF vote that landed between lookup and update.
+  * Fix: reset rate_win_ts_ns and rate_win_bytes on swap (C2).  The
+    first sustained_bps measurement after a swap straddled the swap
+    point -- mixing pre-swap and post-swap bytes -- and could inflate
+    post_swap_rate_max if the pre-swap alg was carrying a higher rate.
+  * Fix: score pending swap on socket close if >=30s elapsed (C3).  A
+    socket that swapped then closed before its next segment-rung vote
+    was never scored; the pending swap_target stayed unscored.  Uses
+    the LAST_CHANCE_MIN_NS (30s) gate matching score_pending_rejected.
+  * Fix: replace TRUTH_MAX_BUCKETS=256 fixed array with 4096-slot
+    open-addressing hash table (C4).  Old code silently dropped
+    corrections for buckets past 256 -- a real cap on busy multi-CDN
+    hosts.  Also fixes the O(n²) linear scan-per-line.
+  * Fix: fsync before rename in save_remote_host_map (C5).  A crash
+    between rename and the actual disk flush could leave STATE_PATH
+    with a zero-length or partially-written file.  Also fsync the
+    parent directory so the rename itself is durable.
+  * Fix: atomic increments for tcp_cong_choices and tcp_thin_lto_choices
+    (C6).  Plain ++ raced across CPUs and undercounted.  Same
+    __sync_fetch_and_add pattern already used for instances.
+  * Fix: remove swap_score=0 reset to neutral in reanchor (M1).  The
+    reset defeated loss-driven demotion: score_pending_swap legitimately
+    drives swap_score to 0 after enough losses, and reanchor was
+    resetting it to 256 every 30s.  Bad_streak penalty still applies.
+  * Fix: drop unused cur_rate parameter from score_pending_rejected (M2).
+    The function uses post_swap_rate_max (running peak), not a momentary
+    rate.  Call sites updated.
+  * Fix: widen sockets_alive/good/proved from __u16 to __u32 (M6).
+    High-churn CDN buckets hit 65k sockets per alg in days, at which
+    point __u16 wraps to 0 and the guarded decrement pins it there
+    forever.  STATE_LAYOUT bumped 1 -> 2; old state files refuse to
+    load (caught by the size check).  Map rebuilds from zero on first
+    boot after upgrade.
+  * Fix: special-case first sample after poisoned ~0 sentinel (Q4).
+    The EMA formula happened to produce the right answer when __div=1,
+    but with __div>1 it produced a still-huge value that passed the
+    v != ~0 filter and entered the best_v tracker as a poisoned value.
+  * Refactor: extract apply_swap_outcome() helper (Q3).  score_pending_swap
+    and score_pending_rejected shared ~50 lines of score/streak update
+    logic; now both delegate to a shared __always_inline helper.
+  * Refactor: factor rate-EMA->B/s and socket-vs-leader ratio magic
+    into socket_under_pct_of_leader() helper (Q2).  Replaces
+    `last_rate_bps * 150 < rate_best_v * 100000ULL * 100` with named,
+    unit-correct math.
+  * Refactor: remove migrate_remote_host + STATE_EPOCH (Q1).  The
+    epoch mechanism was a no-op body that served only as a footgun
+    for the next maintainer who bumped STATE_EPOCH expecting migration
+    to run.  Future semantic changes bump STATE_LAYOUT (wiping the
+    map and rebuilding from zero).
+  * Refactor: remove dead tcp_iter_fd variable (Q6).
+  * Fix: escape JSON special chars in alias labels (M7).  A label
+    containing " or \ would produce malformed JSON and break the
+    dashboard's parser.
+  * Fix: check bpftuner_cgroup_attach return in retry loop (M8).  Was
+    silently ignored; failures now logged.  Also log when popen(bpftool)
+    fails so a missing binary is visible.
+  * Fix: document the 30s vs 180s threshold asymmetry (M3).  The 30s
+    gate in score_pending_rejected (last-chance for preempted swaps)
+    vs 180s in score_pending_swap (settling for completed swaps) is
+    intentional.
+  * Fix: bounds math comment for reanchor pass-3 weighted product (M5).
+  * Fix: use getline() instead of fixed 512-byte buf in truth parser (M4).
+    Truth lines can exceed 512 chars with labels and timestamps.
+  * Feature: bpftune_debug BPF variable (Q5).  Defaults to 1 (verbose,
+    matching pre-0.4.89 behavior).  All bpf_printk calls in the vote
+    path are now gated behind `if (bpftune_debug)`.  Set to 0 via
+    `bpftune --quiet` (or by writing the BPF global directly) to
+    silence kernel log noise on production hosts.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Sat, 04 Oct 2026 02:00:00 +0200
+
 bpftune (0.4.88) unstable; urgency=medium
 
   * Fix: re-enable swap_score write in score_pending_rejected (Bug T1).

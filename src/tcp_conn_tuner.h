@@ -83,8 +83,8 @@ const char congs[NUM_TCP_CONG_ALGS][CONG_MAXNAME] = {
  * the bins; it only appends.
  */
 struct rate_hist {
-	__u32 bins[RATE_HIST_BINS];
-	__u64 total;
+        __u32 bins[RATE_HIST_BINS];
+        __u64 total;
 };
 
 struct conn_state {
@@ -118,32 +118,32 @@ struct conn_state {
      * (shape across an algorithm change is not meaningful). */
     __u64 hist_1;
     __u64 hist_2;
-	/* 0.4.44 proof tracking.  One bit per algorithm.  touched is set
-	 * on first contact with an alg (initial selection or swap-in);
-	 * good / proved are set the first time the socket's delivered
-	 * rate crosses the matching tier while on that alg.  cleaned is
-	 * a one-shot flag so the close decrement runs exactly once even
-	 * if STATE_CB fires on multiple transitions. */
-	__u64 touched_bitmap;
-	__u64 good_bitmap;
-	__u64 proved_bitmap;
-	__u64 cleaned;
+        /* 0.4.44 proof tracking.  One bit per algorithm.  touched is set
+         * on first contact with an alg (initial selection or swap-in);
+         * good / proved are set the first time the socket's delivered
+         * rate crosses the matching tier while on that alg.  cleaned is
+         * a one-shot flag so the close decrement runs exactly once even
+         * if STATE_CB fires on multiple transitions. */
+        __u64 touched_bitmap;
+        __u64 good_bitmap;
+        __u64 proved_bitmap;
+        __u64 cleaned;
 
 
-	/* 0.4.56: pending-swap scoring. */
+        /* 0.4.56: pending-swap scoring. */
 
-	__u64 pre_swap_rate;
-	__u64 post_swap_rate_max;
+        __u64 pre_swap_rate;
+        __u64 post_swap_rate_max;
 
-	__u64 swap_target;
+        __u64 swap_target;
 
-	/* 0.4.68/0.4.69: rolling window for sustained-rate computation.
-	 * rate_win_ts_ns == 0 means the window has not been seeded
-	 * (socket's first vote).  rate_win_bytes is
-	 * bytes_acked + bytes_received at that boundary.  (0.4.68 used
-	 * segs_out+segs_in, which undercounted GSO super-segments.) */
-	__u64 rate_win_ts_ns;
-	__u64 rate_win_bytes;
+        /* 0.4.68/0.4.69: rolling window for sustained-rate computation.
+         * rate_win_ts_ns == 0 means the window has not been seeded
+         * (socket's first vote).  rate_win_bytes is
+         * bytes_acked + bytes_received at that boundary.  (0.4.68 used
+         * segs_out+segs_in, which undercounted GSO super-segments.) */
+        __u64 rate_win_ts_ns;
+        __u64 rate_win_bytes;
 };
 
 struct tcp_conn_metric {
@@ -151,20 +151,25 @@ struct tcp_conn_metric {
     __u64 greedy_count;
     __u64 metric_count;
     __u64 metric_value;
-	/* 0.4.44 proof tracking.  sockets_alive counts sockets currently
-	 * on this alg; decremented at socket close for every alg the
-	 * socket ever touched.  sockets_good / sockets_proved count the
-	 * subset that crossed each tier at some point while on this alg. */
-	__u16 sockets_alive;
-	__u16 sockets_good;
-	__u16 sockets_proved;
+        /* 0.4.44 proof tracking.  sockets_alive counts sockets currently
+         * on this alg; decremented at socket close for every alg the
+         * socket ever touched.  sockets_good / sockets_proved count the
+         * subset that crossed each tier at some point while on this alg.
+         *
+         * 0.4.89: widened from __u16 to __u32.  High-churn CDN buckets
+         * hit 65k sockets per alg in days, at which point __u16 wraps
+         * to 0 and the guarded decrement pins it there forever.
+         * STATE_LAYOUT bumped to 2; old state files refuse to load. */
+        __u32 sockets_alive;
+        __u32 sockets_good;
+        __u32 sockets_proved;
 
-	/* 0.4.45: rate EMA in 100KB/s units; swap target reads it. */
+        /* 0.4.45: rate EMA in 100KB/s units; swap target reads it. */
 
-	__u16 rate_ema;
-	__u16 swap_score;
-	__u8  bad_streak;   /* 0.4.58: consecutive failed swaps to this alg */
-	__u8  null_streak;  /* 0.4.59: consecutive null swaps to this alg */
+        __u16 rate_ema;
+        __u16 swap_score;
+        __u8  bad_streak;   /* 0.4.58: consecutive failed swaps to this alg */
+        __u8  null_streak;  /* 0.4.59: consecutive null swaps to this alg */
 };
 
 #define NUM_TCP_CONN_METRICS NUM_TCP_CONG_ALGS
@@ -191,6 +196,13 @@ struct tcp_conn_event_data {
 };
 
 struct remote_host {
+    /* 0.4.89: sequence counter for reanchor-vs-BPF race fix (C1).
+     * BPF increments seq before and after every in-place update via
+     * __sync_fetch_and_add.  Userspace reads seq, does read-modify-write
+     * of the full struct, reads seq again; if it changed, retries.
+     * Even = stable, odd = mid-update.  Counter wraps at 2^64;
+     * userspace compares equality, not magnitude, so wrap is fine. */
+    __u64 seq;
     __u64 min_rtt;
     __u64 max_rate_delivered;
     __u64 instances;
@@ -217,7 +229,7 @@ struct remote_host {
      * reference reading is treated as an outlier; REF_HIGH_STREAK_N
      * in a row promote the reference to the best of the streak.
      * Frozen while allow_ref_update is false (control-plane votes). */
-    __u64 rtt_low_streak;	/* RTT side -- unchanged this release */
+    __u64 rtt_low_streak;       /* RTT side -- unchanged this release */
     __u64 rtt_low_min;
     struct rate_hist rate;   /* rate side: histogram replaces streaks */
     struct tcp_conn_metric metrics[NUM_TCP_CONN_METRICS];
@@ -510,4 +522,80 @@ static __always_inline __u64 tcp_metric_calc(struct remote_host *r,
         if (heal_rate_out)
                 *heal_rate_out = heal_rate;
         return metric;
+}
+
+/* 0.4.89 (Q2): helpers for the rate-EMA -> B/s conversion and the
+ * socket-vs-leader ratio test.  Replaces the `* 100000ULL * 100` and
+ * `* 4` magic in the vote path with named, unit-correct math. */
+static __always_inline __u64 rate_ema_to_bps(__u16 ema)
+{
+        return (__u64)ema * RATE_EMA_BYTES_PER_UNIT;
+}
+
+/* Returns true if socket_bps is under (pct% of) the leader's rate_ema
+ * (converted to B/s).  Either side being 0 means "no signal" and
+ * returns false -- the caller's existing !rate_best_v checks still
+ * apply. */
+static __always_inline bool
+socket_under_pct_of_leader(__u64 socket_bps, __u16 leader_ema, __u32 pct)
+{
+        __u64 leader_bps;
+        if (!socket_bps || !leader_ema)
+                return false;
+        leader_bps = rate_ema_to_bps(leader_ema);
+        return socket_bps * 100 < leader_bps * pct;
+}
+
+/* 0.4.89 (Q3): shared swap-outcome update.  Both score_pending_swap
+ * and score_pending_rejected compute ratio_q (post/pre * 256), then
+ * move swap_score toward ratio_q and update bad_streak/null_streak.
+ * This helper does the move + streak update; callers compute ratio_q
+ * per their own gating rules (score_pending_swap caps at 1024,
+ * score_pending_rejected caps at 230 if <30s elapsed).
+ *
+ * Thresholds (matching the 0.4.74/0.4.82 design):
+ *   ratio_q >= 282  -> win  : both streaks = 0
+ *   ratio_q <= 230  -> loss : bad_streak++ (cap 255), null_streak = 0
+ *   between         -> null : null_streak++ (cap 255), bad_streak unchanged
+ */
+static __always_inline void
+apply_swap_outcome(struct remote_host *rh, __u8 tgt, __u64 ratio_q)
+{
+        __u16 cur16 = rh->metrics[tgt].swap_score;
+        __u32 cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
+
+        if (ratio_q >= 282) {
+                if (ratio_q >= cur32) {
+                        __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_STEP_DIV;
+                        cur32 += step;
+                } else {
+                        __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_STEP_DIV;
+                        cur32 = (drop > cur32) ? 0 : cur32 - drop;
+                }
+        } else if (ratio_q > 230) {
+                /* 0.4.74: null is a no-op on swap_score; streaks below. */
+        } else {
+                if (ratio_q >= cur32) {
+                        __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_LOSS_DIV;
+                        cur32 += step;
+                } else {
+                        __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_LOSS_DIV;
+                        cur32 = (drop > cur32) ? 0 : cur32 - drop;
+                }
+        }
+        if (cur32 > 1024)
+                cur32 = 1024;
+        rh->metrics[tgt].swap_score = (__u16)cur32;
+
+        if (ratio_q >= 282) {
+                rh->metrics[tgt].bad_streak = 0;
+                rh->metrics[tgt].null_streak = 0;
+        } else if (ratio_q <= 230) {
+                if (rh->metrics[tgt].bad_streak < 255)
+                        rh->metrics[tgt].bad_streak++;
+                rh->metrics[tgt].null_streak = 0;
+        } else {
+                if (rh->metrics[tgt].null_streak < 255)
+                        rh->metrics[tgt].null_streak++;
+        }
 }

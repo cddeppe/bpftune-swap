@@ -22,11 +22,17 @@
 _Static_assert(sizeof(struct remote_host) <= 1024,
                "remote_host too large for BPF memset");
 
-#define TCP_THIN_LINEAR_TIMEOUTS	16
+#define TCP_THIN_LINEAR_TIMEOUTS        16
 
 __u64 tcp_cong_choices[NUM_TCP_CONG_ALGS];
 
 long long tcp_thin_lto = 0;
+
+/* 0.4.89 (Q5): debug toggle.  Default 1 (verbose, matching pre-0.4.89
+ * behavior).  Set to 0 via 'bpftune --quiet' to silence bpf_printk
+ * calls in the vote path.  Read on every vote; the cost is one map
+ * lookup, which is negligible compared to the printk itself. */
+__u64 bpftune_debug = 1;
 
 BPF_MAP_DEF(remote_host_map, BPF_MAP_TYPE_LRU_HASH, struct in6_addr, struct remote_host, 4096, 0);
 
@@ -54,39 +60,44 @@ BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
  * makes struct remote_host 792 bytes, exceeding the 512-byte stack limit).
  */
 BPF_MAP_DEF(remote_host_scratch, BPF_MAP_TYPE_PERCPU_ARRAY, __u32,
-	    struct remote_host, 1, 0);
+            struct remote_host, 1, 0);
 
 /* if we have not looked up the host >= REMOTE_HOST_MIN_INSTANCES, return NULL.
  * This ensures we only apply RL to hosts with which we have multiple
  * interactions.
  */
 static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
-							   bool initial)
+                                                           bool initial)
 {
-	__u32 zero = 0;
-	struct remote_host *remote_host;
-	struct remote_host *scratch;
+        __u32 zero = 0;
+        struct remote_host *remote_host;
+        struct remote_host *scratch;
 
-	remote_host = bpf_map_lookup_elem(&remote_host_map, key);
-	if (remote_host) {
-		if (initial)
-			__sync_fetch_and_add(&remote_host->instances, 1);
-	} else {
-		/* Use per-CPU scratch to avoid a >512B stack temporary.
-		 * bpf_map_update_elem copies sizeof(*scratch) bytes from
-		 * the kernel-memory scratch buffer into the hash map.
-		 */
-		scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
-		if (!scratch)
-			return NULL;
-		__builtin_memset(scratch, 0, sizeof(*scratch));
-		scratch->instances = 1;
-		bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
-		return NULL;
-	}
-	if (remote_host->instances < REMOTE_HOST_MIN_INSTANCES)
-		return NULL;
-	return remote_host;
+        remote_host = bpf_map_lookup_elem(&remote_host_map, key);
+        if (remote_host) {
+                if (initial) {
+                        /* 0.4.89 (C1): seq-wrap the instances++ so
+                         * reanchor's read-modify-write sees the change. */
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                        __sync_fetch_and_add(&remote_host->instances, 1);
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                }
+        } else {
+                /* Use per-CPU scratch to avoid a >512B stack temporary.
+                 * bpf_map_update_elem copies sizeof(*scratch) bytes from
+                 * the kernel-memory scratch buffer into the hash map.
+                 */
+                scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
+                if (!scratch)
+                        return NULL;
+                __builtin_memset(scratch, 0, sizeof(*scratch));
+                scratch->instances = 1;
+                bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
+                return NULL;
+        }
+        if (remote_host->instances < REMOTE_HOST_MIN_INSTANCES)
+                return NULL;
+        return remote_host;
 }
 
 /* 0.4.64: explore with probability pct% (0=never, 100=always).
@@ -95,12 +106,12 @@ static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
 static __always_inline int
 epsilon_greedy_pct(__u32 greedy_state, __u32 num_states, __u32 pct)
 {
-	__u32 r = bpf_get_prandom_u32();
+        __u32 r = bpf_get_prandom_u32();
 
     if (pct < 100 && (r % 100) >= pct)
-		return greedy_state;
-	r = bpf_get_prandom_u32();
-	return r % num_states;
+                return greedy_state;
+        r = bpf_get_prandom_u32();
+        return r % num_states;
 }
 
 /* 0.4.66: number of votes a freshly-assigned socket is protected
@@ -117,16 +128,16 @@ epsilon_greedy_pct(__u32 greedy_state, __u32 num_states, __u32 pct)
  * applies consistently to all sockets immediately. */
 static __always_inline __u32 explore_protect_votes(void)
 {
-	__u32 zero = 0;
-	__u32 pct = EXPLORE_PCT_DEFAULT;
-	__u32 *p = bpf_map_lookup_elem(&tuner_config_map, &zero);
-	if (p)
-		pct = *p;
-	if (pct > EXPLORE_PCT_MAX)
-		pct = EXPLORE_PCT_MAX;
-	if (pct >= 100)
-		return 0;
-	return (EXPLORE_PROTECT_VOTES * (100 - pct)) / 95;
+        __u32 zero = 0;
+        __u32 pct = EXPLORE_PCT_DEFAULT;
+        __u32 *p = bpf_map_lookup_elem(&tuner_config_map, &zero);
+        if (p)
+                pct = *p;
+        if (pct > EXPLORE_PCT_MAX)
+                pct = EXPLORE_PCT_MAX;
+        if (pct >= 100)
+                return 0;
+        return (EXPLORE_PROTECT_VOTES * (100 - pct)) / 95;
 }
 
 /* 0.4.79: v4 bucket prefix, read live from tuner_config_map[1].
@@ -218,48 +229,53 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
                                     struct remote_host *remote_host,
                                     __u8 i)
 {
-	int ret;
+        int ret;
 
-	ret = bpf_setsockopt(ops, SOL_TCP, TCP_CONGESTION, (void *)congs[i],
-	                     sizeof(congs[i]));
-	if (ret)
-		return ret;
-	tcp_cong_choices[i & (NUM_TCP_CONG_ALGS - 1)]++;
-	/* update state */
-	struct bpf_sock *sk = ops->sk;
-	struct conn_state *statep;
+        ret = bpf_setsockopt(ops, SOL_TCP, TCP_CONGESTION, (void *)congs[i],
+                             sizeof(congs[i]));
+        if (ret)
+                return ret;
+        /* 0.4.89 (C6): atomic increment; was plain `++` which races
+         * across CPUs and undercounts. */
+        __sync_fetch_and_add(&tcp_cong_choices[i & (NUM_TCP_CONG_ALGS - 1)], 1);
+        /* update state */
+        struct bpf_sock *sk = ops->sk;
+        struct conn_state *statep;
 
-	if (!sk)
-		return 0;
-	statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
-	                            BPF_SK_STORAGE_GET_F_CREATE);
-	if (statep) {
-		/* 0.4.86: init swap_target to 0xff on fresh storage.
-		 * Fresh sk_storage is zeroed, so swap_target == 0 (cubic).
-		 * score_pending_swap checks for 0xff, so it did not early-return
-		 * on fresh sockets.  Every fresh socket triggered score_pending_swap
-		 * with tgt=0 (cubic), and if cur_alg != 0, ratio_q was forced to 0
-		 * (catastrophic loss for cubic).  This is why cubic was
-		 * disproportionately punished. */
-		if (statep->last_swap_at == 0) {
-			statep->swap_target = 0xff;
-		}
-		/* 0.4.44: count socket against alg on first contact. */
-		__u8 idx = i & (NUM_TCP_CONG_ALGS - 1);
-		__u64 bit = 1ULL << idx;
-		if (remote_host && !(statep->touched_bitmap & bit)) {
-			statep->touched_bitmap |= bit;
-			remote_host->metrics[idx].sockets_alive++;
-			/* 0.4.62: initialize swap_score to neutral the first time
-			 * this algorithm runs on this bucket.  Makes the map
-			 * self-describing -- 0 never appears for an untested alg,
-			 * so picker and dashboard both trust the raw field. */
-			if (remote_host->metrics[idx].swap_score == 0)
-				remote_host->metrics[idx].swap_score =
-					SWAP_SCORE_NEUTRAL;
-		}
-		statep->state = (__u64)i;
-		statep->bad_checkpoints = 0;
+        if (!sk)
+                return 0;
+        statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
+                                    BPF_SK_STORAGE_GET_F_CREATE);
+        if (statep) {
+                /* 0.4.86: init swap_target to 0xff on fresh storage.
+                 * Fresh sk_storage is zeroed, so swap_target == 0 (cubic).
+                 * score_pending_swap checks for 0xff, so it did not early-return
+                 * on fresh sockets.  Every fresh socket triggered score_pending_swap
+                 * with tgt=0 (cubic), and if cur_alg != 0, ratio_q was forced to 0
+                 * (catastrophic loss for cubic).  This is why cubic was
+                 * disproportionately punished. */
+                if (statep->last_swap_at == 0) {
+                        statep->swap_target = 0xff;
+                }
+                /* 0.4.44: count socket against alg on first contact. */
+                __u8 idx = i & (NUM_TCP_CONG_ALGS - 1);
+                __u64 bit = 1ULL << idx;
+                if (remote_host && !(statep->touched_bitmap & bit)) {
+                        statep->touched_bitmap |= bit;
+                        /* 0.4.89 (C1): seq-wrap the proof-counter bump. */
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                        remote_host->metrics[idx].sockets_alive++;
+                        /* 0.4.62: initialize swap_score to neutral the first time
+                         * this algorithm runs on this bucket.  Makes the map
+                         * self-describing -- 0 never appears for an untested alg,
+                         * so picker and dashboard both trust the raw field. */
+                        if (remote_host->metrics[idx].swap_score == 0)
+                                remote_host->metrics[idx].swap_score =
+                                        SWAP_SCORE_NEUTRAL;
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                }
+                statep->state = (__u64)i;
+                statep->bad_checkpoints = 0;
                 /* 0.4.54: exploration pick = neither leader. */
                 if (remote_host &&
                     (__u64)i != (remote_host->best_i & (NUM_TCP_CONG_ALGS - 1)) &&
@@ -268,8 +284,8 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
                 else
                         statep->exploring = 0;
                 statep->votes_on_alg = 0;
-	}
-	return 0;
+        }
+        return 0;
 }
 
 __u64 tcp_thin_lto_choices;
@@ -297,7 +313,8 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
                 int one = 1;
                 if (!bpf_setsockopt(ops, SOL_TCP, TCP_THIN_LINEAR_TIMEOUTS,
                                     &one, sizeof(one)))
-                    tcp_thin_lto_choices++;
+                    /* 0.4.89 (C6): atomic increment; was plain `++`. */
+                    __sync_fetch_and_add(&tcp_thin_lto_choices, 1);
             }
         }
         return 1;
@@ -344,10 +361,14 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 
         if (remote_host->selection_count < 2 * NUM_TCP_CONN_METRICS) {
             __u8 forced = remote_host->selection_count & (NUM_TCP_CONN_METRICS - 1);
+            /* 0.4.89 (C1): seq-wrap selection_count++. */
+            __sync_fetch_and_add(&remote_host->seq, 1);
             remote_host->selection_count++;
+            __sync_fetch_and_add(&remote_host->seq, 1);
             if (set_cong(ops, remote_host, forced)) {
                 remote_host->metrics[forced].metric_value = ~((__u64)0);
             } else {
+                if (bpftune_debug)
                 bpf_printk("estab cookie=%llu alg=%u forced=1 dest=%u dest6=%u dest6b=%u",
                            bpf_get_socket_cookie(ops), (__u32)forced,
                            (__u32)bpf_ntohl(ops->remote_ip4),
@@ -385,8 +406,11 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
              * pair.  No new variables — the loop already found minindex
              * and metric_min; we just persist them. */
             if (remote_host->metrics[minindex].metric_count > 0) {
+                /* 0.4.89 (C1): seq-wrap the tracker update. */
+                __sync_fetch_and_add(&remote_host->seq, 1);
                 remote_host->best_i = minindex;
                 remote_host->best_v = metric_min;
+                __sync_fetch_and_add(&remote_host->seq, 1);
             }
             {
                 __u32 zero = 0;
@@ -408,6 +432,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
             if (set_cong(ops, remote_host, s)) {
                 remote_host->metrics[s].metric_value = ~((__u64)0);
             } else {
+                if (bpftune_debug)
                 bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
                            bpf_get_socket_cookie(ops), (__u32)s,
                            (__u32)bpf_ntohl(ops->remote_ip4),
@@ -420,7 +445,15 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 
 /* 0.4.56: score the pending swap once >=60s have elapsed.  Cur rate
  * vs the captured pre-swap rate sets target alg's swap_score; 256 is
- * neutral.  Called from the vote path. */
+ * neutral.  Called from the vote path.
+ *
+ * 0.4.89: also called from the close path if elapsed >= 30s (C3).
+ * Closes the gap where a socket swapped then closed before its next
+ * segment-rung vote -- the pending swap was never scored.
+ *
+ * 0.4.89 (Q3): the score/streak update logic is now in
+ * apply_swap_outcome() in the header; this function computes ratio_q
+ * per its gating rules and delegates. */
 static __always_inline void
 score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
                    struct conn_state *statep, __u64 now,
@@ -460,78 +493,15 @@ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
                 if (ratio_q > 1024) ratio_q = 1024;
         }
 
-        /* read-modify-write u16 field via pointer cast */
-        {
-                __u16 cur16 = rh->metrics[tgt].swap_score;
-                __u32 cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
-                /* 0.4.60: asymmetric scoring.  Wins move by 1/16
-                 * (unchanged).  Nulls pull toward neutral 256 by
-                 * 1/4 so a high score cannot coast through
-                 * inactivity.  Losses pull toward the observed
-                 * ratio by 1/2 -- bigger misses drop the score more.
-                 * No signed division; take the unsigned difference,
-                 * then add or subtract based on which is larger. */
-                if (ratio_q >= 282) {
-                        if (ratio_q >= cur32) {
-                                __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_STEP_DIV;
-                                cur32 += step;
-                        } else {
-                                __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_STEP_DIV;
-                                cur32 = (drop > cur32) ? 0 : cur32 - drop;
-                        }
-                } else if (ratio_q > 230) {
-                        /* 0.4.74: null is a no-op.  The streak
-                         * counters (bad_streak / null_streak,
-                         * incremented below) are the fast recency
-                         * demotion in pass 3.  Having the score ALSO
-                         * decay toward neutral on nulls double-counted
-                         * the punishment, and the /2 loss weight was
-                         * already pulling every population-average
-                         * target to ~188. */
-                } else {
-                        if (ratio_q >= cur32) {
-                                __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_LOSS_DIV;
-                                cur32 += step;
-                        } else {
-                                __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_LOSS_DIV;
-                                cur32 = (drop > cur32) ? 0 : cur32 - drop;
-                        }
-                }
-                if (cur32 > 1024) cur32 = 1024;
-                /* 0.4.84: re-enabled in-kernel score write.  The
-                 * collector's streak_writeback was supposed to own
-                 * this but only patches bad_streak/null_streak, not
-                 * swap_score.  On hosts where pre_swap_rate=0
-                 * (app-limited), swap_score stayed at 256 forever. */
-                rh->metrics[tgt].swap_score = (__u16)cur32;
-        }
-        /* 0.4.58: consecutive failed swaps to this alg.  Two in a
-         * row is a pattern; a later rising rate_ema clears it in the
-         * vote path.  Win/null clears; loss increments. */
-        /* 0.4.59: ratio_q = post/pre * 256.  Three outcomes:
-         *   <= 230   loss  (ratio <= 0.9)   -> bad_streak++
-         *   >= 282   win   (ratio >= 1.1)   -> both = 0
-         *   between  null  (no change)      -> null_streak++
-         * A null isn't proof of failure but it isn't a win either --
-         * three in a row and the target gets excluded. */
-        /* 0.4.82: re-enabled in-kernel streak updates. Truth file owns
-         * swap_score but was NOT updating streaks (all values were 0).
-         * Penalty multiplier 16/(16+bad*4+null*2) was always 1.0. */
-        if (ratio_q >= 282) {
-                rh->metrics[tgt].bad_streak = 0;
-                rh->metrics[tgt].null_streak = 0;
-        } else if (ratio_q <= 230) {
-                if (rh->metrics[tgt].bad_streak < 255)
-                        rh->metrics[tgt].bad_streak++;
-                rh->metrics[tgt].null_streak = 0;
-        } else {
-                if (rh->metrics[tgt].null_streak < 255)
-                        rh->metrics[tgt].null_streak++;
-        }
-        bpf_printk("swapscore cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
-                   bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
-                   (__u32)rh->metrics[tgt].bad_streak,
-                   (__u32)rh->metrics[tgt].null_streak);
+        /* 0.4.89 (C1 + Q3): seq-wrap the delegated swap-outcome update. */
+        __sync_fetch_and_add(&rh->seq, 1);
+        apply_swap_outcome(rh, tgt, ratio_q);
+        __sync_fetch_and_add(&rh->seq, 1);
+        if (bpftune_debug)
+                bpf_printk("swapscore cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
+                           bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
+                           (__u32)rh->metrics[tgt].bad_streak,
+                           (__u32)rh->metrics[tgt].null_streak);
         statep->swap_target = 0xff;
         statep->pre_swap_rate = 0;
 }
@@ -545,15 +515,31 @@ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
  *
  * The caller always overwrites statep->swap_target and pre_swap_rate
  * with the new pending values right after this call, so no clearing
- * is done here. */
+ * is done here.
+ *
+ * 0.4.89 (M2): dropped the unused cur_rate parameter; the function
+ * uses post_swap_rate_max (the peak across the post-swap window),
+ * not a momentary rate.
+ *
+ * 0.4.89 (Q3): score/streak update delegated to apply_swap_outcome.
+ * Note: score_pending_rejected caps ratio_q at 230 if <30s elapsed
+ * (the "last chance" gate), so the win path in apply_swap_outcome
+ * (ratio_q >= 282) only fires if >=30s elapsed AND the socket
+ * happened to deliver >110% of pre-swap -- rare for a rejected swap
+ * but possible.
+ *
+ * 0.4.89 (M3): the 30s threshold here vs 180s in score_pending_swap
+ * is intentional.  score_pending_swap scores a COMPLETED swap
+ * (socket stayed on the target); 180s lets slow-start settle.
+ * score_pending_rejected scores a PREEMPTED swap (socket left the
+ * target); 30s is the "last chance" -- if at least 30s of post-swap
+ * data exists, use the actual ratio; otherwise force loss-class. */
 static __always_inline void
 score_pending_rejected(struct bpf_sock_ops *ops, struct remote_host *rh,
-                       struct conn_state *statep, __u64 now, __u64 cur_rate)
+                       struct conn_state *statep, __u64 now)
 {
         __u8 tgt;
         __u64 pre, ratio_q;
-        __u16 cur16;
-        __u32 cur32;
 
         if (statep->swap_target == 0xff) return;
         if (statep->pre_swap_rate == 0)  return;
@@ -569,37 +555,15 @@ score_pending_rejected(struct bpf_sock_ops *ops, struct remote_host *rh,
         if ((now - statep->last_swap_at) < LAST_CHANCE_MIN_NS)
                 if (ratio_q > 230) ratio_q = 230;
 
-        cur16 = rh->metrics[tgt].swap_score;
-        cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
-        if (ratio_q >= cur32) {
-                __u32 step = (__u32)(ratio_q - cur32) / SWAP_SCORE_LOSS_DIV;
-                cur32 += step;
-        } else {
-                __u32 drop = (__u32)(cur32 - ratio_q) / SWAP_SCORE_LOSS_DIV;
-                cur32 = (drop > cur32) ? 0 : cur32 - drop;
-        }
-        if (cur32 > 1024) cur32 = 1024;
-        /* 0.4.88: re-enable score write (was disabled in 0.4.76).
-         * score_pending_swap was re-enabled in 03f86ff but this sibling
-         * was missed. ~8% of swaps (rejected path) left swap_score stale. */
-        rh->metrics[tgt].swap_score = (__u16)cur32;
+        /* 0.4.89 (C1 + Q3): seq-wrap the delegated swap-outcome update. */
+        __sync_fetch_and_add(&rh->seq, 1);
+        apply_swap_outcome(rh, tgt, ratio_q);
+        __sync_fetch_and_add(&rh->seq, 1);
 
-        /* 0.4.82: streak update based on actual outcome (if >=30s). */
-        if (ratio_q >= 282) {
-                rh->metrics[tgt].bad_streak = 0;
-                rh->metrics[tgt].null_streak = 0;
-        } else if (ratio_q <= 230) {
-                if (rh->metrics[tgt].bad_streak < 255)
-                        rh->metrics[tgt].bad_streak++;
-                rh->metrics[tgt].null_streak = 0;
-        } else {
-                if (rh->metrics[tgt].null_streak < 255)
-                        rh->metrics[tgt].null_streak++;
-        }
-
-        bpf_printk("swapscore-reject cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
-                   bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
-                   (__u32)rh->metrics[tgt].bad_streak);
+        if (bpftune_debug)
+                bpf_printk("swapscore-reject cookie=%llu tgt=%u ratio=%llu bad=%u null=%u",
+                           bpf_get_socket_cookie(ops), (__u32)tgt, ratio_q,
+                           (__u32)rh->metrics[tgt].bad_streak);
 }
 
 SEC("sockops")
@@ -677,6 +641,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                  * up here. */
                 struct conn_state *sp_al = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
                 int alg_idx = sp_al ? (int)(sp_al->state & (NUM_TCP_CONG_ALGS - 1)) : -1;
+                if (bpftune_debug)
                 bpf_printk("midsamp cookie=%llu port=%u rport=%u alg=%d thr=%llu segs=%llu smin=%llu savg=%llu srate=%llu",
                            bpf_get_socket_cookie(ops), ops->local_port, bpf_ntohl(ops->remote_port),
                            alg_idx, next, segs, smin, savg, srate);
@@ -752,38 +717,44 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     statep = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
     if (!statep)
         return 1;
-	/* 0.4.44: decrement proof counters once per socket.
-	 * Only runs on STATE_CB close (is_close).  Placed before the
-	 * METRIC_MIN_SEGS / origin-facing early returns below so that
-	 * short-lived and receive-dominant sockets decrement too --
-	 * otherwise the sockets we most care about never decrement.
-	 * cleaned flag is idempotent across the FIN_WAIT1 /
-	 * CLOSE_WAIT double-fire. */
-	if (is_close && !statep->cleaned) {
-		/* Shift accumulator: constant step (bit <<= 1 per
-		 * iteration) rather than a variable shift amount.
-		 * #pragma unroll flattens to 16 straight-line blocks.
-		 * Close is a cold path so the size is fine. */
-		__u64 bit = 1;
-		for (int b = 0; b < NUM_TCP_CONG_ALGS; b++) {
-			/* Guarded decrement: if the remote_host entry was
-			 * LRU-evicted + recreated while this socket lived,
-			 * its counters were reset to 0; an unguarded --
-			 * would wrap to 2^64-1.  Guard costs nothing in
-			 * the common case. */
-			if ((statep->touched_bitmap & bit) &&
-			    remote_host->metrics[b].sockets_alive > 0)
-				remote_host->metrics[b].sockets_alive--;
-			if ((statep->good_bitmap & bit) &&
-			    remote_host->metrics[b].sockets_good > 0)
-				remote_host->metrics[b].sockets_good--;
-			if ((statep->proved_bitmap & bit) &&
-			    remote_host->metrics[b].sockets_proved > 0)
-				remote_host->metrics[b].sockets_proved--;
-			bit <<= 1;
-		}
-		statep->cleaned = 1;
-	}
+        /* 0.4.44: decrement proof counters once per socket.
+         * Only runs on STATE_CB close (is_close).  Placed before the
+         * METRIC_MIN_SEGS / origin-facing early returns below so that
+         * short-lived and receive-dominant sockets decrement too --
+         * otherwise the sockets we most care about never decrement.
+         * cleaned flag is idempotent across the FIN_WAIT1 /
+         * CLOSE_WAIT double-fire. */
+        if (is_close && !statep->cleaned) {
+                /* Shift accumulator: constant step (bit <<= 1 per
+                 * iteration) rather than a variable shift amount.
+                 * #pragma unroll flattens to 16 straight-line blocks.
+                 * Close is a cold path so the size is fine. */
+                __u64 bit = 1;
+                /* 0.4.89 (C1): seq-wrap the whole close-decrement loop.
+                 * One seq pair around the 16-iter loop is enough -- the
+                 * intermediate state is never read by userspace mid-loop
+                 * (reanchor reads the whole struct atomically via lookup). */
+                __sync_fetch_and_add(&remote_host->seq, 1);
+                for (int b = 0; b < NUM_TCP_CONG_ALGS; b++) {
+                        /* Guarded decrement: if the remote_host entry was
+                         * LRU-evicted + recreated while this socket lived,
+                         * its counters were reset to 0; an unguarded --
+                         * would wrap to 2^64-1.  Guard costs nothing in
+                         * the common case. */
+                        if ((statep->touched_bitmap & bit) &&
+                            remote_host->metrics[b].sockets_alive > 0)
+                                remote_host->metrics[b].sockets_alive--;
+                        if ((statep->good_bitmap & bit) &&
+                            remote_host->metrics[b].sockets_good > 0)
+                                remote_host->metrics[b].sockets_good--;
+                        if ((statep->proved_bitmap & bit) &&
+                            remote_host->metrics[b].sockets_proved > 0)
+                                remote_host->metrics[b].sockets_proved--;
+                        bit <<= 1;
+                }
+                __sync_fetch_and_add(&remote_host->seq, 1);
+                statep->cleaned = 1;
+        }
     s = statep->state & (NUM_TCP_CONG_ALGS - 1);
     if ((__u64)tp->segs_out + tp->segs_in < METRIC_MIN_SEGS)
         return 1;
@@ -822,12 +793,32 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
      * when the VPS is the server on 443. */
     if ((__u64)tp->data_segs_out * 4 < (__u64)tp->data_segs_in)
         return 1;
-    if (is_close)
+    if (is_close && bpftune_debug)
         bpf_printk("closport cookie=%llu port=%u rport=%u alg=%u segs=%llu",
                    bpf_get_socket_cookie(ops), ops->local_port,
                    bpf_ntohl(ops->remote_port),
                    (__u32)(statep->state & (NUM_TCP_CONG_ALGS - 1)),
                    (__u64)tp->segs_out + tp->segs_in);
+    /* 0.4.89 (C3): score the pending swap on close if >=30s elapsed.
+     * Without this, a socket that swapped then closed before its next
+     * segment-rung vote was never scored -- the pending swap_target
+     * stayed at the un-scored value, swap_score and streaks weren't
+     * updated.  Uses the 30s gate (LAST_CHANCE_MIN_NS) matching
+     * score_pending_rejected's last-chance window; score_pending_swap
+     * internally re-checks the 180s gate (SWAP_OUTCOME_MIN_RNAL_NS)
+     * and early-returns if <180s, so we need the 30s outer gate to
+     * catch the 30-180s window where score_pending_swap itself would
+     * refuse.  For <30s, the swap is too fresh to score -- skip.
+     *
+     * Note: score_pending_swap uses the cur_alg != tgt check to force
+     * loss-class if the socket moved away from the target.  On close,
+     * cur_alg is whatever the socket ended on, which may or may not
+     * be the pending target.  The check still works correctly. */
+    if (is_close && statep->swap_target != 0xff) {
+        __u64 close_now = bpf_ktime_get_ns();
+        if (close_now - statep->last_swap_at >= LAST_CHANCE_MIN_NS)
+            score_pending_swap(ops, remote_host, statep, close_now, s);
+    }
     if (is_close &&
         (__u64)tp->segs_out + tp->segs_in >= METRIC_TRIGGER_SEGS)
         return 1;
@@ -874,31 +865,39 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
             (rd * mss * 1000000ULL) / rate_interval_us : 0;
     }
 
-	/* 0.4.44: proof tracking.  Non-close votes only.  If the
-	 * socket's delivered rate crosses a tier on the alg it is
-	 * currently running, mark the (socket, alg) bit and bump the
-	 * per-alg counter.  Bits are per-alg so a swap does not have
-	 * to reset anything -- each alg the socket has ever touched
-	 * keeps its own bit, and the close handler decrements them
-	 * all. */
-	if (!is_close) {
-		__u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
-		if (rate_delivered >= PROOF_PROVED_BPS && !(statep->proved_bitmap & bit)) {
-			statep->proved_bitmap |= bit;
-			remote_host->metrics[s].sockets_proved++;
-			if (!(statep->good_bitmap & bit)) {
-				statep->good_bitmap |= bit;
-				remote_host->metrics[s].sockets_good++;
-			}
-			bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2",
-			           bpf_get_socket_cookie(ops), s, rate_delivered);
-		} else if (rate_delivered >= PROOF_GOOD_BPS && !(statep->good_bitmap & bit)) {
-			statep->good_bitmap |= bit;
-			remote_host->metrics[s].sockets_good++;
-			bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1",
-			           bpf_get_socket_cookie(ops), s, rate_delivered);
-		}
-	}
+        /* 0.4.44: proof tracking.  Non-close votes only.  If the
+         * socket's delivered rate crosses a tier on the alg it is
+         * currently running, mark the (socket, alg) bit and bump the
+         * per-alg counter.  Bits are per-alg so a swap does not have
+         * to reset anything -- each alg the socket has ever touched
+         * keeps its own bit, and the close handler decrements them
+         * all. */
+        if (!is_close) {
+                __u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
+                if (rate_delivered >= PROOF_PROVED_BPS && !(statep->proved_bitmap & bit)) {
+                        statep->proved_bitmap |= bit;
+                        /* 0.4.89 (C1): seq-wrap proof-counter bump. */
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                        remote_host->metrics[s].sockets_proved++;
+                        if (!(statep->good_bitmap & bit)) {
+                                statep->good_bitmap |= bit;
+                                remote_host->metrics[s].sockets_good++;
+                        }
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                        if (bpftune_debug)
+                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2",
+                                   bpf_get_socket_cookie(ops), s, rate_delivered);
+                } else if (rate_delivered >= PROOF_GOOD_BPS && !(statep->good_bitmap & bit)) {
+                        statep->good_bitmap |= bit;
+                        /* 0.4.89 (C1): seq-wrap proof-counter bump. */
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                        remote_host->metrics[s].sockets_good++;
+                        __sync_fetch_and_add(&remote_host->seq, 1);
+                        if (bpftune_debug)
+                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1",
+                                   bpf_get_socket_cookie(ops), s, rate_delivered);
+                }
+        }
     /* 0.4.53: raw delivered rate on every vote.
      * midsamp only fires on rung crossings; sockets past the last
      * rung only vote via the 60s time-check and had no raw rate
@@ -909,7 +908,8 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         __u64 _sraw   = (__u64)tp->rate_delivered;
         __u64 _smss   = (__u64)tp->mss_cache;
         __u64 _srate  = _sinter ? (_sraw * _smss * 1000000ULL) / _sinter : 0;
-        bpf_printk("srate cookie=%llu alg=%u srate=%llu",
+        if (bpftune_debug)
+                bpf_printk("srate cookie=%llu alg=%u srate=%llu",
                    bpf_get_socket_cookie(ops), s, _srate);
     }
 
@@ -930,7 +930,8 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
             loss_term = (loss_bp * LOSS_SCALE) / LOSS_CAP_BP;
             metric += loss_term;
         }
-        bpf_printk("met cookie=%llu rport=%u alg=%d segs=%llu val=%llu rtt=%llu rate=%llu loss=%llu smrtt=%llu bmrtt=%llu avgrtt=%llu",
+        if (bpftune_debug)
+                bpf_printk("met cookie=%llu rport=%u alg=%d segs=%llu val=%llu rtt=%llu rate=%llu loss=%llu smrtt=%llu bmrtt=%llu avgrtt=%llu",
                    bpf_get_socket_cookie(ops), bpf_ntohl(ops->remote_port),
                    s, (__u64)tp->segs_out + tp->segs_in, metric, rtt_term, rate_term,
                    loss_term, min_rtt, remote_host->min_rtt, avg_rtt);
@@ -942,14 +943,15 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
          * path.  The met line above is at the 12-argument printk
          * limit, so this lives on its own line and joins by cookie.
          * No metric logic change; diagnostic only. */
-        bpf_printk("cwnd cookie=%llu snd_cwnd=%llu pkts_out=%llu",
+        if (bpftune_debug)
+                bpf_printk("cwnd cookie=%llu snd_cwnd=%llu pkts_out=%llu",
                    bpf_get_socket_cookie(ops),
                    (__u64)tp->snd_cwnd, (__u64)tp->packets_out);
-        if (heal_rtt)
+        if (heal_rtt && bpftune_debug)
             bpf_printk("heal_rtt smrtt=%llu newref=%llu",
                        (unsigned long long)min_rtt,
                        (unsigned long long)heal_rtt);
-        if (heal_rate)
+        if (heal_rate && bpftune_debug)
             bpf_printk("heal_rate rate=%llu newref=%llu",
                        (unsigned long long)rate_delivered,
                        (unsigned long long)heal_rate);
@@ -1175,11 +1177,13 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     }
                 }
             }
-        /* 0.4.54: rate-based.  socket under 66% of leader. */
-            bool margin_met = (remote_host->rate_best_v > 0 &&
-                               statep->last_rate_bps > 0 &&
-                               statep->last_rate_bps * 150 <
-                               remote_host->rate_best_v * 100000ULL * 100);
+        /* 0.4.54: rate-based.  socket under 66% of leader.
+         * 0.4.89 (Q2): factored into socket_under_pct_of_leader();
+         * the old form was `last_rate_bps * 150 < rate_best_v * 100000 * 100`
+         * where the *100 and /150 cancel to a 2/3 ratio. */
+            bool margin_met = socket_under_pct_of_leader(
+                statep->last_rate_bps,
+                (__u16)(remote_host->rate_best_v & 0xffff), 66);
             /* Post-freeze, "desperate" is judged relative to this
              * socket's own best_seen_metric rather than the bucket
              * leader.  A frozen socket that stays at ~best_seen (even
@@ -1191,9 +1195,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
              * unchanged: bucket-relative 2x still fires immediately. */
             bool desperate_post = (statep->last_metric * 100 >=
                                    statep->best_seen_metric * 200);
+            /* 0.4.89 (Q2): desperate requires margin_met AND socket
+             * under 25% of leader.  The old form was
+             * `last_rate_bps * 4 < rate_best_v * 100000` which is
+             * equivalent to socket_under_pct_of_leader(..., 25). */
             bool desperate = (margin_met &&
-                              statep->last_rate_bps * 4 <
-                              remote_host->rate_best_v * 100000ULL &&
+                              socket_under_pct_of_leader(
+                                  statep->last_rate_bps,
+                                  (__u16)(remote_host->rate_best_v & 0xffff), 25) &&
                               (!statep->frozen || desperate_post));
 
             /* Settle window: fixed minimum gap between swaps on one
@@ -1218,11 +1227,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
 
             /* 0.4.52: slow-vs-leader.  Uses the rate directly, bypassing
              * the composite.  A swap that raises throughput fills the
-             * bottleneck queue; the induced RTT rise masks the win. */
-            bool slow_vs_leader = (statep->last_rate_bps > 0 &&
-                                   remote_host->rate_best_v > 0 &&
-                                   statep->last_rate_bps * 100 <
-                                   remote_host->rate_best_v * 100000 * RATE_TRIGGER_PCT);
+             * bottleneck queue; the induced RTT rise masks the win.
+             * 0.4.89 (Q2): factored into socket_under_pct_of_leader();
+             * the old form was `last_rate_bps * 100 < rate_best_v * 100000 * RATE_TRIGGER_PCT`
+             * which is socket_under_pct_of_leader(..., RATE_TRIGGER_PCT). */
+            bool slow_vs_leader = socket_under_pct_of_leader(
+                statep->last_rate_bps,
+                (__u16)(remote_host->rate_best_v & 0xffff),
+                RATE_TRIGGER_PCT);
 
             /* 0.4.54: exploration protection. */
 
@@ -1249,8 +1261,16 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 if (!set_cong(ops, remote_host, swap_tgt)) {
                     statep->swap_count++;
                     statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                     statep->last_metric = 0;
-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                    score_pending_rejected(ops, remote_host, statep, now);
                     statep->pre_swap_rate = statep->last_rate_bps;
                     statep->post_swap_rate_max = 0;
                     statep->swap_target = swap_tgt;
@@ -1258,10 +1278,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     statep->hist_1 = 0;
                     statep->hist_2 = 0;
                     statep->bad_checkpoints = 0;
+                    if (bpftune_debug)
                     bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=1 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                bpf_get_socket_cookie(ops), from_i, to_i,
                                bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                    if (bpftune_debug)
                     bpf_printk("swapctx cookie=%llu d=1 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
                                bpf_get_socket_cookie(ops),
                                (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
@@ -1285,13 +1307,22 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if ((statep->best_seen_metric != 0 ||
                          statep->best_seen_srate != 0) && tgt8 != s)
                         fret = set_cong(ops, remote_host, tgt8);
+                    if (bpftune_debug)
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
                                bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                     statep->last_metric = 0;
-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                    score_pending_rejected(ops, remote_host, statep, now);
                     statep->pre_swap_rate = statep->last_rate_bps;
                     statep->post_swap_rate_max = 0;
                     statep->swap_target = tgt8;
@@ -1306,10 +1337,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if (!set_cong(ops, remote_host, swap_tgt)) {
                         statep->swap_count++;
                         statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                         statep->last_metric = 0;
 
                         /* 0.4.56: stage pre-swap rate and target for scoring. */
-                        score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                        score_pending_rejected(ops, remote_host, statep, now);
                         statep->pre_swap_rate = statep->last_rate_bps;
                         statep->post_swap_rate_max = 0;
                         statep->swap_target = swap_tgt;
@@ -1317,10 +1356,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         statep->hist_1 = 0;
                         statep->hist_2 = 0;
                         statep->bad_checkpoints = 0;
+                        if (bpftune_debug)
                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=2 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                    bpf_get_socket_cookie(ops), from_i, to_i,
                                    (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                        if (bpftune_debug)
                         bpf_printk("swapctx cookie=%llu d=2 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
                                    bpf_get_socket_cookie(ops),
                                    (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
@@ -1344,13 +1385,22 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if ((statep->best_seen_metric != 0 ||
                          statep->best_seen_srate != 0) && tgt8 != s)
                         fret = set_cong(ops, remote_host, tgt8);
+                    if (bpftune_debug)
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
                                bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                     statep->last_metric = 0;
-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                    score_pending_rejected(ops, remote_host, statep, now);
                     statep->pre_swap_rate = statep->last_rate_bps;
                     statep->post_swap_rate_max = 0;
                     statep->swap_target = tgt8;
@@ -1365,10 +1415,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if (!set_cong(ops, remote_host, swap_tgt)) {
                         statep->swap_count++;
                         statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                         statep->last_metric = 0;
 
                         /* 0.4.56: stage pre-swap rate and target for scoring. */
-                        score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                        score_pending_rejected(ops, remote_host, statep, now);
                         statep->pre_swap_rate = statep->last_rate_bps;
                         statep->post_swap_rate_max = 0;
                         statep->swap_target = swap_tgt;
@@ -1376,10 +1434,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         statep->hist_1 = 0;
                         statep->hist_2 = 0;
                         statep->bad_checkpoints = 0;
+                        if (bpftune_debug)
                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=3 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                    bpf_get_socket_cookie(ops), from_i, to_i,
                                    (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                        if (bpftune_debug)
                         bpf_printk("swapctx cookie=%llu d=3 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
                                    bpf_get_socket_cookie(ops),
                                    (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
@@ -1405,9 +1465,11 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if ((statep->best_seen_metric != 0 ||
                          statep->best_seen_srate != 0) && tgt8 != s)
                         fret = set_cong(ops, remote_host, tgt8);
+                    if (bpftune_debug)
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
                                bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                    if (bpftune_debug)
                     bpf_printk("swapctx cookie=%llu d=f cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
                                bpf_get_socket_cookie(ops),
                                (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
@@ -1418,8 +1480,16 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                                (__u64)(tp->snd_cwnd ? ((__u64)tp->packets_out * 100 / tp->snd_cwnd) : 0));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                     statep->last_metric = 0;
-                    score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                    score_pending_rejected(ops, remote_host, statep, now);
                     statep->pre_swap_rate = statep->last_rate_bps;
                     statep->post_swap_rate_max = 0;
                     statep->swap_target = tgt8;
@@ -1457,10 +1527,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                             } else if (!set_cong(ops, remote_host, swap_tgt)) {
                                 statep->swap_count++;
                                 statep->last_swap_at = now;
+                    /* 0.4.89 (C2): reset the sustained-rate window so the
+                     * next measurement starts at the swap boundary.  Without
+                     * this, the first sustained_bps sample after a swap
+                     * straddles the swap point -- mixing pre-swap and
+                     * post-swap bytes -- and can inflate post_swap_rate_max
+                     * if the pre-swap alg was carrying a higher rate. */
+                    statep->rate_win_ts_ns = now;
+                    statep->rate_win_bytes = (__u64)tp->bytes_acked + (__u64)tp->bytes_received;
                                 statep->last_metric = 0;
 
                                 /* 0.4.56: stage pre-swap rate and target for scoring. */
-                                score_pending_rejected(ops, remote_host, statep, now, statep->last_rate_bps);
+                                score_pending_rejected(ops, remote_host, statep, now);
                                 statep->pre_swap_rate = statep->last_rate_bps;
                                 statep->post_swap_rate_max = 0;
                                 statep->swap_target = swap_tgt;
@@ -1468,10 +1546,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                                 statep->hist_1 = 0;
                                 statep->hist_2 = 0;
                                 statep->bad_checkpoints = 0;
+                                if (bpftune_debug)
                                 bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=0 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                            bpf_get_socket_cookie(ops), from_i, to_i,
                                            bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
                                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
+                                if (bpftune_debug)
                                 bpf_printk("swapctx cookie=%llu d=0 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
                                            bpf_get_socket_cookie(ops),
                                            (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
@@ -1512,6 +1592,11 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 do_update = true;
         }
         if (do_update) {
+            /* 0.4.89 (C1): seq-wrap the entire metric_value + rate_ema
+             * + tracker update.  One seq pair around the whole block
+             * is sufficient -- reanchor reads the whole struct, so it
+             * either sees all of these updates or none. */
+            __sync_fetch_and_add(&remote_host->seq, 1);
             /* 0.4.45 rate EMA */
             {
                 __u64 r100k = rate_delivered / RATE_EMA_BYTES_PER_UNIT;
@@ -1532,18 +1617,38 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     }
                 }
             }
-        __u64 __div = m->metric_count + 1;
+            /* 0.4.89 (Q4): special-case the first sample after the
+             * poisoned ~0 sentinel.  The EMA formula
+             * `m->metric_value -= (m->metric_value - metric) / __div`
+             * happens to produce the right answer when __div=1 (because
+             * ~0 - (~0 - metric) = metric in unsigned arithmetic), but
+             * with __div > 1 it produces a still-huge value that passes
+             * the v != ~0 filter below and enters the best_v tracker
+             * as a poisoned large value.  Replace the poison with the
+             * actual metric on the first real vote. */
+            __u64 __div = m->metric_count + 1;
             if (__div > METRIC_AVG_CAP)
                 __div = METRIC_AVG_CAP;
-            if (metric > m->metric_value)
+            if (m->metric_value == ~((__u64)0)) {
+                m->metric_value = metric;
+            } else if (metric > m->metric_value) {
                 m->metric_value += (metric - m->metric_value) / __div;
-            else
+            } else {
                 m->metric_value -= (m->metric_value - metric) / __div;
+            }
+            /* 0.4.89 (M5): bounds note -- rate_ema is __u16 (max 65535),
+             * swap_score capped at 1024 (line ~530/585).  The weighted
+             * product rv * ss <= 65535 * 1024 = 67M, *16 = 1.07B, well
+             * under __u64 max.  If either bound is ever widened, audit
+             * the reanchor pass-3 multiplication for overflow. */
         }
     }
     {
         __u64 v = m->metric_value;
         if (v != 0 && v != ~((__u64)0)) {
+            /* 0.4.89 (C1): seq-wrap the tracker update -- best_i/best_v
+             * /second_i/second_v are read by reanchor and written here. */
+            __sync_fetch_and_add(&remote_host->seq, 1);
             if (s == remote_host->best_i) {
                 remote_host->best_v = v;
             } else if (s == remote_host->second_i) {
@@ -1566,11 +1671,17 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 remote_host->second_i = ti;
                 remote_host->second_v = tv;
             }
+            __sync_fetch_and_add(&remote_host->seq, 1);
         }
     }
+    /* 0.4.89 (C1): metric_count and greedy_count are also read by
+     * reanchor (pass 1/2/3 use metric_count for MIN_LEADER_TRUST).
+     * Seq-wrap so the read sees a consistent pair. */
+    __sync_fetch_and_add(&remote_host->seq, 1);
     m->metric_count++;
     if (greedy)
         m->greedy_count++;
+    __sync_fetch_and_add(&remote_host->seq, 1);
     return 1;
 }
 
