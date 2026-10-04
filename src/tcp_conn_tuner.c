@@ -1172,7 +1172,7 @@ static void stop_reanchor(void)
  * 0.4.89 (M6): STATE_LAYOUT bumped 1 -> 2 because sockets_alive /
  * sockets_good / sockets_proved widened from __u16 to __u32.  Old
  * state files (layout 1) will be refused by the size check below. */
-#define STATE_MAGIC   0x42504655u
+#define STATE_MAGIC   0x42504656u
 #define STATE_LAYOUT  2
 struct state_header {
         __u32 magic;
