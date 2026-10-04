@@ -2134,6 +2134,9 @@ function _populateBucketSelect(desiredBucket) {
           try { localStorage.setItem("bpftune.range", rs.value); } catch (e) {}
           renderBucket();
           renderSwaps();
+          _safeRender("div", function() { renderDivChart("div", ""); });
+          _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
+          _safeRender("score-now", function() { renderScoreNow(); });
           _updateBucketTags();
         };
 
