@@ -178,8 +178,14 @@ if [ "$DO_DASHBOARD" = 1 ]; then
         mkdir -p "$DASH_BIN" "$SERVED/data"
 
         # --- 2a. Get updated Go binary ---
-        BIN_URL="https://github.com/${REPO}/releases/latest/download/bpftune-collector-go-${ARCH}"
-        if curl -fsSL "$BIN_URL" -o /tmp/bpftune-collector-go-"$ARCH" 2>/dev/null; then
+        # Search GitHub API for the latest release with the dashboard binary
+        # (can't use "releases/latest" because the tuner is marked as latest)
+        DASH_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null | \
+            python3 -c "import json,sys;[print(r['tag_name']) for r in json.load(sys.stdin) if any(a['name']=='bpftune-collector-go-${ARCH}' for a in r.get('assets',[]))]" 2>/dev/null | head -1)
+        if [ -n "$DASH_TAG" ]; then
+            BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-collector-go-${ARCH}"
+        fi
+        if [ -n "$BIN_URL" ] && curl -fsSL "$BIN_URL" -o /tmp/bpftune-collector-go-"$ARCH" 2>/dev/null; then
             # Stop service before swapping binary (avoid "Text file busy")
             systemctl stop bpftune-collector-go 2>/dev/null || true
             sleep 2
