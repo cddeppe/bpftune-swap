@@ -2036,6 +2036,9 @@ function _populateBucketSelect(desiredBucket) {
       return loadBucket(finalBucket);
     }).then(function () {
       renderSwaps();
+      _safeRender("div", function() { renderDivChart("div", ""); });
+      _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
+      _safeRender("score-now", function() { renderScoreNow(); });
       renderFleet();
     }).catch(function (e) {
       err("refresh: " + (e && e.message ? e.message : e), e);
