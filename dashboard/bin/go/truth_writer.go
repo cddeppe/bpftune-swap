@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -57,9 +58,38 @@ func writeTruthRow(destIPStr, toAlg, outcome string) {
 	f, err := os.OpenFile(truthFilePath,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[truth] ERROR OpenFile: %v (path=%s)\n", err, truthFilePath)
 		return
 	}
 	defer f.Close()
 	f.Write(data)
 	f.Write([]byte("\n"))
+	fmt.Fprintf(os.Stderr, "[truth] OK wrote %d bytes to %s\n", len(data)+1, truthFilePath)
+}
+
+
+// writeTruthRows writes truth file entries for all swaps with classified
+// outcomes (win/loss/null). Called from collect() after writeSwapsCSV.
+// Uses a separate writtenTruth dedup map. v0.8.3.
+func writeTruthRows(swaps []swapRow) {
+	dedupMu.Lock()
+	defer dedupMu.Unlock()
+	classified := 0
+	written := 0
+	for _, sw := range swaps {
+		if sw.Outcome != "win" && sw.Outcome != "loss" && sw.Outcome != "null" {
+			continue
+		}
+		if writtenTruth[sw.Cookie] == nil {
+			writtenTruth[sw.Cookie] = map[float64]bool{}
+		}
+		classified++
+		if !writtenTruth[sw.Cookie][sw.Ts] {
+			writeTruthRow(destIP(sw.Dest), algName(sw.To), sw.Outcome)
+			writtenTruth[sw.Cookie][sw.Ts] = true
+			written++
+			fmt.Fprintf(os.Stderr, "[truth] wrote: dest=%s tgt=%s cls=%s\n", destIP(sw.Dest), algName(sw.To), sw.Outcome)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[truth] writeTruthRows: %d swaps, %d classified, %d written\n", len(swaps), classified, written)
 }

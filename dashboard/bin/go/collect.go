@@ -110,7 +110,8 @@ func (c *Collector) collect() {
 	// v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
 	// Mirrors Python _resolve_pending enrichment logic.
 	enrichSwapsForCSV(allSwaps, allMets, allSrates)
-	writeSwapsCSV(allSwaps, now)            // truth writing happens inside, after dedup
+	writeSwapsCSV(allSwaps, now)
+	writeTruthRows(allSwaps) // v0.8.3: write truth rows with separate dedup            // truth writing happens inside, after dedup
 	writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
 
 	// ----- Update current state + push to SSE --------------------------

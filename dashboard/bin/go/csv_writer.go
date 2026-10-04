@@ -60,6 +60,7 @@ var (
 var (
 	writtenSwaps  = map[int64]map[float64]bool{}
 	writtenSrates = map[int64]map[float64]bool{}
+	writtenTruth  = map[int64]map[float64]bool{} // 0.8.3: separate dedup for truth rows
 	dedupMu       sync.Mutex
 )
 
