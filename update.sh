@@ -79,45 +79,36 @@ printf "  update dashboard: %s\n" "$([ $DO_DASHBOARD = 1 ] && echo yes || echo '
 if [ "$DO_TUNER" = 1 ]; then
     step "1. Check for newer bpftune .deb"
 
-    LOCAL_DEB=""
-    if [ -d "$BACKUP_DIR" ]; then
-        LOCAL_DEB=$(ls "$BACKUP_DIR"/bpftune-custom-*-"$ARCH".deb 2>/dev/null | sort -V | tail -1 || true)
-    fi
-
     NEW_VER=""
     DEB_TO_INSTALL=""
 
-    if [ -n "$LOCAL_DEB" ]; then
-        NEW_VER=$(dpkg-deb -f "$LOCAL_DEB" Version 2>/dev/null || echo "?")
-        DEB_TO_INSTALL="$LOCAL_DEB"
-        printf "  found local .deb: %s (%s)\n" "$LOCAL_DEB" "$NEW_VER"
-    else
-        printf "  no local .deb — checking GitHub releases for %s/%s...\n" "$REPO" "$ARCH"
-        DEB_URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-            | python3 -c "
+    printf "  checking GitHub releases for %s/%s...\n" "$REPO" "$ARCH"
+    DEB_INFO=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
+        | python3 -c "
 import json, sys
 try:
-    d = json.load(sys.stdin)
+    releases = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-for a in d.get('assets', []):
-    if '${ARCH}' in a.get('name', '') and 'bpftune-custom' in a.get('name', ''):
-        tag = d.get('tag_name', '').lstrip('v')
-        if tag:
-            print(tag + ' ' + a.get('browser_download_url', ''))
-        break
+for r in releases:
+    for a in r.get('assets', []):
+        name = a.get('name', '')
+        if name.endswith('_${ARCH}.deb') and 'bpftune' in name:
+            parts = name.split('_')
+            ver = parts[1] if len(parts) >= 2 else r.get('tag_name', '').lstrip('v')
+            print(ver + ' ' + a.get('browser_download_url', ''))
+            sys.exit(0)
 " 2>/dev/null || true)
-        if [ -n "$DEB_URL" ]; then
-            NEW_VER=$(printf "%s" "$DEB_URL" | awk '{print $1}')
-            URL=$(printf "%s" "$DEB_URL" | awk '{print $2}')
-            curl -fsSL "$URL" -o /tmp/bpftune-"$ARCH".deb
-            DEB_TO_INSTALL=/tmp/bpftune-"$ARCH".deb
-            printf "  found GitHub release: %s\n" "$NEW_VER"
-        fi
+    if [ -n "$DEB_INFO" ]; then
+        NEW_VER=$(printf "%s" "$DEB_INFO" | awk '{print $1}')
+        URL=$(printf "%s" "$DEB_INFO" | awk '{print $2}')
+        curl -fsSL "$URL" -o /tmp/bpftune-"$ARCH".deb
+        DEB_TO_INSTALL=/tmp/bpftune-"$ARCH".deb
+        printf "  found GitHub release: %s\n" "$NEW_VER"
     fi
 
     if [ -z "$DEB_TO_INSTALL" ]; then
-        warn "no .deb found in $BACKUP_DIR or GitHub releases — skipping tuner update"
+        warn "no .deb found in GitHub releases — skipping tuner update"
         if [ "$CURRENT_VER" = "not-installed" ]; then
             fail "bpftune is not installed. Run install.sh first."
         fi
