@@ -196,13 +196,6 @@ struct tcp_conn_event_data {
 };
 
 struct remote_host {
-    /* 0.4.89: sequence counter for reanchor-vs-BPF race fix (C1).
-     * BPF increments seq before and after every in-place update via
-     * __sync_fetch_and_add.  Userspace reads seq, does read-modify-write
-     * of the full struct, reads seq again; if it changed, retries.
-     * Even = stable, odd = mid-update.  Counter wraps at 2^64;
-     * userspace compares equality, not magnitude, so wrap is fine. */
-    __u64 seq;
     __u64 min_rtt;
     __u64 max_rate_delivered;
     __u64 instances;
@@ -233,6 +226,11 @@ struct remote_host {
     __u64 rtt_low_min;
     struct rate_hist rate;   /* rate side: histogram replaces streaks */
     struct tcp_conn_metric metrics[NUM_TCP_CONN_METRICS];
+    /* 0.4.89 (C1): sequence counter at END of struct to preserve
+     * field offsets for dashboard tooling (streak_writeback.go) that
+     * reads the BPF map with hardcoded offsets from the pre-0.4.89
+     * layout.  Position within struct is irrelevant to the race fix. */
+    __u64 seq;
 };
 
 #define REMOTE_HOST_MIN_INSTANCES 4
