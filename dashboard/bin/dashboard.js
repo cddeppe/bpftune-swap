@@ -1107,6 +1107,9 @@
     // 0.4.122: wrap in _safeRender — Chart may not be loaded yet on the
     // very first liveRefresh call (fires before boot's _loadCharts resolves).
     _safeRender('swaps', function() { renderSwaps(); });
+    _safeRender('score-now', function() { renderScoreNow(); });
+    _safeRender('div', function() { renderDivChart("div", ""); });
+    _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
     state.lastLiveSwaps = doc.recent_swaps || [];
     _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
     _fetchAndApplyLabels();
@@ -1774,16 +1777,59 @@
   }
 
   function renderScoreNow() {
-    if (!state.bucketDoc || !state.bucketDoc.series) return;
-    console.log("renderScoreNow", state.bucketDoc ? "has doc, ranges: " + Object.keys(state.bucketDoc.series || {}).length : "no doc");
+    if (!state.meta) return;
     var rng = $("range").value;
-    var bid = $("bucket").value;
-    if (bid === "all") { var hb = _heaviestBucketWithCoverage(); if (hb) bid = hb.bid; }
-    var doc = state.bucketDoc;
-    if (!doc || !doc.series || !doc.series[rng]) return;
-    var s = doc.series[rng];
-    var ts = s.ts;
-    if (!ts || !ts.length) return;
+    var bid = $("bucket") ? $("bucket").value : null;
+    if (!bid || bid === "all") { var hb = _heaviestBucketWithCoverage(); if (hb) bid = hb.bid; }
+    var s = null, ts = null;
+    // v0.8.4: for 1h range, use live bucket data (30s SSE) and compute
+    // score_ from re_/ss_/bs_/ns_. Formula: score = re*ss/(256+bs*64+ns*32)
+    if (rng === "1h" && bid && state.bucketLive && state.bucketLive[bid]) {
+      var lb = state.bucketLive[bid];
+      if (lb.ts && lb.ts.length && lb.cols) {
+        s = {}; ts = lb.ts;
+        for (var k in lb.cols) {
+          if (k.indexOf("re_") === 0) {
+            var alg = k.substring(3);
+            var reA = lb.cols["re_"+alg]||[], ssA = lb.cols["ss_"+alg]||[];
+            var bsA = lb.cols["bs_"+alg]||[], nsA = lb.cols["ns_"+alg]||[];
+            s["score_"+alg] = reA.map(function(re,i){
+              var ss=ssA[i]||0, bs=bsA[i]||0, ns=nsA[i]||0;
+              return (re && ss) ? re*ss/(256+bs*64+ns*32) : null;
+            });
+          }
+        }
+      }
+    }
+    // Try labeled bucket if raw addr didn't match
+    if (!s && rng === "1h" && bid) {
+      var _lbl = _labelForBucketAddr(bid);
+      if (_lbl && _lbl !== bid && state.bucketLive && state.bucketLive[_lbl]) {
+        var _lb = state.bucketLive[_lbl];
+        if (_lb.ts && _lb.ts.length && _lb.cols) {
+          s = {}; ts = _lb.ts;
+          for (var _k in _lb.cols) {
+            if (_k.indexOf("re_") === 0) {
+              var _a = _k.substring(3);
+              var rA=_lb.cols["re_"+_a]||[], sA=_lb.cols["ss_"+_a]||[];
+              var bA=_lb.cols["bs_"+_a]||[], nA=_lb.cols["ns_"+_a]||[];
+              s["score_"+_a] = rA.map(function(re,i){
+                var ss=sA[i]||0, bs=bA[i]||0, ns=nA[i]||0;
+                return (re && ss) ? re*ss/(256+bs*64+ns*32) : null;
+              });
+            }
+          }
+        }
+      }
+    }
+    // Fall back to static bucketDoc for longer ranges (5 min refresh)
+    if (!s) {
+      if (!state.bucketDoc || !state.bucketDoc.series) return;
+      var doc = state.bucketDoc;
+      if (!doc.series || !doc.series[rng]) return;
+      s = doc.series[rng]; ts = s.ts;
+      if (!ts || !ts.length) return;
+    }
     var scoreCols = Object.keys(s).filter(function(k) { return k.indexOf("score_") === 0; });
     mk("score-now", {
       type: "line",
