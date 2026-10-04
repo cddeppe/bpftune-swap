@@ -160,9 +160,9 @@ struct tcp_conn_metric {
          * hit 65k sockets per alg in days, at which point __u16 wraps
          * to 0 and the guarded decrement pins it there forever.
          * STATE_LAYOUT bumped to 2; old state files refuse to load. */
-        __u32 sockets_alive;
-        __u32 sockets_good;
-        __u32 sockets_proved;
+        __u16 sockets_alive;
+        __u16 sockets_good;
+        __u16 sockets_proved;
 
         /* 0.4.45: rate EMA in 100KB/s units; swap target reads it. */
 
