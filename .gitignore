@@ -32,3 +32,4 @@ __pycache__/
 /tools/bpftune-collector.py
 /tools/bpftune-render.py
 /tools/bpftune-cli.py
+dashboard/
