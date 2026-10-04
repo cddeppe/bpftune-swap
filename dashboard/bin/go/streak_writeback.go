@@ -41,7 +41,8 @@ const (
 	offRateHist         = 112
 	sizeofRateHist      = 4*rateHistBins + 8
 	offMetricsArray     = offRateHist + sizeofRateHist
-	sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric)
+	sizeofSeqField      = 8  // 0.4.89: __u64 seq at end of struct (C1 race fix)
+	sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric) + sizeofSeqField
 	writebackWindow     = 8
 )
 
@@ -303,6 +304,11 @@ func valueJSONToBytes(v map[string]interface{}) []byte {
 		buf = append(buf, byte(toInt(m["null_streak"])&0xff))
 		buf = append(buf, 0, 0, 0, 0)
 	}
+	// 0.4.89: seq field (__u64) at end of struct -- preserve from lookup.
+	// The writeback only patches bad_streak/null_streak; seq is carried
+	// through unchanged, same as all other fields we don't touch.
+	buf = binary.LittleEndian.AppendUint64(buf, uint64(toInt(v["seq"])))
+
 	if len(buf) != sizeofRemoteHost {
 		return nil
 	}
