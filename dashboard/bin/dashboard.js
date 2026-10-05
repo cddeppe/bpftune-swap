@@ -147,15 +147,15 @@
       if (!_k || !_v) return;
       var _kt = _k.textContent;
       if (_kt.indexOf('prefix4') >= 0) {
-        _v.innerHTML = '/<input type="text" id="cfg-p4" value="' + b.prefix4 + '" min="1" max="32" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px">';
+        _v.innerHTML = '/<input type="text" id="cfg-p4" value="' + b.prefix4 + '" min="1" max="32" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px;text-align:right">';
       } else if (_kt.indexOf('prefix6') >= 0) {
-        _v.innerHTML = '/<input type="text" id="cfg-p6" value="' + b.prefix6 + '" min="1" max="128" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px">';
+        _v.innerHTML = '/<input type="text" id="cfg-p6" value="' + b.prefix6 + '" min="1" max="128" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px;text-align:right">';
       } else if (_kt.indexOf('exploration') >= 0) {
-        _v.innerHTML = '<input type="text" id="cfg-ep" value="' + b.explore_pct + '" min="0" max="100" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px">%';
+        _v.innerHTML = '<input type="text" id="cfg-ep" value="' + b.explore_pct + '" min="0" max="100" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px;text-align:right">%';
       } else if (_kt.indexOf('proof good') >= 0) {
-        _v.innerHTML = '<input type="text" id="cfg-pg" value="' + (b.proof_good_bps * 8 / 1000000).toFixed(0) + '" min="1" style="width:50px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px"> Mbps';
+        _v.innerHTML = '<input type="text" id="cfg-pg" value="' + (b.proof_good_bps * 8 / 1000000).toFixed(0) + '" min="1" style="width:50px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px;text-align:right"> Mbps';
       } else if (_kt.indexOf('proof proved') >= 0) {
-        _v.innerHTML = '<input type="text" id="cfg-pp" value="' + (b.proof_proved_bps * 8 / 1000000).toFixed(0) + '" min="1" style="width:50px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px"> Mbps';
+        _v.innerHTML = '<input type="text" id="cfg-pp" value="' + (b.proof_proved_bps * 8 / 1000000).toFixed(0) + '" min="1" style="width:50px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px;text-align:right"> Mbps';
       }
     });
     var _sb = document.createElement('button');
