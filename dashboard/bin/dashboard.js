@@ -2076,7 +2076,7 @@ function _populateBucketSelect(desiredBucket) {
 
       var stamp = new Date(state.meta.generated_ts * 1000).toISOString()
                       .replace("T", " ").slice(0, 19) + "Z";
-      if (footgen) footgen.textContent = "rendered " + stamp + " | 07190921";
+      if (footgen) footgen.textContent = "rendered " + stamp;
       status("updated " + relTime(state.meta.generated_ts));
 
       return loadBucket(finalBucket);
@@ -2164,7 +2164,7 @@ function _populateBucketSelect(desiredBucket) {
         var stamp = new Date(state.meta.generated_ts * 1000).toISOString()
                         .replace("T", " ").slice(0, 19) + "Z";
         status("updated " + relTime(state.meta.generated_ts));
-        if (footgen) footgen.textContent = "rendered " + stamp + " | 07190921";
+        if (footgen) footgen.textContent = "rendered " + stamp;
 
         var bs = $("bucket");
         bs.onchange = function () {
