@@ -48,7 +48,10 @@ func (c *Collector) collect() {
 	// writeSwapsCSV, writeSrateCSV) reuse these parsed results.
 	logText := readLogTail(logTailBytes)
 	allSwaps, allMets, allSrates := parseSwapsMetsSrates(logText)
-	cdest := cookieDestMap(logText)
+	// v0.8.8: persist cookie→dest map across cycles so proofs with
+	// cookies established before the 2 MB log tail still get a dest.
+	// Without this, recent_proofs rows for old cookies showed dest="".
+	cdest := persistCookieDest(cookieDestMap(logText))
 
 	// ----- Build live buckets + metric_by_bucket + bucket_live ---------
 	buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
