@@ -204,49 +204,6 @@ if [ "$DO_DASHBOARD" = 1 ]; then
         chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
         ok "frontend files synced"
 
-        # --- 2c. Handle nginx port 8080 conflict ---
-        if command -v nginx >/dev/null 2>&1; then
-            if grep -rq 'listen.*8080' /etc/nginx/ 2>/dev/null; then
-                rm -f /etc/nginx/conf.d/bpftune-dashboard.conf 2>/dev/null || true
-                python3 - <<'NGINX_CLEANUP'
-import re, sys
-path = "/etc/nginx/nginx.conf"
-try:
-    s = open(path).read()
-except:
-    sys.exit(0)
-for anchor in ["listen 0.0.0.0:8080", "listen 8080"]:
-    idx = s.find(anchor)
-    if idx != -1:
-        break
-else:
-    sys.exit(0)
-server_start = s.rfind("server {", 0, idx)
-if server_start == -1:
-    sys.exit(0)
-brace_start = s.find("{", server_start)
-depth = 0; i = brace_start; end = None
-while i < len(s):
-    if s[i] == "{": depth += 1
-    elif s[i] == "}":
-        depth -= 1
-        if depth == 0: end = i + 1; break
-    i += 1
-if end is None:
-    sys.exit(0)
-line_start = s.rfind("\n", 0, server_start) + 1
-s = s[:line_start] + s[end:]
-s = re.sub(r"\n\n\n+", "\n\n", s)
-open(path, "w").write(s)
-NGINX_CLEANUP
-                nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
-                ok "removed nginx 8080 block"
-            fi
-        fi
-
-        # Kill any lingering process on 8080
-        fuser -k 8080/tcp 2>/dev/null || true
-
         # --- 2d. Start/restart Go collector ---
         systemctl restart bpftune-collector-go 2>/dev/null || systemctl start bpftune-collector-go 2>/dev/null || true
         sleep 5
