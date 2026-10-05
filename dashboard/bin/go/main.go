@@ -548,8 +548,6 @@ func main() {
 		// truth rows to the REAL /var/lib/bpftune/history/swapscore_truth.jsonl,
 		// polluting the production ML training file.
 		truthFilePath = *dataRoot + "/history/swapscore_truth.jsonl"
-		// v0.8.8: cookieDestPath also needs overriding for the same reason.
-		cookieDestPath = *dataRoot + "/history/cookie_dest.json"
 	}
 	if *aliasesPath != "/etc/bpftune/aliases" {
 		aliasesFile = *aliasesPath
