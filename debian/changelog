@@ -1,3 +1,17 @@
+bpftune (0.4.92) unstable; urgency=medium
+
+  * Fix: skip swap/metric tracking for incoming (passive) connections.
+    The server is the receiver — swapping the local congestion algorithm
+    only affects ACK pacing, not the data transfer rate. Sources no
+    longer appear in the dashboard.
+  * Fix: customizable proof thresholds via BPF map slots 4+5.
+  * Fix: re-enable swap_score write in score_pending_rejected (T1).
+  * Fix: remove drop_count double increment (T3).
+  * Fix: syslog format-string vulnerability (T4).
+  * Fix: bpftune_log_buf buf_off overshoot (T5).
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Mon, 06 Oct 2026 00:00:00 +0200
+
 bpftune (0.4.91) unstable; urgency=medium
 
   * Feature: add --bpf-debug CLI flag to toggle BPF trace output live.
