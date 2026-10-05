@@ -47,7 +47,7 @@ BPF_MAP_DEF(midsamp_map, BPF_MAP_TYPE_SK_STORAGE, int, __u64, 0, BPF_F_NO_PREALL
  * update values live without restarting.
  * slot 0 = exp_pct, slot 1 = prefix4, slot 2 = prefix6,
  * slot 3 = bpf_debug (0=quiet, 1=verbose). */
-BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 4, 0);
+BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
 
 /* 0.4.79: alias table.  Key is the raw destination as it arrives
  * from the socket (v4-mapped or v6/32 top bits); value is the
@@ -157,6 +157,27 @@ static __always_inline __u32 bucket_prefix4(void)
         if (pfx > 32) pfx = 32;
         return pfx;
 }
+/* 0.4.92: proof thresholds, read live from tuner_config_map[4] and [5].
+ * Defaults: PROOF_GOOD_BPS (30 Mbps = 3750000), PROOF_PROVED_BPS (100 Mbps = 12500000).
+ * Users can customize via the dashboard /api/config endpoint. */
+static __always_inline __u64 get_proof_good_bps(void)
+{
+    __u32 key = 4;
+    __u32 *p = bpf_map_lookup_elem(&tuner_config_map, &key);
+    if (p && *p > 0)
+        return (__u64)*p;
+    return PROOF_GOOD_BPS;
+}
+
+static __always_inline __u64 get_proof_proved_bps(void)
+{
+    __u32 key = 5;
+    __u32 *p = bpf_map_lookup_elem(&tuner_config_map, &key);
+    if (p && *p > 0)
+        return (__u64)*p;
+    return PROOF_PROVED_BPS;
+}
+
 /* 0.4.79: v6 bucket prefix, read live from tuner_config_map[2].
  * Default 32 = the 0.4.56 /32 merge. */
 static __always_inline __u32 bucket_prefix6(void)
@@ -909,7 +930,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
          * all. */
         if (!is_close) {
                 __u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
-                if (rate_delivered >= PROOF_PROVED_BPS && !(statep->proved_bitmap & bit)) {
+                if (rate_delivered >= get_proof_proved_bps() && !(statep->proved_bitmap & bit)) {
                         statep->proved_bitmap |= bit;
                         /* 0.4.89 (C1): seq-wrap proof-counter bump. */
                         __sync_fetch_and_add(&remote_host->seq, 1);
@@ -922,7 +943,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         if (bpftune_debug)
                                 bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2",
                                    bpf_get_socket_cookie(ops), s, rate_delivered);
-                } else if (rate_delivered >= PROOF_GOOD_BPS && !(statep->good_bitmap & bit)) {
+                } else if (rate_delivered >= get_proof_good_bps() && !(statep->good_bitmap & bit)) {
                         statep->good_bitmap |= bit;
                         /* 0.4.89 (C1): seq-wrap proof-counter bump. */
                         __sync_fetch_and_add(&remote_host->seq, 1);
