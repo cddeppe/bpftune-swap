@@ -332,8 +332,22 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 
     switch (ops->op) {
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
+        bpf_sock_ops_cb_flags_set(ops, cb_flags);
+        break;
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
         bpf_sock_ops_cb_flags_set(ops, cb_flags);
+        /* 0.4.92: mark passive (incoming) connections — skip swap/metric
+         * tracking. The server is the receiver; swapping the local
+         * congestion algorithm only affects ACK pacing, not the data
+         * transfer rate (controlled by the sender's algorithm).
+         * This also removes sources from the dashboard (no met/swap/
+         * proof events = no bucket list or leaderboard entries). */
+        if (sk) {
+            statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
+                                        BPF_SK_STORAGE_GET_F_CREATE);
+            if (statep)
+                statep->swap_target = 0xff;
+        }
         break;
     case BPF_SOCK_OPS_RETRANS_CB:
         if (ops->total_retrans > (ops->segs_out >> DROP_SHIFT)) {
@@ -351,6 +365,10 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     default:
         return 1;
     }
+
+    /* 0.4.92: skip all tracking for passive (incoming) connections */
+    if (statep && statep->swap_target == 0xff)
+        return 1;
 
     if (!sk)
         return 1;
