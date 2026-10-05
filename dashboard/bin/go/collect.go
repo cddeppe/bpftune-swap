@@ -57,15 +57,17 @@ func (c *Collector) collect() {
 	doc := map[string]interface{}{
 		"generated_ts": now,
 		"build": map[string]interface{}{
-			"version":      bpftuneVersion(),
-			"dash_version": dashVersion(),
-			"service":      bpftuneServiceActive(),
-			"uptime_min":   uptimeMin(),
-			"started_utc":  startedUTC(),
-			"log_path":     "/var/log/bpftune-met-live.log",
-			"prefix4":      prefix4Value(),
-			"prefix6":      prefix6Value(),
-			"explore_pct":  explorePctValue(),
+			"version":          bpftuneVersion(),
+			"dash_version":     dashVersion(),
+			"service":          bpftuneServiceActive(),
+			"uptime_min":       uptimeMin(),
+			"started_utc":      startedUTC(),
+			"log_path":         "/var/log/bpftune-met-live.log",
+			"prefix4":          prefix4Value(),
+			"prefix6":          prefix6Value(),
+			"explore_pct":      explorePctValue(),
+			"proof_good_bps":   proofGoodBpsValue(),
+			"proof_proved_bps": proofProvedBpsValue(),
 		},
 		"system":           readSystemInfo(),
 		"buckets":          buckets,
@@ -111,7 +113,7 @@ func (c *Collector) collect() {
 	// Mirrors Python _resolve_pending enrichment logic.
 	enrichSwapsForCSV(allSwaps, allMets, allSrates)
 	writeSwapsCSV(allSwaps, now)
-	writeTruthRows(allSwaps) // v0.8.3: write truth rows with separate dedup            // truth writing happens inside, after dedup
+	writeTruthRows(allSwaps)                // v0.8.3: write truth rows with separate dedup            // truth writing happens inside, after dedup
 	writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
 
 	// ----- Update current state + push to SSE --------------------------

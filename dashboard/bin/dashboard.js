@@ -129,6 +129,8 @@
     if (b.prefix4 != null) rows.push(["prefix4 (v4)", "/" + b.prefix4, "dim"]);
     if (b.prefix6 != null) rows.push(["prefix6 (v6)", "/" + b.prefix6, "dim"]);
     if (b.explore_pct != null) rows.push(["exploration", b.explore_pct + "%", b.explore_pct > 0 ? "hi" : "dim"]);
+    if (b.proof_good_bps != null) rows.push(["proof good", (b.proof_good_bps / 1000000).toFixed(0) + " Mbps", "dim"]);
+    if (b.proof_proved_bps != null) rows.push(["proof proved", (b.proof_proved_bps / 1000000).toFixed(0) + " Mbps", "dim"]);
     setHTML("lv-build", rows.map(function (r) {
       return '<div class="row"><span class="k">' + esc(r[0]) + '</span>' +
              '<span class="v ' + (r[2] || "") + '">' + esc(r[1]) + '</span></div>';
@@ -150,6 +152,10 @@
         _v.innerHTML = '/<input type="text" id="cfg-p6" value="' + b.prefix6 + '" min="1" max="128" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px">';
       } else if (_kt.indexOf('exploration') >= 0) {
         _v.innerHTML = '<input type="text" id="cfg-ep" value="' + b.explore_pct + '" min="0" max="100" style="width:40px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px">%';
+      } else if (_kt.indexOf('proof good') >= 0) {
+        _v.innerHTML = '<input type="text" id="cfg-pg" value="' + (b.proof_good_bps / 1000000).toFixed(0) + '" min="1" style="width:50px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px"> Mbps';
+      } else if (_kt.indexOf('proof proved') >= 0) {
+        _v.innerHTML = '<input type="text" id="cfg-pp" value="' + (b.proof_proved_bps / 1000000).toFixed(0) + '" min="1" style="width:50px;font-size:13px;font-family:var(--mono);background:transparent;border:1px solid var(--border);border-radius:3px;color:inherit;padding:1px 3px"> Mbps';
       }
     });
     var _sb = document.createElement('button');
@@ -163,9 +169,15 @@
       if (p4) ch.prefix4 = parseInt(p4.value);
       if (p6) ch.prefix6 = parseInt(p6.value);
       if (ep) ch.explore_pct = parseInt(ep.value);
+      var pg = document.getElementById('cfg-pg');
+      var pp = document.getElementById('cfg-pp');
+      if (pg) ch.proof_good_bps = Math.round(parseFloat(pg.value) * 1000000);
+      if (pp) ch.proof_proved_bps = Math.round(parseFloat(pp.value) * 1000000);
       fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(ch)})
         .then(function(r) { return r.json(); })
-        .then(function(d) { if (d.ok) { status('Config saved — live on next bpftune restart'); if (d.prefix4 != null) { var _i = document.getElementById('cfg-p4'); if (_i) _i.value = d.prefix4; } if (d.prefix6 != null) { var _i2 = document.getElementById('cfg-p6'); if (_i2) _i2.value = d.prefix6; } if (d.explore_pct != null) { var _i3 = document.getElementById('cfg-ep'); if (_i3) _i3.value = d.explore_pct; } } })
+        .then(function(d) { if (d.ok) { status('Config saved — live on next bpftune restart'); if (d.prefix4 != null) { var _i = document.getElementById('cfg-p4'); if (_i) _i.value = d.prefix4; } if (d.prefix6 != null) { var _i2 = document.getElementById('cfg-p6'); if (_i2) _i2.value = d.prefix6; } if (d.explore_pct != null) { var _i3 = document.getElementById('cfg-ep'); if (_i3) _i3.value = d.explore_pct; }
+          if (d.proof_good_bps != null) { var _i4 = document.getElementById('cfg-pg'); if (_i4) _i4.value = (d.proof_good_bps / 1000000).toFixed(0); }
+          if (d.proof_proved_bps != null) { var _i5 = document.getElementById('cfg-pp'); if (_i5) _i5.value = (d.proof_proved_bps / 1000000).toFixed(0); } } })
         .catch(function(e) { err('config: ' + e.message); });
     };
     _be.appendChild(_sb);
