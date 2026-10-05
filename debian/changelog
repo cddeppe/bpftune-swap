@@ -1,4 +1,4 @@
-bpftune (0.4.92fix1) unstable; urgency=medium
+bpftune (0.4.93) unstable; urgency=medium
 
   * Fix: clear stale swap_target=0xff on socket reuse. When a socket was
     previously used for a passive (incoming) connection, swap_target=0xff
