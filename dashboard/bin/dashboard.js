@@ -116,7 +116,7 @@
 
   function renderBuild(b) {
     var rows = [
-      ["version",   b.version, "hi"],
+      ["tuner",     b.version, "hi"],
       ["dashboard", b.dash_version || "?", "hi"],
       ["service",   b.service, b.service === "active" ? "hi" : ""],
     ];
