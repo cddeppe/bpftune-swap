@@ -125,12 +125,12 @@
       var m = b.uptime_min % 60;
       rows.push(["uptime", h + "h " + m + "m"]);
     }
-    if (b.started_utc) rows.push(["started", b.started_utc + " UTC", "dim"]);
-    if (b.prefix4 != null) rows.push(["prefix4 (v4)", "/" + b.prefix4, "dim"]);
-    if (b.prefix6 != null) rows.push(["prefix6 (v6)", "/" + b.prefix6, "dim"]);
-    if (b.explore_pct != null) rows.push(["exploration", b.explore_pct + "%", b.explore_pct > 0 ? "hi" : "dim"]);
-    if (b.proof_good_bps != null) rows.push(["proof good", (b.proof_good_bps * 8 / 1000000).toFixed(0) + " Mbps", "dim"]);
-    if (b.proof_proved_bps != null) rows.push(["proof proved", (b.proof_proved_bps * 8 / 1000000).toFixed(0) + " Mbps", "dim"]);
+    if (b.started_utc) rows.push(["started", b.started_utc + " UTC"]);
+    if (b.prefix4 != null) rows.push(["prefix4 (v4)", "/" + b.prefix4]);
+    if (b.prefix6 != null) rows.push(["prefix6 (v6)", "/" + b.prefix6]);
+    if (b.explore_pct != null) rows.push(["exploration", b.explore_pct + "%"]);
+    if (b.proof_good_bps != null) rows.push(["proof good", (b.proof_good_bps * 8 / 1000000).toFixed(0) + " Mbps"]);
+    if (b.proof_proved_bps != null) rows.push(["proof proved", (b.proof_proved_bps * 8 / 1000000).toFixed(0) + " Mbps"]);
     setHTML("lv-build", rows.map(function (r) {
       return '<div class="row"><span class="k">' + esc(r[0]) + '</span>' +
              '<span class="v ' + (r[2] || "") + '">' + esc(r[1]) + '</span></div>';
