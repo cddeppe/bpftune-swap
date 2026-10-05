@@ -571,16 +571,6 @@
     setHTML("lv-div", html + '</tbody></table>');
   }
 
-  // v0.8.7: destLabel() — resolve dest for display, falling back to a
-  // readable placeholder when the collector couldn't attribute the proof
-  // to a specific destination (passive / pre-connection samples).  Was
-  // previously rendering as ` · 174.7 Mb/s · 2m ago` with no label, which
-  // made operators think the panel was broken.
-  function destLabel(dest) {
-    var s = shortAddr(dest);
-    return s && s.length ? s : '\u2014';   // em dash placeholder
-  }
-
   function renderRecentProofs(rows) {
     rows = (rows || []).slice(0, 18);
     if (!rows.length) {
@@ -593,7 +583,7 @@
     rows.forEach(function (r) {
       html += '<div class="item">' +
         '<span class="flow">' + esc(r.alg) + '</span>' +
-        '<span class="meta">' + esc(destLabel(r.dest)) +
+        '<span class="meta">' + esc(shortAddr(r.dest)) +
           ' &middot; ' + r.mbps.toFixed(1) + ' Mb/s' +
           (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
           '</span>' +
@@ -659,7 +649,7 @@
       html += '<div class="item">' +
         '<span class="flow">' + esc(r.from_alg) +
           '<span class="arrow">&rarr;</span>' + esc(r.to_alg) + '</span>' +
-        '<span class="meta">' + esc(destLabel(r.dest)) +
+        '<span class="meta">' + esc(shortAddr(r.dest)) +
           ' &middot; d' + r.d +
           (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
           '</span>' +
