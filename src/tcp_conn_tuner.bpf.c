@@ -333,6 +333,16 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     switch (ops->op) {
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
         bpf_sock_ops_cb_flags_set(ops, cb_flags);
+        /* 0.4.92fix: clear stale swap_target=0xff from a previous passive
+         * connection on the same socket (socket reuse). Without this, an
+         * active connection on a reused socket would be incorrectly skipped
+         * by the passive-skip check below, causing missing estab events
+         * and missing bucket labels on proofs. */
+        if (sk) {
+            statep = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
+            if (statep && statep->swap_target == 0xff)
+                statep->swap_target = 0;
+        }
         break;
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
         bpf_sock_ops_cb_flags_set(ops, cb_flags);
