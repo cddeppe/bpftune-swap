@@ -571,6 +571,16 @@
     setHTML("lv-div", html + '</tbody></table>');
   }
 
+  // v0.8.7: destLabel() — resolve dest for display, falling back to a
+  // readable placeholder when the collector couldn't attribute the proof
+  // to a specific destination (passive / pre-connection samples).  Was
+  // previously rendering as ` · 174.7 Mb/s · 2m ago` with no label, which
+  // made operators think the panel was broken.
+  function destLabel(dest) {
+    var s = shortAddr(dest);
+    return s && s.length ? s : '\u2014';   // em dash placeholder
+  }
+
   function renderRecentProofs(rows) {
     rows = (rows || []).slice(0, 18);
     if (!rows.length) {
@@ -583,7 +593,7 @@
     rows.forEach(function (r) {
       html += '<div class="item">' +
         '<span class="flow">' + esc(r.alg) + '</span>' +
-        '<span class="meta">' + esc(shortAddr(r.dest)) +
+        '<span class="meta">' + esc(destLabel(r.dest)) +
           ' &middot; ' + r.mbps.toFixed(1) + ' Mb/s' +
           (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
           '</span>' +
@@ -649,7 +659,7 @@
       html += '<div class="item">' +
         '<span class="flow">' + esc(r.from_alg) +
           '<span class="arrow">&rarr;</span>' + esc(r.to_alg) + '</span>' +
-        '<span class="meta">' + esc(shortAddr(r.dest)) +
+        '<span class="meta">' + esc(destLabel(r.dest)) +
           ' &middot; d' + r.d +
           (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
           '</span>' +
@@ -1576,7 +1586,9 @@
     if (!state.meta) return;
     var algs = state.meta.algs;
     if (!algs) return;   // 0.4.87: meta not loaded yet — boot() still running
-    var rng = $("range").value;
+    // v0.8.7: guard $("range") — SSE can fire before boot populates
+    // the <select>.  Treat as "1h" (matches boot's default).
+    var rng = $("range") ? $("range").value : "1h";
     var bid = $("bucket") ? $("bucket").value : null;
     if (!bid || bid === 'all') {
       var hb2 = _heaviestBucketWithCoverage();
@@ -1720,7 +1732,13 @@
   }
 
   function renderDivChart(canvasId, suffix) {
-    var doc = state.swaps, rng = $("range").value;
+    // v0.8.7: guard state.swaps — SSE can fire renderDivergenceCharts
+    // before boot()'s data/swaps.json fetch resolves, so state.swaps is
+    // still null.  Without this guard, `doc[rng]` throws
+    // "Cannot read properties of null (reading '')" and aborts the
+    // whole renderDivergenceCharts call (both div + div_sustained).
+    var doc = state.swaps, rng = $("range") ? $("range").value : "1h";
+    if (!doc) return;
     var d = doc[rng];
     if (!d) return;
     var ts = d.ts;
@@ -1862,7 +1880,9 @@
   }
 
   function renderSwaps() {
-    var rng = $("range").value;
+    // v0.8.7: guard $("range") — SSE can fire before boot populates
+    // the <select>, so $("range") is null briefly.  Treat as "1h".
+    var rng = $("range") ? $("range").value : "1h";
     var d = null;
     if (state.bucketDoc && state.bucketDoc.series && state.bucketDoc.series[rng] && state.bucketDoc.series[rng].swaps) {
       var s2 = state.bucketDoc.series[rng];
