@@ -1866,9 +1866,40 @@
     var d = null;
     if (state.bucketDoc && state.bucketDoc.series && state.bucketDoc.series[rng] && state.bucketDoc.series[rng].swaps) {
       var s2 = state.bucketDoc.series[rng];
-      d = {ts: s2.ts, swaps: s2.swaps};
-      window.__chart_axis_min = s2.ts[0] * 1000;
-      window.__chart_axis_max = s2.ts[s2.ts.length - 1] * 1000;
+      // 0.8.5: rebin onto the SAME fixed axis as renderBucket() so all
+      // four charts share an identical x-axis. Was using raw s2.ts which
+      // was offset from the bucket charts by up to 1 interval.
+      var __now = (window.__current_doc && window.__current_doc.generated_ts) || (Date.now() / 1000);
+      var __fa = buildFixedAxis(rng, __now);
+      if (__fa) {
+        var rebinned = __fa.ts.map(function(){return 0;});
+        var maxDist = __fa.interval * 1.5;
+        for (var si = 0; si < s2.ts.length; si++) {
+          var t = s2.ts[si];
+          if (t < __fa.ts[0] - maxDist || t > __fa.ts[__fa.ts.length - 1] + maxDist) continue;
+          if (t <= __fa.ts[0]) { rebinned[0] += (s2.swaps[si] || 0); continue; }
+          var hi = __fa.ts.length - 1;
+          if (t >= __fa.ts[hi]) { rebinned[hi] += (s2.swaps[si] || 0); continue; }
+          var lo = 0;
+          while (lo < hi - 1) {
+            var mid = (lo + hi) >> 1;
+            if (__fa.ts[mid] <= t) lo = mid; else hi = mid;
+          }
+          if (Math.abs(t - __fa.ts[lo]) <= Math.abs(t - __fa.ts[hi])) {
+            rebinned[lo] += (s2.swaps[si] || 0);
+          } else {
+            rebinned[hi] += (s2.swaps[si] || 0);
+          }
+        }
+        d = {ts: __fa.ts, swaps: rebinned};
+        window.__chart_axis_min = __fa.ts[0] * 1000;
+        window.__chart_axis_max = __fa.ts[__fa.ts.length - 1] * 1000;
+      } else {
+        // "all" range — no fixed axis, keep original ts
+        d = {ts: s2.ts, swaps: s2.swaps};
+        window.__chart_axis_min = undefined;
+        window.__chart_axis_max = undefined;
+      }
     }
     if (!d) {
     var sse = window.__filtered_doc || window.__current_doc;
