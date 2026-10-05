@@ -4,10 +4,13 @@ package main
 // for the bpftune tuner.  Mirrors Python _truth_write.
 //
 // Format: one JSON object per line:
-//   {"bucket":"82.43.0.0","tgt":"4","cls":"win"}
+//   {"bucket":"82.43.0.0","tgt":"cubic","cls":"win"}
 //
 // bucket = /16 prefix for v4 (first two octets + .0.0), "v6:XXXXXXXX" for v6
-// tgt    = to_alg index (as string)
+// tgt    = to_alg NAME (e.g. "cubic", "bbr", "htcp") — v0.8.6 fix D2: was
+//          previously the alg index as a string, which made the truth file
+//          unusable for the ML training pipeline (indices are not stable
+//          across BPF map reloads / kernel versions).
 // cls    = "win"/"loss"/"null" (only written for resolved outcomes,
 //          NOT for "no_post" or empty — matches Python behavior)
 //

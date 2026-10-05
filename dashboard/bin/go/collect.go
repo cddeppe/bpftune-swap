@@ -113,7 +113,15 @@ func (c *Collector) collect() {
 	// Mirrors Python _resolve_pending enrichment logic.
 	enrichSwapsForCSV(allSwaps, allMets, allSrates)
 	writeSwapsCSV(allSwaps, now)
-	writeTruthRows(allSwaps)                // v0.8.3: write truth rows with separate dedup            // truth writing happens inside, after dedup
+	// v0.8.7: removed writeTruthRows(allSwaps) call - writeSwapsCSV
+	// already writes truth rows for each NEW swap (those that pass the
+	// writtenSwaps dedup check).  Calling writeTruthRows separately
+	// was writing DUPLICATE truth rows on every collect cycle because
+	// writeTruthRows uses a SEPARATE dedup map (writtenTruth) that
+	// writeSwapsCSV never updates - so every classified swap that
+	// had just been written by writeSwapsCSV was written AGAIN by
+	// writeTruthRows.  The in-CSV write at csv_writer.go:247 is the
+	// single source of truth now.
 	writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
 
 	// ----- Update current state + push to SSE --------------------------

@@ -543,6 +543,11 @@ func main() {
 		swapsCSVPath = *dataRoot + "/history/swaps.csv"
 		srateCSVPath = *dataRoot + "/history/srate.csv"
 		stateJSONPath = *dataRoot + "/history/collector-go-state.json"
+		// v0.8.7: truthFilePath was missing from this override block -
+		// smoke tests with --data-root /tmp/test-bpftune were writing
+		// truth rows to the REAL /var/lib/bpftune/history/swapscore_truth.jsonl,
+		// polluting the production ML training file.
+		truthFilePath = *dataRoot + "/history/swapscore_truth.jsonl"
 	}
 	if *aliasesPath != "/etc/bpftune/aliases" {
 		aliasesFile = *aliasesPath
