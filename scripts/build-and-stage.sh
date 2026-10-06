@@ -103,7 +103,7 @@ cd "$GO_DIR"
 rm -f bpftune-collector-go bpftune-collector-go-*
 
 CGO_ENABLED=0 go build \
-    -ldflags "-s -w -X main.dashVersionStr=v0.9.0-${DASH_HASH}" \
+    -ldflags "-s -w -X main.dashVersionStr=v0.9.1-${DASH_HASH}" \
     -o "bpftune-collector-go-${ARCH}" \
     .
 
