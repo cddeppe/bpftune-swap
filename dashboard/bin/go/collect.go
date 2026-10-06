@@ -119,7 +119,16 @@ func (c *Collector) collect() {
                 }
         }
         doc["churn"] = churnResult
-        doc["rate"] = buildRate(logText) // midsamp scanning, separate from swap/met/srate
+        // v0.9.7: rate progression now falls back to midsamp.csv when the
+        // log tail is sparse, so the panel always shows data after restart.
+        rateResult := buildRate(logText)
+        if len(rateResult) == 0 {
+                csvRate := buildRateFromCSV()
+                if len(csvRate) > 0 {
+                        rateResult = csvRate
+                }
+        }
+        doc["rate"] = rateResult
         divResult := buildDivergenceFromParsed(allSwaps, allMets, allSrates)
         if len(allSwaps) < 50 {
                 csvDiv := buildDivergenceFromCSV(200)
@@ -157,6 +166,20 @@ func (c *Collector) collect() {
 
         // v0.9.5: write proofs.csv for the recent-proofs panel fallback
         writeProofsCSVFromInterface(topProofs, now)
+
+        // v0.9.7: write midsamp.csv for the rate progression panel fallback
+        midsampEvents := parseMidsampEvents(logText)
+        writeMidsampCSV(midsampEvents, now)
+
+        // v0.9.7: one-time backfill from log tail on first collect cycle.
+        // Parses the 16MB log tail and writes any proof/midsamp events
+        // that aren't already in the CSVs. This populates the CSVs with
+        // historical data immediately after deploy, instead of waiting
+        // for new events to accumulate.
+        backfillDone.Do(func() {
+                backfillProofsFromLog(logText, cdest)
+                backfillMidsampFromLog(logText)
+        })
 
         // ----- Update current state + push to SSE --------------------------
         c.mu.Lock()

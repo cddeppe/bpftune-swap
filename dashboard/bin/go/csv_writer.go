@@ -53,7 +53,8 @@ var (
         bucketsCSVPath = "/var/lib/bpftune/history/buckets.v2.csv"
         swapsCSVPath   = "/var/lib/bpftune/history/swaps.csv"
         srateCSVPath   = "/var/lib/bpftune/history/srate.csv"
-        proofsCSVPath  = "/var/lib/bpftune/history/proofs.csv" // v0.9.5: for proof panel fallback
+        proofsCSVPath  = "/var/lib/bpftune/history/proofs.csv"  // v0.9.5: for proof panel fallback
+        midsampCSVPath = "/var/lib/bpftune/history/midsamp.csv" // v0.9.7: for rate progression fallback
 )
 
 // Dedup sets — track which swaps/srates/proofs have already been written to CSV.

@@ -300,4 +300,6 @@ func rotateAllCSVs() {
 	rotateCSVIfLarge(srateCSVPath, 90, 50)
 	// proofs.csv: simple 90d retention, 20MB threshold
 	rotateCSVIfLarge(proofsCSVPath, 90, 20)
+	// midsamp.csv: simple 90d retention, 50MB threshold (v0.9.7)
+	rotateCSVIfLarge(midsampCSVPath, 90, 50)
 }

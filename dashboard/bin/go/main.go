@@ -549,6 +549,10 @@ func main() {
                 bucketsCSVPath = *dataRoot + "/history/buckets.v2.csv"
                 swapsCSVPath = *dataRoot + "/history/swaps.csv"
                 srateCSVPath = *dataRoot + "/history/srate.csv"
+                // v0.9.5: proofs.csv path also needs override
+                proofsCSVPath = *dataRoot + "/history/proofs.csv"
+                // v0.9.7: midsamp.csv path also needs override
+                midsampCSVPath = *dataRoot + "/history/midsamp.csv"
                 stateJSONPath = *dataRoot + "/history/collector-go-state.json"
                 // v0.8.7: truthFilePath was missing from this override block -
                 // smoke tests with --data-root /tmp/test-bpftune were writing

@@ -354,3 +354,95 @@ func algIndexFromName(name string) int {
         }
         return -1
 }
+
+// mergeProofsRaw merges log-derived and CSV-derived proof leaderboard data.
+// For each algorithm, it sums the counts (good, proved, samples) and takes
+// the max of proven_max and sampled_max. This gives a combined view that
+// includes both the live log tail and the historical CSV data.
+func mergeProofsRaw(logData, csvData []interface{}) []interface{} {
+        type algStats struct {
+                alg        string
+                good       int
+                proved     int
+                provenMax  interface{}
+                sampleSum  int64
+                sampleN    int
+                sampleMax  int64
+        }
+        merged := map[string]*algStats{}
+
+        for _, source := range [][]interface{}{logData, csvData} {
+                for _, item := range source {
+                        row, ok := item.(map[string]interface{})
+                        if !ok {
+                                continue
+                        }
+                        alg, _ := row["alg"].(string)
+                        if alg == "" {
+                                continue
+                        }
+                        s, ok := merged[alg]
+                        if !ok {
+                                s = &algStats{alg: alg}
+                                merged[alg] = s
+                        }
+                        s.good += toInt(row["good"])
+                        s.proved += toInt(row["proved"])
+                        if pm, ok := row["proven_max"].(float64); ok {
+                                if pm > toFloat(s.provenMax) {
+                                        s.provenMax = pm
+                                }
+                        }
+                        if sa, ok := row["sampled_avg"].(float64); ok {
+                                n := toInt(row["samples"])
+                                if n > 0 {
+                                        s.sampleSum += int64(sa * float64(n))
+                                        s.sampleN += n
+                                }
+                        }
+                        if sm, ok := row["sampled_max"].(float64); ok {
+                                if int64(sm) > s.sampleMax {
+                                        s.sampleMax = int64(sm)
+                                }
+                        }
+                }
+        }
+
+        var algs []string
+        for a := range merged {
+                algs = append(algs, a)
+        }
+        sort.Strings(algs)
+
+        out := make([]interface{}, 0, len(algs))
+        for _, a := range algs {
+                s := merged[a]
+                var provenMax, sampledAvg, sampledMax interface{}
+                if s.provenMax != nil {
+                        provenMax = s.provenMax
+                }
+                if s.sampleN > 0 {
+                        sampledAvg = round1(float64(s.sampleSum) / float64(s.sampleN) / bpsToMbps)
+                        sampledMax = round1(float64(s.sampleMax) / bpsToMbps)
+                }
+                var samplesN interface{}
+                if s.sampleN > 0 {
+                        samplesN = s.sampleN
+                }
+                out = append(out, map[string]interface{}{
+                        "alg":         s.alg,
+                        "good":        s.good,
+                        "proved":      s.proved,
+                        "proven_max":  provenMax,
+                        "sampled_avg": sampledAvg,
+                        "sampled_max": sampledMax,
+                        "samples":     samplesN,
+                })
+        }
+        sort.Slice(out, func(i, j int) bool {
+                vi, _ := out[i].(map[string]interface{})["proven_max"].(float64)
+                vj, _ := out[j].(map[string]interface{})["proven_max"].(float64)
+                return vi > vj
+        })
+        return out
+}

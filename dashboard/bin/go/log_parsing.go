@@ -190,14 +190,15 @@ func buildLogPanels(swaps []swapRow,
         logWindow = buildLogWindow(swaps, topProofs)
 
         // ----- proofs_raw (proof leaderboard: good/proved/sampled per alg) --
-        // v0.9.6: fall back to proofs.csv when the log tail has few proofs.
-        proofsRaw = buildProofsRaw(text)
-        peEvents, _ := proofEvents(text)
-        if len(peEvents) == 0 {
-                csvProofsRaw := buildProofsRawFromCSV()
-                if len(csvProofsRaw) > 0 {
-                        proofsRaw = csvProofsRaw
-                }
+        // v0.9.7: ALWAYS merge CSV data into the leaderboard. The log tail
+        // only covers a few hours; proofs.csv accumulates over days. We
+        // merge both sources so the leaderboard shows full history.
+        logProofsRaw := buildProofsRaw(text)
+        csvProofsRaw := buildProofsRawFromCSV()
+        if len(csvProofsRaw) > 0 {
+                proofsRaw = mergeProofsRaw(logProofsRaw, csvProofsRaw)
+        } else {
+                proofsRaw = logProofsRaw
         }
 
         return topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw
