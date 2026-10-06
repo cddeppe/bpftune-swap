@@ -64,7 +64,11 @@ cd "$REPO_DIR"
 # Save current branch so we can restore
 ORIG_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
-git fetch origin --prune --tags
+# Fetch without --tags (avoid "would clobber existing tag" errors when
+# local tags from prior releases disagree with remote). The build does
+# not need tags — `git describe --tags --always` falls back to the
+# commit hash when no local tags match.
+git fetch origin --prune --no-tags
 ok "fetched origin"
 
 # Pull main
