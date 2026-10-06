@@ -4,13 +4,14 @@
 # Updates the bpftune .deb + Go dashboard collector.
 #
 # Usage:
-#   sudo bash update.sh                # check + upgrade .deb and dashboard
+#   sudo bash update.sh                 # check + upgrade .deb and dashboard
 #   sudo bash update.sh --tuner-only    # only update .deb, skip dashboard
 #   sudo bash update.sh --dashboard-only # only update dashboard, skip .deb
+#   sudo bash update.sh --clean-state   # also wipe tcp_conn_tuner.state before restart
 #   sudo bash update.sh --help
 #
 # Idempotent: re-running when already up-to-date is a no-op.
-# Checks (in order): local /mnt/backup .deb → GitHub releases → skip if not newer.
+# Always downloads from GitHub Releases (never /mnt/backup/).
 # Go binary: downloaded from GitHub Releases or built from source (needs Go).
 
 set -Eeuo pipefail
@@ -33,6 +34,7 @@ trap 'fail "Aborted at line $LINENO (exit code $?)"' ERR
 DO_TUNER=1
 DO_DASHBOARD=1
 FORCE_DOWNGRADE=0
+CLEAN_STATE=0
 SHOW_HELP=0
 
 for arg in "$@"; do
@@ -40,6 +42,7 @@ for arg in "$@"; do
         --tuner-only)       DO_DASHBOARD=0 ;;
         --dashboard-only)   DO_TUNER=0 ;;
         --force-downgrade)  FORCE_DOWNGRADE=1 ;;
+        --clean-state)      CLEAN_STATE=1 ;;
         --help|-h)          SHOW_HELP=1 ;;
         *)                  fail "Unknown flag: $arg (try --help)" ;;
     esac
@@ -154,6 +157,10 @@ print(best[1] + ' ' + best[2])
             ok "proceeding with downgrade (--force-downgrade)"
             printf "  downgrading: %s → %s\n" "$CURRENT_VER" "$NEW_VER"
             systemctl stop bpftune 2>/dev/null || true
+            if [ "$CLEAN_STATE" = 1 ]; then
+                warn "wiping /var/lib/bpftune/tcp_conn_tuner.state (--clean-state)"
+                rm -f /var/lib/bpftune/tcp_conn_tuner.state
+            fi
             if ! dpkg -i "$DEB_TO_INSTALL"; then
                 fail "dpkg -i failed — run 'apt-get install -f' then re-run this script"
             fi
@@ -167,6 +174,10 @@ print(best[1] + ' ' + best[2])
     else
         printf "  upgrading: %s → %s\n" "$CURRENT_VER" "$NEW_VER"
         systemctl stop bpftune 2>/dev/null || true
+        if [ "$CLEAN_STATE" = 1 ]; then
+            warn "wiping /var/lib/bpftune/tcp_conn_tuner.state (--clean-state)"
+            rm -f /var/lib/bpftune/tcp_conn_tuner.state
+        fi
         if ! dpkg -i "$DEB_TO_INSTALL"; then
             fail "dpkg -i failed — run 'apt-get install -f' then re-run this script"
         fi
