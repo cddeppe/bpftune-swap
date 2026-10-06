@@ -1,3 +1,13 @@
+bpftune (0.4.98) unstable; urgency=medium
+
+  * Add dest=/dest6=/dest6b= to proof printk lines (both tier=1 and tier=2).
+    This allows the dashboard to resolve dest directly from the proof event
+    without needing a cookie→dest lookup. Fixes the '(unknown)' dest issue
+    for passive (incoming) connections which fire proofs but never fire
+    estab events.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Tue, 06 Oct 2026 20:00:00 +0200
+
 bpftune (0.4.97) unstable; urgency=medium
 
   * REVERT v0.4.96's passive-connection skip in the vote path.
