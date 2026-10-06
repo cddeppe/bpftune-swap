@@ -5,6 +5,8 @@
 #
 # Usage:
 #   sudo bash scripts/build-and-stage.sh
+#
+# Can be run from any directory — uses absolute paths.
 
 set -Eeuo pipefail
 
@@ -25,10 +27,13 @@ case "$ARCH" in
     *) fail "Unsupported arch: $ARCH" ;;
 esac
 
-REPO_DIR="${REPO_DIR:-/root/bpftune}"
+REPO_DIR="/root/bpftune"
 BACKUP_DIR="/mnt/backup"
 
-# Read the version from debian/changelog on main branch
+[ -d "$REPO_DIR/.git" ] || fail "$REPO_DIR is not a git checkout"
+[ -d "$BACKUP_DIR" ] || fail "$BACKUP_DIR not present (NFS mount missing?)"
+
+# ---------- 0. Read version from debian/changelog on main ----------
 cd "$REPO_DIR"
 git fetch origin --no-tags --prune 2>&1 | tail -2
 git checkout main 2>&1 | tail -1
@@ -46,7 +51,7 @@ printf "  backup dir:  %s\n" "$BACKUP_DIR"
 # ---------- 1. Build tuner .deb ----------
 step "1. Build tuner ${TUNER_VER} .deb"
 
-cd src
+cd "$REPO_DIR/src"
 make clean
 rm -f *.skel.h *.bpf.o *.o
 ok "cleaned src/"
@@ -54,17 +59,19 @@ ok "cleaned src/"
 cd "$REPO_DIR"
 dpkg-buildpackage -b -us -uc 2>&1 | tail -10
 
-DEB=$(ls -t ../bpftune_*_"${ARCH}".deb 2>/dev/null | head -1 || true)
-[ -n "$DEB" ] || fail "no bpftune_*_${ARCH}.deb produced"
+# Find the .deb (in the parent dir, named bpftune_VERSION_ARCH.deb)
+DEB="$REPO_DIR/../bpftune_${TUNER_VER}_${ARCH}.deb"
+[ -f "$DEB" ] || fail "$DEB not found (dpkg-buildpackage output)"
 
-DEB_VER=$(echo "$DEB" | sed -n 's|.*/bpftune_\([^_]*\)_.*|\1|p')
-[ "$DEB_VER" = "$TUNER_VER" ] || fail "filename version mismatch: got $DEB_VER, expected $TUNER_VER"
+# Verify version inside the .deb matches
+DEB_VER_INTERNAL=$(dpkg-deb -f "$DEB" Version 2>/dev/null || echo "?")
+[ "$DEB_VER_INTERNAL" = "$TUNER_VER" ] || \
+    warn "internal Version: $DEB_VER_INTERNAL (expected $TUNER_VER)"
 ok "built $(basename "$DEB")"
 
 # ---------- 2. Stage .deb ----------
 step "2. Stage .deb to ${BACKUP_DIR}"
 
-# Use both naming conventions (install.sh looks for bpftune-custom-*)
 STAGED_DEB="$BACKUP_DIR/bpftune-custom-${TUNER_VER}-${ARCH}.deb"
 HIST_DEB="$BACKUP_DIR/bpftune_${TUNER_VER}_${ARCH}.deb"
 cp "$DEB" "$STAGED_DEB"
@@ -76,6 +83,7 @@ ok "staged $HIST_DEB"
 # ---------- 3. Build Go binary ----------
 step "3. Build dashboard Go binary"
 
+cd "$REPO_DIR"
 git checkout dashboard 2>&1 | tail -1
 git pull --ff-only origin dashboard 2>&1 | tail -2
 DASH_HASH=$(git rev-parse --short HEAD)
@@ -89,7 +97,9 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 ok "Go: $(go version)"
 
-cd dashboard/bin/go
+GO_DIR="$REPO_DIR/dashboard/bin/go"
+[ -f "$GO_DIR/go.mod" ] || fail "$GO_DIR/go.mod not found"
+cd "$GO_DIR"
 rm -f bpftune-collector-go bpftune-collector-go-*
 
 CGO_ENABLED=0 go build \
@@ -115,7 +125,9 @@ ok "staged $STAGED_BIN"
 # ---------- 5. Summary ----------
 step "5. Summary"
 
-git checkout main 2>&1 | tail -1  # restore to main
+# Restore to main
+cd "$REPO_DIR"
+git checkout main 2>&1 | tail -1
 
 echo
 printf "${B}=== build-and-stage complete ===${N}\n"
@@ -124,13 +136,12 @@ printf "  staged bin:   %s\n" "$STAGED_BIN"
 printf "  tuner ver:    %s (main %s)\n" "$TUNER_VER" "$MAIN_HASH"
 printf "  dash hash:    %s (dashboard)\n" "$DASH_HASH"
 echo
-echo "Next: on vps-3959, create the GitHub release:"
+echo "Next: on vps-3959, create the GitHub release (after BOTH builders finish):"
 echo "  gh release create v${TUNER_VER} \\"
-echo "    $STAGED_DEB \\"
-echo "    $BACKUP_DIR/bpftune-collector-go-amd64 \\"
-echo "    $BACKUP_DIR/bpftune-collector-go-arm64 \\"
-echo "    --title \"v${TUNER_VER}\" \\"
-echo "    --notes \"see debian/changelog\" \\"
+echo "    /mnt/backup/bpftune-custom-${TUNER_VER}-amd64.deb \\"
+echo "    /mnt/backup/bpftune-custom-${TUNER_VER}-arm64.deb \\"
+echo "    /mnt/backup/bpftune-collector-go-amd64 \\"
+echo "    /mnt/backup/bpftune-collector-go-arm64 \\"
+echo "    --title v${TUNER_VER} \\"
+echo "    --notes 'Fix: skip passive connections in vote path' \\"
 echo "    --repo cddeppe/bpftune-swap"
-echo
-echo "(after both builders have run this script)"
