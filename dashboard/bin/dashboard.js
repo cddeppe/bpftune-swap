@@ -2180,10 +2180,14 @@ function _populateBucketSelect(desiredBucket) {
     // needed state.meta bailed. Now the chart.js failure is logged
     // but the data load still runs; the live panels (NOW, recent
     // swaps, tunables, system, build) all work without charts.
+    // v0.9.1: load chart.js locally (not from CDN) so it works on
+    // air-gapped networks, behind ad-blockers, or when the CDN is
+    // unreachable. The chart.umd.min.js + chartjs-adapter-date-fns
+    // files are served by the Go collector from /opt/bpftune-dashboard/bin/.
     function _loadCharts() {
-      return loadScript("https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js")
+      return loadScript("chart.umd.min.js")
         .then(function () {
-          return loadScript("https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js");
+          return loadScript("chartjs-adapter-date-fns.bundle.min.js");
         })
         .then(function () {
           try { applyChartDefaults(); }
