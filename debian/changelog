@@ -1,3 +1,25 @@
+bpftune (0.4.97) unstable; urgency=medium
+
+  * REVERT v0.4.96's passive-connection skip in the vote path.
+    v0.4.96 added 'if (!is_close && statep->swap_target == 0xff)
+    return 1;' to bpftune_conn_tuner_vote, which skipped ALL vote
+    processing for passive (incoming) connections. This caused the
+    busiest hosts (al, instance-20260905-0931 — mostly passive
+    traffic to xray/nginx) to show ZERO proofs and ZERO swaps in
+    the dashboard. A serious regression.
+  * The original v0.4.92 passive skip in active_estab (line 380) is
+    KEPT — it prevents estab events from being logged for passive
+    connections (no dest info to capture, which is correct).
+  * The 'proofs show empty dest' bug was actually fixed by:
+      1. cookie_dest.json persistence (v0.9.0 dashboard)
+      2. Log rotation after deploy
+      3. New active connections populating cookie_dest.json
+  * Passive connections now fire proofs normally. Their dest shows
+    as '(unknown)' in the dashboard (no estab event = no cookie in
+    cookie_dest.json), which is better than not showing them at all.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Tue, 06 Oct 2026 19:00:00 +0200
+
 bpftune (0.4.96) unstable; urgency=medium
 
   * Fix: skip passive (incoming) connections in the vote path too.

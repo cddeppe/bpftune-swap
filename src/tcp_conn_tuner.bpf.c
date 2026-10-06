@@ -908,17 +908,30 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     statep = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
     if (!statep)
         return 1;
-    /* 0.4.96: skip all tracking for passive (incoming) connections in
-     * the vote path too.  v0.4.92 added this check to active_estab
-     * (line 380) but forgot to add it here — so passive connections
-     * were still firing proof/srate/met events without ever having
-     * fired an estab event.  Result: proofs showed up in the dashboard
-     * with empty dest (no estab = no cookie→dest mapping).
+    /* 0.4.97: REVERTED v0.4.96's passive skip in the vote path.
+     * v0.4.96 added 'if (!is_close && statep->swap_target == 0xff) return 1;'
+     * here, which skipped ALL vote processing for passive connections.
+     * This caused the busiest hosts (mostly passive/incoming traffic
+     * to xray/nginx) to show ZERO proofs in the dashboard — a serious
+     * regression.
      *
-     * The close path (STATE_CB) is still allowed through so the
-     * proof counters get decremented on socket close. */
-    if (!is_close && statep->swap_target == 0xff)
-        return 1;
+     * The original v0.4.92 passive skip in active_estab (line 380) is
+     * KEPT — it prevents estab events from being logged for passive
+     * connections, which is correct (no dest info to capture).
+     *
+     * The 'proofs show empty dest' bug was actually fixed by:
+     *   1. cookie_dest.json persistence (v0.9.0 dashboard) — cookies
+     *      from old estab events survive log rotation
+     *   2. Log rotation after deploy — clears old passive-connection
+     *      proofs that had no estab events
+     *   3. New active connections populate cookie_dest.json naturally
+     *
+     * So passive connections SHOULD fire proofs — they're valid
+     * measurements of "did this algorithm achieve high rate?"
+     * The dest for passive connections won't be in cookie_dest.json
+     * (no estab event), but that's OK — the dashboard shows
+     * '(unknown)' for those, which is better than not showing them
+     * at all. */
         /* 0.4.44: decrement proof counters once per socket.
          * Only runs on STATE_CB close (is_close).  Placed before the
          * METRIC_MIN_SEGS / origin-facing early returns below so that
@@ -1199,6 +1212,13 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
             statep->best_seen_srate_alg = s;
         }
     }
+
+    /* 0.4.97: (passive swap skip was here in v0.4.96 but removed —
+     * see comment above. Passive connections now go through the
+     * full vote path including swap decisions, matching v0.4.91
+     * behavior. The swap engine naturally won't fire for passive
+     * connections because their rate_ema stays low (server is the
+     * receiver, not the sender).) */
 
     {
         __u64 best_alt = ~((__u64)0);
