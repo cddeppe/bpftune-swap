@@ -136,7 +136,16 @@ func buildLogPanels(swaps []swapRow,
 
         // ----- recent_swaps (newest-first, last 18) --------------------------
         allSwaps := buildRecentSwapRows(swaps, metByCookie, srateByCookie, cdest)
-        topSwaps = lastN(allSwaps, 18)
+        topSwapsSlice := lastN(allSwaps, 18)
+        // v0.9.4: if the log tail has fewer than 18 swaps, fall back to
+        // swaps.csv so the panel always shows data (even after log rotation).
+        if len(topSwapsSlice) < 18 {
+                csvSwaps := readRecentSwapsFromCSV(18)
+                if len(csvSwaps) > len(topSwapsSlice) {
+                        topSwapsSlice = csvSwaps
+                }
+        }
+        topSwaps = topSwapsSlice
 
         // ----- recent_proofs (newest-first, last 18) --------------------------
         allProofs := buildRecentProofRows(text, cdest)
