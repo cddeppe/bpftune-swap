@@ -161,7 +161,27 @@ func buildLogPanels(swaps []swapRow,
         topProofs = topProofsSlice
 
         // ----- swap_outcomes (composite + srate + sustained) ----------------
-        swapOutcomes = buildSwapOutcomes(swaps, metByCookie, srateByCookie)
+        // v0.9.6: fall back to swaps.csv when the log tail has few swaps,
+        // so the outcomes panel always shows data after a restart.
+        logOutcomesMap := buildSwapOutcomes(swaps, metByCookie, srateByCookie)
+        if len(swaps) < 50 {
+                csvOutcomes := buildSwapOutcomesFromCSV(200)
+                csvMeasurable := 0
+                if comp, ok := csvOutcomes["composite"].(map[string]interface{}); ok {
+                        csvMeasurable = toInt(comp["measurable"])
+                }
+                logMeasurable := 0
+                if comp, ok := logOutcomesMap["composite"].(map[string]interface{}); ok {
+                        logMeasurable = toInt(comp["measurable"])
+                }
+                if csvMeasurable > logMeasurable {
+                        swapOutcomes = csvOutcomes
+                } else {
+                        swapOutcomes = logOutcomesMap
+                }
+        } else {
+                swapOutcomes = logOutcomesMap
+        }
 
         // ----- bucket_ips (all dest= occurrences, /16 or /32 grouped) ------
         bucketIPs = buildBucketIPs(text)
@@ -170,7 +190,15 @@ func buildLogPanels(swaps []swapRow,
         logWindow = buildLogWindow(swaps, topProofs)
 
         // ----- proofs_raw (proof leaderboard: good/proved/sampled per alg) --
+        // v0.9.6: fall back to proofs.csv when the log tail has few proofs.
         proofsRaw = buildProofsRaw(text)
+        peEvents, _ := proofEvents(text)
+        if len(peEvents) == 0 {
+                csvProofsRaw := buildProofsRawFromCSV()
+                if len(csvProofsRaw) > 0 {
+                        proofsRaw = csvProofsRaw
+                }
+        }
 
         return topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw
 }

@@ -107,9 +107,27 @@ func (c *Collector) collect() {
         doc["proof"] = proofsRaw
 
         // ----- Other data panels (reuse parsed log results) ----------------
-        doc["churn"] = buildChurnFromParsed(allSwaps)
+        // v0.9.6: fall back to CSVs when the log tail is sparse, so churn
+        // and divergence panels always show data after a restart.
+        churnResult := buildChurnFromParsed(allSwaps)
+        if len(allSwaps) < 50 {
+                csvChurn := buildChurnFromCSV(200)
+                csvTotal := toInt(csvChurn["total"])
+                logTotal := toInt(churnResult["total"])
+                if csvTotal > logTotal {
+                        churnResult = csvChurn
+                }
+        }
+        doc["churn"] = churnResult
         doc["rate"] = buildRate(logText) // midsamp scanning, separate from swap/met/srate
-        doc["divergence"] = buildDivergenceFromParsed(allSwaps, allMets, allSrates)
+        divResult := buildDivergenceFromParsed(allSwaps, allMets, allSrates)
+        if len(allSwaps) < 50 {
+                csvDiv := buildDivergenceFromCSV(200)
+                if len(csvDiv) > len(divResult) {
+                        divResult = csvDiv
+                }
+        }
+        doc["divergence"] = divResult
         doc["tunables"] = buildTunables()
 
         // ----- Capture snapshots for the in-memory ring buffer --------------
