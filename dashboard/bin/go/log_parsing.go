@@ -51,7 +51,8 @@ var (
                         `alg=(\d+) forced=\d+ dest=(\d+)(?: dest6=(\d+))?(?: dest6b=(\d+))?`)
 
         rxProof = regexp.MustCompile(
-                `(\d+\.\d+): .*proof cookie=(\d+) alg=(\d+) rate=(\d+) tier=(\d+)`)
+                `(\d+\.\d+): .*proof cookie=(\d+) alg=(\d+) rate=(\d+) tier=(\d+)` +
+                        `(?: dest=(\d+))?(?: dest6=(\d+))?(?: dest6b=(\d+))?`)
 
         rxMidsamp = regexp.MustCompile(
                 `(\d+\.\d+): .*midsamp cookie=(\d+) .*srate=(\d+)`)
@@ -617,7 +618,20 @@ func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{
                         tierLabel = "proved"
                 }
                 dest := ""
-                if d, ok := cdest[cookie]; ok {
+                // v0.9.2: prefer the proof's own dest fields (new in
+                // tuner 0.4.98 — proof printk now carries dest=/dest6=/dest6b=).
+                // This fixes the '(unknown)' issue for passive connections
+                // which fire proofs but never fire estab (so cdest has no
+                // entry for their cookie). Fall back to cdest for older BPF
+                // that doesn't have dest= in the proof line.
+                v4, v6, v6b := m[6], m[7], m[8]
+                if v4 != "" || v6 != "" || v6b != "" {
+                        ds := destStr(v4, v6, v6b)
+                        dest = labelFor(ds)
+                        if dest == "" {
+                                dest = ds
+                        }
+                } else if d, ok := cdest[cookie]; ok {
                         ds := destStr(d[0], d[1], d[2])
                         dest = labelFor(ds)
                         if dest == "" {
@@ -880,7 +894,20 @@ func buildProofsRawEvents(text string, cdest map[string]cdestEntry) []interface{
                         tierLabel = "proved"
                 }
                 dest := ""
-                if d, ok := cdest[cookie]; ok {
+                // v0.9.2: prefer the proof's own dest fields (new in
+                // tuner 0.4.98 — proof printk now carries dest=/dest6=/dest6b=).
+                // This fixes the '(unknown)' issue for passive connections
+                // which fire proofs but never fire estab (so cdest has no
+                // entry for their cookie). Fall back to cdest for older BPF
+                // that doesn't have dest= in the proof line.
+                v4, v6, v6b := m[6], m[7], m[8]
+                if v4 != "" || v6 != "" || v6b != "" {
+                        ds := destStr(v4, v6, v6b)
+                        dest = labelFor(ds)
+                        if dest == "" {
+                                dest = ds
+                        }
+                } else if d, ok := cdest[cookie]; ok {
                         ds := destStr(d[0], d[1], d[2])
                         dest = labelFor(ds)
                         if dest == "" {
