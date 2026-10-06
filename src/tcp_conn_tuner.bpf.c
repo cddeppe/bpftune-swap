@@ -1100,8 +1100,10 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         }
                         __sync_fetch_and_add(&remote_host->seq, 1);
                         if (bpftune_debug)
-                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2",
-                                   bpf_get_socket_cookie(ops), s, rate_delivered);
+                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2 dest=%u dest6=%u dest6b=%u",
+                                   bpf_get_socket_cookie(ops), s, rate_delivered,
+                                   is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                                   (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                 } else if (rate_delivered >= get_proof_good_bps() && !(statep->good_bitmap & bit)) {
                         statep->good_bitmap |= bit;
                         /* 0.4.89 (C1): seq-wrap proof-counter bump. */
@@ -1109,8 +1111,10 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         remote_host->metrics[s].sockets_good++;
                         __sync_fetch_and_add(&remote_host->seq, 1);
                         if (bpftune_debug)
-                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1",
-                                   bpf_get_socket_cookie(ops), s, rate_delivered);
+                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1 dest=%u dest6=%u dest6b=%u",
+                                   bpf_get_socket_cookie(ops), s, rate_delivered,
+                                   is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                                   (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                 }
         }
     /* 0.4.53: raw delivered rate on every vote.
