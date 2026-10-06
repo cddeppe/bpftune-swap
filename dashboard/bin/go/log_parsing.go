@@ -149,7 +149,7 @@ func buildLogPanels(swaps []swapRow,
         bucketIPs = buildBucketIPs(text)
 
         // ----- log_window (oldest/newest swap ts, span, age) ----------------
-        logWindow = buildLogWindow(swaps)
+        logWindow = buildLogWindow(swaps, topProofs)
 
         // ----- proofs_raw (proof leaderboard: good/proved/sampled per alg) --
         proofsRaw = buildProofsRaw(text)
@@ -772,19 +772,46 @@ func buildBucketIPs(text string) map[string]interface{} {
 // buildLogWindow — oldest/newest swap ts + span/age info
 // ============================================================================
 
-func buildLogWindow(swaps []swapRow) map[string]interface{} {
-        if len(swaps) == 0 {
+func buildLogWindow(swaps []swapRow, proofs []interface{}) map[string]interface{} {
+        if len(swaps) == 0 && len(proofs) == 0 {
                 return emptyLogWindow()
         }
-        oldest := swaps[0].Ts
-        newest := swaps[0].Ts
-        for _, s := range swaps[1:] {
+        var oldest, newest float64
+        haveFirst := false
+        for _, s := range swaps {
+                if !haveFirst {
+                        oldest = s.Ts
+                        newest = s.Ts
+                        haveFirst = true
+                        continue
+                }
                 if s.Ts < oldest {
                         oldest = s.Ts
                 }
                 if s.Ts > newest {
                         newest = s.Ts
                 }
+        }
+        for _, p := range proofs {
+                if row, ok := p.(map[string]interface{}); ok {
+                        if ts, ok := row["boot_ts"].(float64); ok {
+                                if !haveFirst {
+                                        oldest = ts
+                                        newest = ts
+                                        haveFirst = true
+                                        continue
+                                }
+                                if ts < oldest {
+                                        oldest = ts
+                                }
+                                if ts > newest {
+                                        newest = ts
+                                }
+                        }
+                }
+        }
+        if !haveFirst {
+                return emptyLogWindow()
         }
         uptime := readProcUptime()
         now := float64(time.Now().Unix())
