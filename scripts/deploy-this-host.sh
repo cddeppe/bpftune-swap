@@ -70,8 +70,29 @@ printf "  current tuner:  %s\n" "$CURRENT_TUNER_VER"
 if [ "$DO_TUNER" = 1 ]; then
     step "1. Update tuner (.deb)"
 
-    DEB="$BACKUP_DIR/bpftune-custom-${EXPECTED_TUNER_VER}-${ARCH}.deb"
-    [ -f "$DEB" ] || fail "missing $DEB (build on $ARCH builder first)"
+    # 0.4.95: support both naming conventions.
+    # dpkg-buildpackage produces:   bpftune_X.Y.Z_arch.deb
+    # install.sh/update.sh look for: bpftune-custom-X.Y.Z-arch.deb
+    # /mnt/backup/ may have either (build-and-stage.sh renames, but a
+    # manual dpkg-buildpackage leaves the original name).
+    DEB=""
+    for p in "$BACKUP_DIR/bpftune-custom-${EXPECTED_TUNER_VER}-${ARCH}.deb" \
+             "$BACKUP_DIR/bpftune_${EXPECTED_TUNER_VER}_${ARCH}.deb" \
+             "/tmp/bpftune-custom-${EXPECTED_TUNER_VER}-${ARCH}.deb" \
+             "/tmp/bpftune_${EXPECTED_TUNER_VER}_${ARCH}.deb"; do
+        if [ -f "$p" ]; then
+            DEB="$p"
+            break
+        fi
+    done
+    [ -n "$DEB" ] || fail "missing bpftune ${EXPECTED_TUNER_VER} .deb for ${ARCH}.
+Looked in:
+  $BACKUP_DIR/bpftune-custom-${EXPECTED_TUNER_VER}-${ARCH}.deb
+  $BACKUP_DIR/bpftune_${EXPECTED_TUNER_VER}_${ARCH}.deb
+  /tmp/bpftune-custom-${EXPECTED_TUNER_VER}-${ARCH}.deb
+  /tmp/bpftune_${EXPECTED_TUNER_VER}_${ARCH}.deb"
+
+    ok "found .deb: $DEB"
 
     # Check for downgrade — by default refuse, allow with --force-downgrade
     if [ "$CURRENT_TUNER_VER" != "not-installed" ]; then

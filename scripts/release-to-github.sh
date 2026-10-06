@@ -111,6 +111,13 @@ ok "Go available: $(go version)"
 
 BACKUP_DIR="/mnt/backup"
 
+# Detect local arch (used below to decide whether to auto-run build-and-stage.sh)
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+case "$ARCH" in
+    amd64|x86_64)  ARCH=amd64 ;;
+    arm64|aarch64) ARCH=arm64 ;;
+esac
+
 printf "${B}=== release-to-github ===${N}\n"
 printf "  repo:          %s\n" "$REPO"
 printf "  tag:           %s\n" "$TAG"
@@ -120,21 +127,39 @@ echo
 # ---------- Step 1: ensure both arch .debs are staged ----------
 step "1. Verify staged .deb files"
 
-DEB_AMD64="$BACKUP_DIR/bpftune-custom-${VERSION}-amd64.deb"
-DEB_ARM64="$BACKUP_DIR/bpftune-custom-${VERSION}-arm64.deb"
+DEB_AMD64=""
+DEB_ARM64=""
+# 0.4.95: support both naming conventions (see deploy-this-host.sh).
+for p in "$BACKUP_DIR/bpftune-custom-${VERSION}-amd64.deb" \
+         "$BACKUP_DIR/bpftune_${VERSION}_amd64.deb"; do
+    [ -f "$p" ] && DEB_AMD64="$p" && break
+done
+for p in "$BACKUP_DIR/bpftune-custom-${VERSION}-arm64.deb" \
+         "$BACKUP_DIR/bpftune_${VERSION}_arm64.deb"; do
+    [ -f "$p" ] && DEB_ARM64="$p" && break
+done
 
 # If the local arch .deb is missing, run build-and-stage.sh first
-ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+# (uses the same naming-convention-flexible lookup as above)
+LOCAL_DEB=""
 case "$ARCH" in
-    amd64|x86_64)  ARCH=amd64 ;;
-    arm64|aarch64) ARCH=arm64 ;;
+    amd64) LOCAL_DEB="$DEB_AMD64" ;;
+    arm64) LOCAL_DEB="$DEB_ARM64" ;;
 esac
-LOCAL_DEB="$BACKUP_DIR/bpftune-custom-${VERSION}-${ARCH}.deb"
 
-if [ ! -f "$LOCAL_DEB" ]; then
-    warn "missing $LOCAL_DEB — running build-and-stage.sh first"
+if [ -z "$LOCAL_DEB" ] || [ ! -f "$LOCAL_DEB" ]; then
+    warn "missing local arch ${ARCH} .deb — running build-and-stage.sh first"
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     bash "$SCRIPT_DIR/build-and-stage.sh" || fail "build-and-stage.sh failed"
+    # Re-detect after build
+    for p in "$BACKUP_DIR/bpftune-custom-${VERSION}-${ARCH}.deb" \
+             "$BACKUP_DIR/bpftune_${VERSION}_${ARCH}.deb"; do
+        [ -f "$p" ] && LOCAL_DEB="$p" && break
+    done
+    case "$ARCH" in
+        amd64) DEB_AMD64="$LOCAL_DEB" ;;
+        arm64) DEB_ARM64="$LOCAL_DEB" ;;
+    esac
 fi
 
 # Check both arches are staged
