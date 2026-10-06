@@ -581,9 +581,14 @@
     // 0.4.90: data_recent_proofs now returns newest-first, so render
     // forward (was .slice().reverse() which assumed oldest-first input).
     rows.forEach(function (r) {
+      // v0.9.0: show "(unknown)" instead of a bare middot when dest is
+      // genuinely empty (passive connection, pre-estab sample, or — most
+      // commonly — a cookie that's not in cdest yet).  The previous bare
+      // middot (" · 174.7 Mb/s · 2m ago") was the user-reported "dash".
+      var destLabel = r.dest ? esc(shortAddr(r.dest)) : '<span class="dim">(unknown)</span>';
       html += '<div class="item">' +
         '<span class="flow">' + esc(r.alg) + '</span>' +
-        '<span class="meta">' + esc(shortAddr(r.dest)) +
+        '<span class="meta">' + destLabel +
           ' &middot; ' + r.mbps.toFixed(1) + ' Mb/s' +
           (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
           '</span>' +
@@ -596,6 +601,10 @@
   function shortAddr(a) {
     // 0.4.124: added /16 scan so '89.168.0.0' (a /16 in meta.json)
     // resolves to 'vps-de' when labels has '89.168.90.153' -> 'vps-de'.
+    // v0.9.0: also handle full /64 IPv6 form "xxxx:xxxx:yyyy:yyyy::"
+    //         returned by the Go destStr() when both dest6 and dest6b
+    //         were present in the log.  Previously only "v6:XXXXXXXX"
+    //         (the 32-bit-truncated form) was handled.
     a = a || "";
     var L = window.__labels || {};
     if (L[a]) return L[a];
@@ -605,6 +614,18 @@
         var ip6 = hex.substring(0,4) + ":" + hex.substring(4,8) + "::";
         if (L[ip6]) return L[ip6];
       }
+      return a;
+    }
+    // v0.9.0: standard IPv6 form ("xxxx:xxxx:yyyy:yyyy::" or "xxxx:xxxx::")
+    // from the Go destStr() when dest6b is present.
+    if (a.indexOf(":") >= 0) {
+      // Try exact match first (already done above via L[a]).
+      // Try the /32 form ("xxxx:xxxx::") — strip the /64 part.
+      var slash32 = a.replace(/^([0-9a-f]{1,4}:[0-9a-f]{1,4}):.*/, '$1::');
+      if (slash32 !== a && L[slash32]) return L[slash32];
+      // Try the /48 form ("xxxx:xxxx:yyyy::") — strip the last group.
+      var slash48 = a.replace(/^([0-9a-f]{1,4}:[0-9a-f]{1,4}:[0-9a-f]{1,4}):.*/, '$1::');
+      if (slash48 !== a && slash48 !== slash32 && L[slash48]) return L[slash48];
       return a;
     }
     var p = a.split(".");
@@ -646,10 +667,12 @@
             if (age < 60) return '<span class="sp wait">wait</span>';
             return '<span class="sp void">void</span>';
           })();
+      // v0.9.0: show "(unknown)" instead of a bare middot when dest is empty.
+      var destLabel = r.dest ? esc(shortAddr(r.dest)) : '<span class="dim">(unknown)</span>';
       html += '<div class="item">' +
         '<span class="flow">' + esc(r.from_alg) +
           '<span class="arrow">&rarr;</span>' + esc(r.to_alg) + '</span>' +
-        '<span class="meta">' + esc(shortAddr(r.dest)) +
+        '<span class="meta">' + destLabel +
           ' &middot; d' + r.d +
           (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
           '</span>' +

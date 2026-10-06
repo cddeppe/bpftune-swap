@@ -14,7 +14,6 @@ package main
 // swap and its post-swap srate samples 60-300s later).
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -49,7 +48,7 @@ var (
 
 	rxEstab = regexp.MustCompile(
 		`(\d+\.\d+): bpf_trace_printk: estab cookie=(\d+) ` +
-			`alg=(\d+) forced=\d+ dest=(\d+)(?: dest6=(\d+))?`)
+			`alg=(\d+) forced=\d+ dest=(\d+)(?: dest6=(\d+))?(?: dest6b=(\d+))?`)
 
 	rxProof = regexp.MustCompile(
 		`(\d+\.\d+): .*proof cookie=(\d+) alg=(\d+) rate=(\d+) tier=(\d+)`)
@@ -79,6 +78,16 @@ type srateEntry struct {
 	Alg   int
 }
 
+// cdest is the cookie→dest map.  Each entry is [v4, v6, v6b] where
+// v6 is the first 32 bits of an IPv6 dest and v6b is the next 32 bits
+// (so together they form a /64).  Any field may be "" when not present
+// in the source log line.
+//
+// v0.9.0: previously [2]string (v4, v6) — this dropped dest6b, which
+// meant IPv6 connections were bucketed only by their top 32 bits and
+// /64 labels in aliases.labels.json could never match.
+type cdestEntry [3]string
+
 // swapRow is the raw extracted swap tuple (matches Python's
 // _swaps_mets_srates row layout).
 type swapRow struct {
@@ -95,10 +104,11 @@ type swapRow struct {
 	Dest6  string
 	Dest6b string
 	// Enriched fields (filled in by enrichSwapsForCSV before writeSwapsCSV)
-	Outcome     string // "win"/"loss"/"null"/"no_post"/""
-	SrateBefore string // pre-swap srate value as string
-	Direction   string // "origin"/"client"/""
-	Rport       string // remote port from met event
+	Outcome      string // "win"/"loss"/"null"/"no_post"/""
+	SrateBefore  string // pre-swap srate value as string
+	Direction    string // "origin"/"client"/""
+	Rport        string // remote port from met event
+	DestResolved string // v0.9.0: fully-resolved display string (v4 dotted, v6:hex, or full /64 IPv6 form)
 }
 
 // ============================================================================
@@ -114,7 +124,7 @@ type swapRow struct {
 func buildLogPanels(swaps []swapRow,
 	metByCookie map[int64][]metEntry,
 	srateByCookie map[int64][]srateEntry,
-	cdest map[string][2]string, text string) (topSwaps, topProofs []interface{},
+	cdest map[string]cdestEntry, text string) (topSwaps, topProofs []interface{},
 	swapOutcomes, bucketIPs, logWindow, proofsRaw interface{}) {
 
 	if text == "" {
@@ -205,7 +215,7 @@ func parseSwapsMetsSrates(text string) (swaps []swapRow,
 func buildRecentSwapRows(swaps []swapRow,
 	metByCookie map[int64][]metEntry,
 	srateByCookie map[int64][]srateEntry,
-	cdest map[string][2]string) []interface{} {
+	cdest map[string]cdestEntry) []interface{} {
 
 	rows := make([]interface{}, 0, len(swaps))
 	for _, sw := range swaps {
@@ -227,15 +237,16 @@ func buildRecentSwapRows(swaps []swapRow,
 		}
 
 		// dest resolution: prefer swap row's own dest fields, fall
-		// back to cookie→dest map from estab events.
-		v4, v6 := sw.Dest, sw.Dest6
-		if v4 == "" && v6 == "" {
+		// back to cookie→dest map from estab events.  v0.9.0: cdest
+		// now carries v6b too, so /64 IPv6 labels resolve correctly.
+		v4, v6, v6b := sw.Dest, sw.Dest6, sw.Dest6b
+		if v4 == "" && v6 == "" && v6b == "" {
 			if d, ok := cdest[strconv.FormatInt(sw.Cookie, 10)]; ok {
-				v4, v6 = d[0], d[1]
+				v4, v6, v6b = d[0], d[1], d[2]
 			}
 		}
-		destStr := destStr(v4, v6)
-		bucketOf := bucketOf(v4, v6)
+		destStr := destStr(v4, v6, v6b)
+		bucketOf := bucketOf(v4, v6, v6b)
 		destLabel := labelFor(destStr)
 		if destLabel == "" {
 			destLabel = destStr
@@ -392,7 +403,7 @@ func buildSwapOutcomes(swaps []swapRow,
 		swapsList = append(swapsList, swapOutRow{
 			Ts: sw.Ts, Cookie: sw.Cookie,
 			Outcome: o, OutcomeSrate: o2, OutcomeSustained: o3,
-			Dest: labelFor(destStr(sw.Dest, sw.Dest6)),
+			Dest: labelFor(destStr(sw.Dest, sw.Dest6, sw.Dest6b)),
 		})
 	}
 
@@ -579,7 +590,7 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
 // buildRecentProofRows — parse proof events, attach dest via cookie map
 // ============================================================================
 
-func buildRecentProofRows(text string, cdest map[string][2]string) []interface{} {
+func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{} {
 	var lines []string
 	for _, l := range strings.Split(text, "\n") {
 		if strings.Contains(l, "proof cookie=") {
@@ -607,7 +618,7 @@ func buildRecentProofRows(text string, cdest map[string][2]string) []interface{}
 		}
 		dest := ""
 		if d, ok := cdest[cookie]; ok {
-			ds := destStr(d[0], d[1])
+			ds := destStr(d[0], d[1], d[2])
 			dest = labelFor(ds)
 			if dest == "" {
 				dest = ds
@@ -628,20 +639,49 @@ func buildRecentProofRows(text string, cdest map[string][2]string) []interface{}
 // cookieDestMap — cookie → (v4, v6) from estab + swap events
 // ============================================================================
 
-func cookieDestMap(text string) map[string][2]string {
-	out := map[string][2]string{}
+// cookieDestMap builds the cookie→dest map from estab + swap events.
+// v0.9.0: stores cdestEntry [3]string{v4, v6, v6b} — dest6b is now
+// captured from both rxSwap (group 12) and rxEstab (group 6, newly added).
+//
+// Merge rule: existing entries are NOT overwritten by empty dest fields
+// (so a swap event without dest6b doesn't blow away a prior estab's value).
+// This is the same BUG 5 fix that was already in place for the [2]string
+// variant, extended to all three fields.
+func cookieDestMap(text string) map[string]cdestEntry {
+	out := map[string]cdestEntry{}
 	for _, line := range strings.Split(text, "\n") {
 		if m := rxSwap.FindStringSubmatch(line); m != nil {
-			// swap row: groups 2=cookie, 10=dest, 11=dest6
-			// BUG 5 fix: only update if dest is present (don't overwrite with empty)
-			if m[10] != "" || m[11] != "" {
-				out[m[2]] = [2]string{m[10], m[11]}
+			// swap row: groups 2=cookie, 10=dest, 11=dest6, 12=dest6b
+			cookie := m[2]
+			if m[10] != "" || m[11] != "" || m[12] != "" {
+				cur := out[cookie]
+				if m[10] != "" {
+					cur[0] = m[10]
+				}
+				if m[11] != "" {
+					cur[1] = m[11]
+				}
+				if m[12] != "" {
+					cur[2] = m[12]
+				}
+				out[cookie] = cur
 			}
 			continue
 		}
 		if m := rxEstab.FindStringSubmatch(line); m != nil {
-			// estab row: groups 2=cookie, 4=dest, 5=dest6
-			out[m[2]] = [2]string{m[4], m[5]}
+			// estab row: groups 2=cookie, 4=dest, 5=dest6, 6=dest6b
+			cookie := m[2]
+			cur := out[cookie]
+			if m[4] != "" {
+				cur[0] = m[4]
+			}
+			if m[5] != "" {
+				cur[1] = m[5]
+			}
+			if m[6] != "" {
+				cur[2] = m[6]
+			}
+			out[cookie] = cur
 		}
 	}
 	return out
@@ -814,9 +854,14 @@ type proofSample struct {
 	sampMax int64
 }
 
-func buildProofsRawEvents(text string) []interface{} {
+// buildProofsRawEvents builds the proofs_raw list (one entry per proof
+// event, with cookie→dest resolution).  v0.9.0: takes cdest as a
+// parameter instead of re-parsing the log on every cycle — the prior
+// implementation called cookieDestMap(text) a SECOND time per cycle,
+// duplicating the work already done in collect.go.  For a 2 MB log tail
+// with ~10k lines, that was ~5ms of wasted regex per cycle.
+func buildProofsRawEvents(text string, cdest map[string]cdestEntry) []interface{} {
 	var out []interface{}
-	cdest := cookieDestMap(text)
 	for _, line := range strings.Split(text, "\n") {
 		if !strings.Contains(line, "proof cookie=") {
 			continue
@@ -836,7 +881,7 @@ func buildProofsRawEvents(text string) []interface{} {
 		}
 		dest := ""
 		if d, ok := cdest[cookie]; ok {
-			ds := destStr(d[0], d[1])
+			ds := destStr(d[0], d[1], d[2])
 			dest = labelFor(ds)
 			if dest == "" {
 				dest = ds
@@ -938,9 +983,27 @@ func proofEvents(text string) (map[int]proofEvent, map[int]proofSample) {
 
 // destStr returns the display string for a destination.  Prefers v6
 // when present.  Mirrors bpftune_log.py:_dest_str.
-func destStr(v4, v6 string) string {
+//
+// v0.9.0: third arg v6b (dest6b) added.  When both v6 and v6b are
+// present, the full /64 IPv6 form "xxxx:xxxx:yyyy:yyyy::" is returned
+// (so labels in aliases.labels.json defined on a /64 can match).
+// When only v6 is present, the previous "v6:XXXXXXXX" form is returned
+// (which foldV6 then converts to the /32 standard form).
+func destStr(v4, v6, v6b string) string {
 	if v6 != "" {
 		if n6, err := strconv.ParseInt(v6, 10, 64); err == nil && n6 != 0 {
+			// v6b present?  Build full /64 form.
+			if v6b != "" {
+				if n6b, err := strconv.ParseInt(v6b, 10, 64); err == nil && n6b != 0 {
+					hi := uint64(n6) & 0xFFFFFFFF
+					lo := uint64(n6b) & 0xFFFFFFFF
+					return fmt.Sprintf("%04x:%04x:%04x:%04x::",
+						(hi>>16)&0xFFFF, hi&0xFFFF,
+						(lo>>16)&0xFFFF, lo&0xFFFF)
+				}
+			}
+			// Only first 32 bits — keep the v6:hex form (matches Python
+			// _dest_str).  foldV6 will convert this to "xxxx:xxxx::".
 			return fmt.Sprintf("v6:%08x", uint64(n6)&0xFFFFFFFF)
 		}
 	}
@@ -951,9 +1014,9 @@ func destStr(v4, v6 string) string {
 // v0.4.2: respects current prefix4/prefix6 from /var/lib/bpftune/.
 // Mirrors bpftune_log.py:_bucket_of (but Python hardcodes /16; we make
 // it prefix-aware per user spec).
-func bucketOf(v4, v6 string) string {
+func bucketOf(v4, v6, v6b string) string {
 	// Build the address string in standard or v6:hex form.
-	addr := destStr(v4, v6)
+	addr := destStr(v4, v6, v6b)
 	if addr == "" {
 		return ""
 	}
@@ -1156,24 +1219,8 @@ func emptyLogWindow() map[string]interface{} {
 	}
 }
 
-// ============================================================================
-// State persistence (cookie dest map only — for now)
-// ============================================================================
-
-// saveCookieDestMap persists the cookie→dest map to state.json so the
-// cookie→dest lookup survives restarts (the Python collector does this
-// via the ESTAB events in the log file itself, so we don't actually
-// need to persist — but keeping the stub for future use).
-func (c *Collector) saveCookieDestMap(m map[string][2]string) {
-	c.mu.RLock()
-	statePath := stateJSONPath
-	c.mu.RUnlock()
-	out := map[string]interface{}{}
-	for k, v := range m {
-		out[k] = []string{v[0], v[1]}
-	}
-	data, _ := json.MarshalIndent(out, "", "  ")
-	tmp := statePath + ".tmp"
-	_ = os.WriteFile(tmp, data, 0644)
-	_ = os.Rename(tmp, statePath)
-}
+// (v0.9.0) saveCookieDestMap stub removed.  Real persistence lives in
+// cookie_dest.go (persistCookieDest + loadCookieDest).  The previous stub
+// wrote to collector-go-state.json but was never called from anywhere,
+// creating the misleading impression that the cookie→dest map survived
+// restarts.  It did not.

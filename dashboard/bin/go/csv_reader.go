@@ -13,12 +13,12 @@ package main
 // is rare (renderToDisk regenerates every 5 min).
 
 import (
-    "bufio"
-    "os"
-    "sort"
-    "strconv"
-    "strings"
-    "sync"
+	"bufio"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,7 +81,7 @@ func readCSVTail(span int64) map[string][]bucketSnapshot {
 		if len(cols) < 9 {
 			continue
 		}
-		addr := ResolveBucket(cols[1])  // v0.7.5g: re-resolve at read time
+		addr := ResolveBucket(cols[1]) // v0.7.5g: re-resolve at read time
 		ts, err := strconv.ParseInt(cols[0], 10, 64)
 		if err != nil || ts < cutoff {
 			continue
@@ -174,7 +174,7 @@ func readCSVAll() map[string][]bucketSnapshot {
 			continue
 		}
 		// v0.7.0: trust the stored label as-is (no ResolveBucket)
-		addr := ResolveBucket(cols[1])  // v0.7.5g: re-resolve at read time
+		addr := ResolveBucket(cols[1]) // v0.7.5g: re-resolve at read time
 		ts, err := strconv.ParseInt(cols[0], 10, 64)
 		if err != nil {
 			continue
@@ -270,7 +270,7 @@ func readBucketCSV(bucketID string, span int64) []bucketSnapshot {
 		if len(cols) < 9 {
 			continue
 		}
-		addr := ResolveBucket(cols[1])  // v0.7.5g: re-resolve at read time
+		addr := ResolveBucket(cols[1]) // v0.7.5g: re-resolve at read time
 		if addr != bucketID {
 			continue
 		}
@@ -371,7 +371,6 @@ func loadCSVTailIntoRingBuffer() {
 		" entries for " + strconv.Itoa(len(all)) + " buckets\n")
 }
 
-
 // ============================================================================
 // v0.7.5p: Streaming CSV reader — replaces readCSVAll for slow renders.
 // Reads buckets.v2.csv line by line and accumulates running sums per bin
@@ -388,13 +387,13 @@ func loadCSVTailIntoRingBuffer() {
 
 // binAcc accumulates running sums for one time bin across multiple snapshots.
 type binAcc struct {
-	ts      int64 // bin center timestamp
-	count   int   // number of snapshots accumulated
-	sumRe   [16]float64
-	sumSs   [16]int
-	sumBs   [16]int
-	sumNs   [16]int
-	sumMv   [16]float64
+	ts    int64 // bin center timestamp
+	count int   // number of snapshots accumulated
+	sumRe [16]float64
+	sumSs [16]int
+	sumBs [16]int
+	sumNs [16]int
+	sumMv [16]float64
 }
 
 func streamCSVToSeries(bucketIDs []string) map[string]map[string]map[string]interface{} {
@@ -495,16 +494,40 @@ func streamCSVToSeries(bucketIDs []string) map[string]map[string]map[string]inte
 				break
 			}
 			if idx, ok := colIdx["re_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-				{ v, _ := strconv.ParseFloat(cols[idx], 64); if v > 10000000 { v = 0 }; re[i] = v }
+				{
+					v, _ := strconv.ParseFloat(cols[idx], 64)
+					if v > 10000000 {
+						v = 0
+					}
+					re[i] = v
+				}
 			}
 			if idx, ok := colIdx["ss_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-				{ v, _ := strconv.Atoi(cols[idx]); if v > 1000 { v = 0 }; ss[i] = v }
+				{
+					v, _ := strconv.Atoi(cols[idx])
+					if v > 1000 {
+						v = 0
+					}
+					ss[i] = v
+				}
 			}
 			if idx, ok := colIdx["bs_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-				{ v, _ := strconv.Atoi(cols[idx]); if v > 1000 { v = 0 }; bs[i] = v }
+				{
+					v, _ := strconv.Atoi(cols[idx])
+					if v > 1000 {
+						v = 0
+					}
+					bs[i] = v
+				}
 			}
 			if idx, ok := colIdx["ns_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-				{ v, _ := strconv.Atoi(cols[idx]); if v > 1000 { v = 0 }; ns[i] = v }
+				{
+					v, _ := strconv.Atoi(cols[idx])
+					if v > 1000 {
+						v = 0
+					}
+					ns[i] = v
+				}
 			}
 			if idx, ok := colIdx["mv_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
 				mv[i], _ = strconv.ParseFloat(cols[idx], 64)
@@ -601,10 +624,29 @@ func finalizeSeriesFromBins(binMap map[int64]*binAcc) map[string]interface{} {
 	return series
 }
 
-
 // v0.7.5p: validateMetric clamps unreasonable values to 0.
 // Prevents column-mismatch bugs (old Python rows have different column order).
-func validateRe(v float64) float64 { if v > 10000000 { return 0 }; return v }
-func validateSs(v int) int { if v > 1000 { return 0 }; return v }
-func validateBs(v int) int { if v > 1000 { return 0 }; return v }
-func validateNs(v int) int { if v > 1000 { return 0 }; return v }
+func validateRe(v float64) float64 {
+	if v > 10000000 {
+		return 0
+	}
+	return v
+}
+func validateSs(v int) int {
+	if v > 1000 {
+		return 0
+	}
+	return v
+}
+func validateBs(v int) int {
+	if v > 1000 {
+		return 0
+	}
+	return v
+}
+func validateNs(v int) int {
+	if v > 1000 {
+		return 0
+	}
+	return v
+}

@@ -75,37 +75,37 @@ func bpftuneVersion() string {
 var dashVersionStr = ""
 
 func dashVersion() string {
-    // 1. If set at build time (ldflags), use that
-    if dashVersionStr != "" {
-        return dashVersionStr
-    }
-    // 2. Try latest git tag (works from any branch)
-    for _, repo := range []string{"/root/bpftune", "/opt/bpftune", "/usr/src/bpftune"} {
-        cmd := exec.Command("git", "-C", repo, "tag", "--sort=-creatordate")
-        output, err := cmd.Output()
-        if err == nil {
-            lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-            if len(lines) > 0 && lines[0] != "" {
-                v := lines[0]
-                shellCacheMu.Lock()
-                shellCache["dash_version"] = shellCacheEntry{v, time.Now()}
-                shellCacheMu.Unlock()
-                return v
-            }
-        }
-    }
-    // 3. Fall back to commit hash
-    for _, repo := range []string{"/root/bpftune", "/opt/bpftune", "/usr/src/bpftune"} {
-        cmd := exec.Command("git", "-C", repo, "rev-parse", "--short", "HEAD")
-        output, err := cmd.Output()
-        if err == nil {
-            v := strings.TrimSpace(string(output))
-            if v != "" {
-                return v
-            }
-        }
-    }
-    return "?"
+	// 1. If set at build time (ldflags), use that
+	if dashVersionStr != "" {
+		return dashVersionStr
+	}
+	// 2. Try latest git tag (works from any branch)
+	for _, repo := range []string{"/root/bpftune", "/opt/bpftune", "/usr/src/bpftune"} {
+		cmd := exec.Command("git", "-C", repo, "tag", "--sort=-creatordate")
+		output, err := cmd.Output()
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+			if len(lines) > 0 && lines[0] != "" {
+				v := lines[0]
+				shellCacheMu.Lock()
+				shellCache["dash_version"] = shellCacheEntry{v, time.Now()}
+				shellCacheMu.Unlock()
+				return v
+			}
+		}
+	}
+	// 3. Fall back to commit hash
+	for _, repo := range []string{"/root/bpftune", "/opt/bpftune", "/usr/src/bpftune"} {
+		cmd := exec.Command("git", "-C", repo, "rev-parse", "--short", "HEAD")
+		output, err := cmd.Output()
+		if err == nil {
+			v := strings.TrimSpace(string(output))
+			if v != "" {
+				return v
+			}
+		}
+	}
+	return "?"
 }
 
 // ============================================================================

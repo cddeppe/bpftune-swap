@@ -25,7 +25,13 @@ import (
 
 // enrichSwapsForCSV fills in enriched fields on each swapRow.
 // Called from collect.go before writeSwapsCSV.
-func enrichSwapsForCSV(swaps []swapRow, met map[int64][]metEntry, srate map[int64][]srateEntry) {
+//
+// v0.9.0: now also fills in DestResolved (the fully-resolved display
+// string for the dest, including v6b for /64 IPv6).  This is used by
+// writeTruthRow so IPv6 swaps get a non-empty bucket key in the truth
+// file (previously they were dropped because destIP(sw.Dest) was ""
+// for IPv6 connections where sw.Dest is "0").
+func enrichSwapsForCSV(swaps []swapRow, met map[int64][]metEntry, srate map[int64][]srateEntry, cdest map[string]cdestEntry) {
 	if len(swaps) == 0 {
 		return
 	}
@@ -80,5 +86,15 @@ func enrichSwapsForCSV(swaps []swapRow, met map[int64][]metEntry, srate map[int6
 				break
 			}
 		}
+
+		// 4. DestResolved: prefer swap row's own dest fields, fall back
+		// to cdest (which carries dest6b from prior estab events).
+		v4, v6, v6b := sw.Dest, sw.Dest6, sw.Dest6b
+		if v4 == "" && v6 == "" && v6b == "" {
+			if d, ok := cdest[strconv.FormatInt(sw.Cookie, 10)]; ok {
+				v4, v6, v6b = d[0], d[1], d[2]
+			}
+		}
+		sw.DestResolved = destStr(v4, v6, v6b)
 	}
 }

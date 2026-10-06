@@ -242,9 +242,12 @@ func writeSwapsCSV(swaps []swapRow, now int64) {
 
 		row := buildSwapCSVRow(sw, now)
 		f.WriteString(row + "\n")
-		// v0.7.6: write truth file entry for resolved swaps
+		// v0.7.6: write truth file entry for resolved swaps.
+		// v0.9.0: pass sw.DestResolved (full dest including v6/v6b) instead
+		// of destIP(sw.Dest) — fixes IPv6 swaps being silently dropped
+		// from the ML training file.
 		if sw.Outcome == "win" || sw.Outcome == "loss" || sw.Outcome == "null" {
-			writeTruthRow(destIP(sw.Dest), algName(sw.To), sw.Outcome)
+			writeTruthRow(sw.DestResolved, algName(sw.To), sw.Outcome)
 		}
 	}
 }
@@ -269,7 +272,10 @@ func buildSwapCSVRow(sw swapRow, now int64) string {
 	if mtAlg != "" && rbAlg != "" && mtAlg != rbAlg {
 		diverges = "1"
 	}
-	dest := destIP(sw.Dest)
+	dest := sw.DestResolved // v0.9.0: use the fully-resolved dest (handles v6)
+	if dest == "" {
+		dest = destIP(sw.Dest) // fall back to v4-only if enrichment didn't run
+	}
 	destRaw := sw.Dest
 
 	parts := []string{

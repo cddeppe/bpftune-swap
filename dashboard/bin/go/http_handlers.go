@@ -13,11 +13,11 @@ package main
 
 import (
 	"bufio"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"net/http"
 	"time"
 )
 
@@ -62,7 +62,38 @@ func (h *historyStore) handleBucketJSON(w http.ResponseWriter, r *http.Request, 
 		}
 
 		series := buildSeriesFromSnaps(snaps, width)
-		bs := map[int64]bool{}; for _, sn := range snaps { bs[sn.Ts/int64(width)] = true }; var bis []int64; for bi := range bs { bis = append(bis, bi) }; sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] }); sa := make([]interface{}, len(bis)); bc := map[int64]int{}; if f, e := os.Open(swapsCSVPath); e == nil { sc := bufio.NewScanner(f); sc.Buffer(make([]byte, 1<<20), 1<<20); sc.Scan(); for sc.Scan() { c := strings.Split(sc.Text(), ","); if len(c) < 13 { continue }; if ResolveBucket(c[11]) != bucketID { continue }; st, _ := strconv.ParseInt(c[0], 10, 64); bc[st/int64(width)]++ }; f.Close() }; for i, bi := range bis { sa[i] = bc[bi] }; series["swaps"] = sa
+		bs := map[int64]bool{}
+		for _, sn := range snaps {
+			bs[sn.Ts/int64(width)] = true
+		}
+		var bis []int64
+		for bi := range bs {
+			bis = append(bis, bi)
+		}
+		sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
+		sa := make([]interface{}, len(bis))
+		bc := map[int64]int{}
+		if f, e := os.Open(swapsCSVPath); e == nil {
+			sc := bufio.NewScanner(f)
+			sc.Buffer(make([]byte, 1<<20), 1<<20)
+			sc.Scan()
+			for sc.Scan() {
+				c := strings.Split(sc.Text(), ",")
+				if len(c) < 13 {
+					continue
+				}
+				if ResolveBucket(c[11]) != bucketID {
+					continue
+				}
+				st, _ := strconv.ParseInt(c[0], 10, 64)
+				bc[st/int64(width)]++
+			}
+			f.Close()
+		}
+		for i, bi := range bis {
+			sa[i] = bc[bi]
+		}
+		series["swaps"] = sa
 		doc["series"].(map[string]interface{})[rngName] = series
 	}
 
@@ -219,8 +250,8 @@ func (h *historyStore) handleFleetJSON(w http.ResponseWriter, r *http.Request, b
 		for _, s := range snaps {
 			seen++
 			if s.RefRate > 0 {
-					have++
-				}
+				have++
+			}
 		}
 		if seen == 0 {
 			continue

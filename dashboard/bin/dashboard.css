@@ -322,6 +322,8 @@
   table.tbl td.mono { font-family: var(--mono); font-size: 12px; }
   table.tbl td.name { color: var(--fg); font-weight: 500; }
   table.tbl td.dim { color: var(--muted); }
+  /* v0.9.0: generic dim for "(unknown)" dest placeholders in list items */
+  .meta .dim, .list .dim { color: var(--muted); font-style: italic; }
   table.tbl tr.pick td { background: var(--accent-dim); }
   /* 0.4.78.2: position the pick badge absolutely so it cannot
    * wrap or affect the row height.  The old inline ::after on

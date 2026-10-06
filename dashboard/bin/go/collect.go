@@ -48,7 +48,12 @@ func (c *Collector) collect() {
 	// writeSwapsCSV, writeSrateCSV) reuse these parsed results.
 	logText := readLogTail(logTailBytes)
 	allSwaps, allMets, allSrates := parseSwapsMetsSrates(logText)
-	cdest := cookieDestMap(logText)
+	// v0.9.0: persist cookie→dest map across cycles so proofs with
+	// cookies established before the 2 MB log tail still get a dest.
+	// Without this, recent_proofs rows for old cookies showed dest=""
+	// and rendered as a bare middot.  Also picks up dest6b from prior
+	// estab events for IPv6 connections (needed for /64 labels).
+	cdest := persistCookieDest(cookieDestMap(logText))
 
 	// ----- Build live buckets + metric_by_bucket + bucket_live ---------
 	buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
@@ -90,7 +95,7 @@ func (c *Collector) collect() {
 	doc["swap_outcomes"] = swapOutcomes
 	doc["bucket_ips"] = bucketIPs
 	doc["log_window"] = logWindow
-	doc["proofs_raw"] = buildProofsRawEvents(logText)
+	doc["proofs_raw"] = buildProofsRawEvents(logText, cdest)
 	doc["proof"] = proofsRaw
 
 	// ----- Other data panels (reuse parsed log results) ----------------
@@ -111,7 +116,7 @@ func (c *Collector) collect() {
 	writeBucketsCSV(hosts, now)
 	// v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
 	// Mirrors Python _resolve_pending enrichment logic.
-	enrichSwapsForCSV(allSwaps, allMets, allSrates)
+	enrichSwapsForCSV(allSwaps, allMets, allSrates, cdest)
 	writeSwapsCSV(allSwaps, now)
 	// v0.8.7: removed writeTruthRows(allSwaps) call - writeSwapsCSV
 	// already writes truth rows for each NEW swap (those that pass the

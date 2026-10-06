@@ -41,7 +41,7 @@ const (
 	offRateHist         = 112
 	sizeofRateHist      = 4*rateHistBins + 8
 	offMetricsArray     = offRateHist + sizeofRateHist
-	sizeofSeqField      = 8  // 0.4.89: __u64 seq at end of struct (C1 race fix)
+	sizeofSeqField      = 8 // 0.4.89: __u64 seq at end of struct (C1 race fix)
 	sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric) + sizeofSeqField
 	writebackWindow     = 8
 )
