@@ -25,10 +25,16 @@ import (
 
 // hostEntry is one BPF map entry after label resolution + merge.
 // Mirrors Python read_map()'s (inst, addr, v) tuple.
+//
+// B3-fix: MaxInst tracks the largest single inst seen across folded entries,
+// separate from Inst which is the SUM. Used by the merge logic to decide
+// which entry donates its metrics/best_alg/min_rtt — we want the entry
+// with the most instances, not whichever appeared first.
 type hostEntry struct {
-	Inst int
-	Addr string // labeled + merged (e.g. "home-sco" or "2606:1a40::")
-	V    map[string]interface{}
+	Inst    int
+	MaxInst int    // B3-fix: largest single inst across folded entries
+	Addr    string // labeled + merged (e.g. "home-sco" or "2606:1a40::")
+	V       map[string]interface{}
 }
 
 // readBPFMap runs bpftool, parses the JSON, applies ResolveBucket + merges
@@ -91,12 +97,18 @@ func readBPFMap() ([]hostEntry, error) {
 		inst := toInt(val["instances"])
 		if existing, ok := merged[final]; ok {
 			existing.Inst += inst
-			// Keep the entry with more instances for the other fields.
-			if inst > existing.Inst-inst {
+			// B3-fix: keep the entry with the largest single inst as the
+			// representative for non-instance fields (best_alg, min_rtt,
+			// max_rate_delivered, metrics[]). The old logic compared
+			// `inst > existing.Inst - inst` (= "is new > sum of previous?")
+			// which was almost never true, so the first-seen entry
+			// permanently donated its metrics.
+			if inst > existing.MaxInst {
+				existing.MaxInst = inst
 				existing.V = val
 			}
 		} else {
-			merged[final] = &hostEntry{Inst: inst, Addr: final, V: val}
+			merged[final] = &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val}
 			order = append(order, final)
 		}
 	}

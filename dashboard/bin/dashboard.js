@@ -140,6 +140,41 @@
   (function() {
     var _be = document.getElementById('lv-build');
     if (!_be || !b.prefix4) return;
+    // E2-fix: skip rebuilding config inputs if any of them currently has
+    // focus. The old code rebuilt the entire #lv-build block on every
+    // SSE push (every 30s), destroying the inputs mid-typing and losing
+    // the user's focus + partial input. Now we leave the inputs alone
+    // while the user is interacting with them.
+    var _activeEl = document.activeElement;
+    var _cfgIds = ['cfg-p4', 'cfg-p6', 'cfg-ep', 'cfg-pg', 'cfg-pp'];
+    for (var _ci = 0; _ci < _cfgIds.length; _ci++) {
+      var _el = document.getElementById(_cfgIds[_ci]);
+      if (_el && _el === _activeEl) {
+        // User is editing — skip the rebuild entirely. The Save button
+        // is already attached from the previous render.
+        return;
+      }
+    }
+    // Also skip if the Save button was already attached (avoid duplicate
+    // buttons on re-renders where no input has focus but inputs exist).
+    var _existingSave = _be.querySelector('button');
+    if (_existingSave) {
+      // Inputs exist and aren't focused — just update their values from
+      // the new b without rebuilding. This keeps the inputs stable
+      // across SSE pushes while still reflecting server-side changes
+      // (e.g. another tab edited the config).
+      var _p4 = document.getElementById('cfg-p4');
+      var _p6 = document.getElementById('cfg-p6');
+      var _ep = document.getElementById('cfg-ep');
+      var _pg = document.getElementById('cfg-pg');
+      var _pp = document.getElementById('cfg-pp');
+      if (_p4) _p4.value = b.prefix4;
+      if (_p6) _p6.value = b.prefix6;
+      if (_ep) _ep.value = b.explore_pct;
+      if (_pg) _pg.value = (b.proof_good_bps * 8 / 1000000).toFixed(0);
+      if (_pp) _pp.value = (b.proof_proved_bps * 8 / 1000000).toFixed(0);
+      return;
+    }
     var _rows = _be.querySelectorAll('.row');
     _rows.forEach(function(row) {
       var _k = row.querySelector('.k');
@@ -918,6 +953,29 @@
   function _syncBucketDropdown(doc) {
     var _bs = $('bucket');
     var _prevVal = _bs ? _bs.value : null;
+    // E3-fix: skip the dropdown rebuild if the bucket set hasn't changed
+    // since last push. The old code rebuilt <option>s on every 30s SSE
+    // push, which closed the dropdown mid-selection if the user was
+    // picking a bucket when a push arrived. We hash the bucket IDs and
+    // only rebuild when the set actually differs.
+    var _newHash = '';
+    if (doc.buckets && doc.buckets.length) {
+      var _ids = doc.buckets.map(function(b) { return b ? b.dest : ''; }).sort();
+      _newHash = _ids.join('|');
+    }
+    if (_bs && _bs._lastBucketHash === _newHash && _newHash !== '') {
+      // Bucket set unchanged — preserve the dropdown as-is. Still
+      // restore _prevVal in case something else changed it.
+      if (_bs && _prevVal) {
+        var _stillThere = false;
+        for (var si = 0; si < _bs.options.length; si++) {
+          if (_bs.options[si].value === _prevVal) { _stillThere = true; break; }
+        }
+        _bs.value = _stillThere ? _prevVal : 'all';
+      }
+      return;
+    }
+    if (_bs) _bs._lastBucketHash = _newHash;
     _safeRender('buckets', function() { renderBuckets(doc.buckets || []); });
     // v0.7.5e: also rebuild the dropdown options from live buckets —
     // previously the dropdown stayed stale for 5 min until refreshAll
@@ -1151,6 +1209,18 @@
   }
 
   function renderLiveState(doc) {
+    // A7-fix: prevent stale HTTP poll (liveRefresh) from overwriting
+    // newer SSE state. Track the highest generated_ts seen; if the
+    // incoming doc is older, skip the render. SSE pushes and HTTP
+    // polls can resolve out of order on network jitter, causing
+    // "data goes backward" flicker.
+    if (doc && doc.generated_ts) {
+      var _ts = doc.generated_ts;
+      if (window.__latest_doc_ts && _ts < window.__latest_doc_ts) {
+        return;
+      }
+      window.__latest_doc_ts = _ts;
+    }
     window.__current_doc = doc;
     _safeRender('log_window', function() { renderLogWindow(doc); });
     if (doc.now_mono) SERVER_NOW_MONO = doc.now_mono;
@@ -1160,7 +1230,15 @@
     _syncBucketDropdown(doc);
     _updateBucketTags();
     state.metricByBucket = doc.metric_by_bucket || {};
-    state.bucketLive = doc.bucket_live || {};
+    // A2-fix: MERGE per-bucket instead of wholesale-replacing. The old
+    // `state.bucketLive = doc.bucket_live || {}` wiped any accumulated
+    // points from _appendLiveMetrics on every SSE push, causing 1h live
+    // charts to show stale/single-point data.
+    if (!state.bucketLive) state.bucketLive = {};
+    var _newBL = doc.bucket_live || {};
+    for (var _bk in _newBL) {
+      if (_newBL.hasOwnProperty(_bk)) state.bucketLive[_bk] = _newBL[_bk];
+    }
     _appendLiveMetrics(doc);
     state.recentSwapsByBucket = doc.recent_swaps_by_bucket || null;
     _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
@@ -1240,10 +1318,14 @@
         }
       };
       _sseSource.onerror = function () {
-        console.log("SSE failed, falling back to polling");
-        if (_sseSource) _sseSource.close();
-        _sseSource = null;
-        startPollingFallback();
+        // A1-fix: do NOT call _sseSource.close(). The browser's
+        // EventSource already auto-reconnects with built-in backoff
+        // (default ~3s, scaling up). The old code closed the stream
+        // permanently on any transient error (proxy timeout, network
+        // blip, server restart), killing real-time updates forever
+        // and falling back to 30s polling. We only log; the browser
+        // will reconnect on its own.
+        console.log("SSE error — browser will auto-reconnect");
       };
       console.log("SSE connected — real-time updates enabled");
       // Also do an immediate fetch so the page loads fast (don't
@@ -1397,9 +1479,44 @@
     // so mk() would throw "Chart is not defined". _safeRender catches
     // it but the noise fills the console. Bail out silently instead.
     if (typeof Chart === "undefined") return;
-    if (charts[id]) { try { charts[id].destroy(); } catch(e) {} }
-    var existing = Chart.getChart(cv);
-    if (existing) { try { existing.destroy(); } catch(e) {} }
+    // E1-fix: update an existing chart in place instead of destroy +
+    // recreate. The old code destroyed and re-created the chart on
+    // every 30s SSE push, causing flicker, loss of tooltips/hover
+    // state, and GC churn across 7 charts per push.
+    //
+    // We try to update the existing chart's data + options in place.
+    // Only destroy + recreate if the chart type changed (rare) or the
+    // dataset count changed (e.g. switching bucket ranges).
+    var existing = charts[id];
+    if (existing) {
+      try {
+        var sameType = !existing.config || !cfg.type ||
+                       existing.config.type === cfg.type;
+        var sameDSCount = existing.data &&
+                          existing.data.datasets &&
+                          cfg.data &&
+                          cfg.data.datasets &&
+                          existing.data.datasets.length === cfg.data.datasets.length;
+        if (sameType && sameDSCount) {
+          // In-place update: replace data + scales, keep the chart
+          // instance alive so hover state + animations are preserved.
+          existing.data = cfg.data;
+          if (cfg.options) {
+            existing.options = cfg.options;
+          }
+          existing.update('none'); // 'none' = no animation, instant
+          return;
+        }
+      } catch (e) {
+        // fall through to destroy + recreate
+      }
+      try { existing.destroy(); } catch(e) {}
+    } else {
+      // No existing chart in our map, but Chart.js may still have one
+      // registered for this canvas (e.g. after a tab restore). Clear it.
+      var stale = Chart.getChart(cv);
+      if (stale) { try { stale.destroy(); } catch(e) {} }
+    }
     charts[id] = new Chart(cv, cfg);
   }
 
@@ -1972,12 +2089,13 @@
       }
     }
     if (!d) {
-    var sse = window.__filtered_doc || window.__current_doc;
-    // 0.4.92: use __current_doc.generated_ts (fresh on every SSE push)
-    // for the timeline, not sse.generated_ts (which is from __filtered_doc,
-    // set only on bucket change — stale by up to 5 min).  This was why
-    // the swaps-per-bin chart used a different timeline than rate/sscore/
-    // streaks (3-min offset).
+    // B5-fix: always read from __current_doc (fresh on every SSE push),
+    // never from __filtered_doc (set only on bucket change — stale by
+    // up to 5 min). The old `window.__filtered_doc || window.__current_doc`
+    // meant that after a bucket change, the swaps-per-bin chart used a
+    // stale now_mono for the monotonic→epoch offset, plotting bars at
+    // the wrong time relative to the line charts.
+    var sse = window.__current_doc;
     if (sse && sse.swap_outcomes && sse.swap_outcomes.swaps_list) {
       var sw = sse.swap_outcomes.swaps_list;
       var now = (window.__current_doc && window.__current_doc.generated_ts) || (Date.now()/1000);
@@ -2331,6 +2449,22 @@ function _populateBucketSelect(desiredBucket) {
         err("FAIL: " + (e && e.message ? e.message : e), e);
       });
   }  boot();
+
+  // A3-fix: refresh immediately when the tab becomes visible again.
+  // Browsers throttle setInterval / setTimeout to ~1/min in background
+  // tabs, so on return the dashboard shows minutes-old data. Without
+  // this, the user perceives "not updating" for 30+ seconds after
+  // switching back.
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") {
+      // Reset the stale-detection watermark so an immediate liveRefresh
+      // isn't rejected by the A7-fix check (the visible-tab refresh is
+      // intentional, even if generated_ts hasn't advanced).
+      window.__latest_doc_ts = null;
+      if (typeof liveRefresh === "function") liveRefresh();
+      if (typeof refreshNowCardAndChart === "function") refreshNowCardAndChart();
+    }
+  });
 
   // 0.4.78.2: dark/light toggle.  Persists per-browser in
   // localStorage; falls back to prefers-color-scheme.

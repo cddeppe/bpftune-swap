@@ -34,14 +34,21 @@ import (
 )
 
 // collect is the per-cycle collection pipeline. Runs every 30s.
+//
+// A4-fix: On readBPFMap() failure, degrade gracefully instead of
+// aborting the entire cycle. We still update generated_ts, run log-derived
+// panels (recent_swaps, recent_proofs, etc.), push an SSE event, and write
+// current.json. We only skip BPF-derived panels (buckets, metric_by_bucket,
+// bucket_live, live_leaders) and CSV appends. This prevents the frontend
+// from freezing for 30+ seconds on a transient bpftool failure.
 func (c *Collector) collect() {
+        now := time.Now().Unix()
+
         hosts, err := readBPFMap()
         if err != nil {
-                fmt.Fprintf(os.Stderr, "collector: BPF map read failed: %v\n", err)
-                return
+                fmt.Fprintf(os.Stderr, "collector: BPF map read failed (degraded mode): %v\n", err)
+                hosts = nil // degraded mode — log panels still update
         }
-
-        now := time.Now().Unix()
 
         // ----- Parse log tail ONCE for the entire cycle ---------------------
         // All consumers below (recent_swaps, swap_outcomes, churn, divergence,
@@ -61,6 +68,7 @@ func (c *Collector) collect() {
         // ----- Build current.json document -----------------------------------
         doc := map[string]interface{}{
                 "generated_ts": now,
+                "degraded":     err != nil, // A4-fix: signal degraded mode to frontend
                 "build": map[string]interface{}{
                         "version":          bpftuneVersion(),
                         "dash_version":     dashVersion(),

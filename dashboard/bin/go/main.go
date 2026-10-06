@@ -272,6 +272,22 @@ func (c *Collector) handleSSE(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
+        // A5-fix: register the channel BEFORE sending the initial snapshot.
+        // Previously the initial send happened first, then channel registration
+        // — a race window where notifySSE() could fire and the new client would
+        // miss the first post-connect update.
+        // Also bumped buffer from 10 (5 min) to 60 (30 min) so slow clients
+        // don't silently drop updates via the `default:` case in notifySSE.
+        ch := make(chan []byte, 60)
+        c.mu.Lock()
+        c.sseClients[ch] = true
+        c.mu.Unlock()
+        defer func() {
+                c.mu.Lock()
+                delete(c.sseClients, ch)
+                c.mu.Unlock()
+        }()
+
         c.mu.RLock()
         current := c.current
         c.mu.RUnlock()
@@ -282,16 +298,6 @@ func (c *Collector) handleSSE(w http.ResponseWriter, r *http.Request) {
                 fmt.Fprintf(w, "data: %s\n\n", data)
                 flusher.Flush()
         }
-
-        ch := make(chan []byte, 10)
-        c.mu.Lock()
-        c.sseClients[ch] = true
-        c.mu.Unlock()
-        defer func() {
-                c.mu.Lock()
-                delete(c.sseClients, ch)
-                c.mu.Unlock()
-        }()
 
         // v0.7.5m: removed per-second hash polling (was the 9% CPU sink).
         // notifySSE() pushes to the channel every 30s after collect().

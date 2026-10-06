@@ -81,7 +81,7 @@ func readCSVTail(span int64) map[string][]bucketSnapshot {
 		if len(cols) < 9 {
 			continue
 		}
-		addr := ResolveBucket(cols[1]) // v0.7.5g: re-resolve at read time
+		addr := cols[1] // B1-fix: trust stored label, no ResolveBucket
 		ts, err := strconv.ParseInt(cols[0], 10, 64)
 		if err != nil || ts < cutoff {
 			continue
@@ -173,8 +173,7 @@ func readCSVAll() map[string][]bucketSnapshot {
 		if len(cols) < 9 {
 			continue
 		}
-		// v0.7.0: trust the stored label as-is (no ResolveBucket)
-		addr := ResolveBucket(cols[1]) // v0.7.5g: re-resolve at read time
+		addr := cols[1] // B1-fix: trust stored label, no ResolveBucket
 		ts, err := strconv.ParseInt(cols[0], 10, 64)
 		if err != nil {
 			continue
@@ -270,7 +269,7 @@ func readBucketCSV(bucketID string, span int64) []bucketSnapshot {
 		if len(cols) < 9 {
 			continue
 		}
-		addr := ResolveBucket(cols[1]) // v0.7.5g: re-resolve at read time
+		addr := cols[1] // B1-fix: trust stored label, no ResolveBucket
 		if addr != bucketID {
 			continue
 		}
@@ -478,7 +477,7 @@ func streamCSVToSeries(bucketIDs []string) map[string]map[string]map[string]inte
 			continue
 		}
 
-		addr := ResolveBucket(cols[1])
+		addr := cols[1] // B1-fix: trust stored label, no ResolveBucket
 		if !bucketSet[addr] {
 			continue
 		}

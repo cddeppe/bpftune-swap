@@ -30,6 +30,7 @@ package main
 import (
         "bufio"
         "encoding/json"
+        "fmt"
         "os"
         "path/filepath"
         "sort"
@@ -479,18 +480,22 @@ func (h *historyStore) renderBucketToDisk(bucketID, safe string, swapOutcomes in
                 bc := map[int64]int{}
                 if f, e := os.Open(swapsCSVPath); e == nil {
                         sc := bufio.NewScanner(f)
-                        sc.Buffer(make([]byte, 1<<20), 1<<20)
+                        sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
                         sc.Scan()
                         for sc.Scan() {
                                 c := strings.Split(sc.Text(), ",")
                                 if len(c) < 13 {
                                         continue
                                 }
-                                if ResolveBucket(c[11]) != bucketID {
+                                if c[11] != bucketID { // B1-fix: trust stored label
                                         continue
                                 }
                                 st, _ := strconv.ParseInt(c[0], 10, 64)
                                 bc[st/int64(width)]++
+                        }
+                        // D2-fix: log scanner errors instead of silently truncating.
+                        if err := sc.Err(); err != nil {
+                                fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
                         }
                         f.Close()
                 }
@@ -633,18 +638,22 @@ func (h *historyStore) renderBucketToDiskPreserving(bucketID, safe string, swapO
                 bc := map[int64]int{}
                 if f, e := os.Open(swapsCSVPath); e == nil {
                         sc := bufio.NewScanner(f)
-                        sc.Buffer(make([]byte, 1<<20), 1<<20)
+                        sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
                         sc.Scan()
                         for sc.Scan() {
                                 c := strings.Split(sc.Text(), ",")
                                 if len(c) < 13 {
                                         continue
                                 }
-                                if ResolveBucket(c[11]) != bucketID {
+                                if c[11] != bucketID { // B1-fix: trust stored label
                                         continue
                                 }
                                 st, _ := strconv.ParseInt(c[0], 10, 64)
                                 bc[st/int64(width)]++
+                        }
+                        // D2-fix: log scanner errors instead of silently truncating.
+                        if err := sc.Err(); err != nil {
+                                fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
                         }
                         f.Close()
                 }

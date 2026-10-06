@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -47,7 +48,11 @@ func rotateCSVIfLarge(path string, maxDays int, maxSizeMB int64) {
 
 	writer := bufio.NewWriter(out)
 	scanner := bufio.NewScanner(in)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// D1-fix: bump max line size from 1MB to 8MB. The old 1MB cap would
+	// silently error on any line exceeding it, and since sc.Err() was
+	// never checked, the rotation would complete with a truncated tmp
+	// file and atomically replace the production CSV — permanent data loss.
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
 	kept := 0
 	skipped := 0
@@ -74,6 +79,20 @@ func rotateCSVIfLarge(path string, maxDays int, maxSizeMB int64) {
 		} else {
 			skipped++
 		}
+	}
+
+	// D1-fix: check scanner error BEFORE renaming. If the scanner errored
+	// (e.g., a line exceeded the 8MB buffer, or a read I/O error), abort
+	// the rotation — do NOT replace the production file with a truncated
+	// tmp file. The old code never checked this, causing permanent data
+	// loss on any over-long line.
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "csv_rotate: ABORT %s: scanner error: %v (production file untouched)\n", path, err)
+		writer.Flush()
+		out.Close()
+		in.Close()
+		os.Remove(tmpPath)
+		return
 	}
 
 	writer.Flush()

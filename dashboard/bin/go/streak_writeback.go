@@ -610,6 +610,36 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 			continue
 		}
 
+		// C1-fix: re-lookup the buffer immediately before writeback and
+		// compare the seq field. The kernel increments seq on every update
+		// to the remote_host entry. If seq changed between the original
+		// lookup (T0) and now (T1), the kernel has updated metric_count /
+		// rate_ema / swap_score / etc. in the meantime, and writing back
+		// our stale buf would clobber those updates.
+		freshBuf, err := mapLookupBytes(mapID, keyArgs)
+		if err != nil || len(freshBuf) != sizeofRemoteHost {
+			fmt.Fprintf(os.Stderr, "[writeback] WARN: %s re-lookup failed; skip\n", host)
+			continue
+		}
+		origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
+		freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
+		if origSeq != freshSeq {
+			fmt.Fprintf(os.Stderr, "[writeback] %s seq changed (%d → %d); kernel updated mid-cycle, skip\n",
+				host, origSeq, freshSeq)
+			continue
+		}
+		// Copy our 2-byte streak patches into the fresh buffer so we don't
+		// lose any other kernel-side updates that happened between T0 and T1.
+		for algIdx := range algSet {
+			base := offMetricsArray + (algIdx * sizeofTCPConnMetric)
+			if base+offMetricNullStreak+1 > len(freshBuf) || base+offMetricNullStreak+1 > len(buf) {
+				continue
+			}
+			freshBuf[base+offMetricBadStreak] = buf[base+offMetricBadStreak]
+			freshBuf[base+offMetricNullStreak] = buf[base+offMetricNullStreak]
+		}
+		buf = freshBuf
+
 		// Write back the modified buffer (1 BPF map update per host).
 		if mapUpdateBytes(mapID, keyArgs, buf) {
 			totalHosts++
