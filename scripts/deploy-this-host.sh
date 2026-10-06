@@ -53,7 +53,7 @@ case "$ARCH" in
     *) fail "Unsupported arch: $ARCH" ;;
 esac
 
-EXPECTED_TUNER_VER="0.4.94"
+EXPECTED_TUNER_VER="0.4.95"
 BACKUP_DIR="/mnt/backup"
 
 printf "${B}=== bpftune deploy-this-host ===${N}\n"

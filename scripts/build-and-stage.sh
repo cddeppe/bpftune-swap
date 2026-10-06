@@ -43,7 +43,7 @@ esac
 
 REPO_DIR="${REPO_DIR:-/root/bpftune}"
 BACKUP_DIR="${BACKUP_DIR:-/mnt/backup}"
-EXPECTED_TUNER_VER="0.4.94"
+EXPECTED_TUNER_VER="0.4.95"
 EXPECTED_DASH_VER="0.9.0"
 
 printf "${B}=== bpftune build-and-stage ===${N}\n"

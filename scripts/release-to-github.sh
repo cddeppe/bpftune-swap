@@ -32,7 +32,7 @@ trap 'fail "Aborted at line $LINENO (exit code $?)"' ERR
 
 # ---------- Config ----------
 REPO="cddeppe/bpftune-swap"
-VERSION="0.4.94"
+VERSION="0.4.95"
 DASH_VERSION="0.9.0"
 TAG="v${VERSION}"
 
