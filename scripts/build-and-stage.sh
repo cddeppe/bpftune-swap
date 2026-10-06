@@ -165,10 +165,62 @@ warn "using dashVersionStr=$DASH_GIT_VER"
 # Clean any stale local binaries
 rm -f bpftune-collector-go bpftune-collector-go-* ./*.test
 
-CGO_ENABLED=0 go build \
-    -ldflags "-s -w -X main.dashVersionStr=${DASH_GIT_VER}" \
-    -o "bpftune-collector-go-${ARCH}" \
-    .
+# v0.9.1: auto-install Go if not in PATH. The dashboard doesn't ship
+# as a .deb yet, so we have to build the binary from source — which
+# means Go has to be on the builder. Both vps-3959 and instance-20250225-1017
+# were missing Go in root's PATH, so the build silently failed mid-script
+# after the .deb was already staged. Make this auto-recover instead.
+if ! command -v go >/dev/null 2>&1; then
+    warn "go not in PATH — attempting auto-install"
+    # Try apt first (Debian/Ubuntu have golang-go packaged)
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq golang-go >/dev/null 2>&1 && ok "installed golang-go via apt" || \
+            warn "apt install golang-go failed — falling back to tarball"
+    fi
+    # If apt failed (or not Debian), install from tarball
+    if ! command -v go >/dev/null 2>&1; then
+        GO_VER="go1.23.2"
+        case "$ARCH" in
+            amd64) GO_TARBALL="${GO_VER}.linux-amd64.tar.gz" ;;
+            arm64) GO_TARBALL="${GO_VER}.linux-arm64.tar.gz" ;;
+        esac
+        GO_URL="https://go.dev/dl/${GO_TARBALL}"
+        warn "downloading ${GO_TARBALL}..."
+        curl -fsSL "$GO_URL" -o /tmp/"$GO_TARBALL" || \
+            fail "could not download Go from $GO_URL"
+        mkdir -p /usr/local/go
+        tar -C /usr/local -xzf /tmp/"$GO_TARBALL" || \
+            fail "tar extract failed"
+        export PATH="$PATH:/usr/local/go/bin"
+        # Persist for subsequent steps + future invocations
+        grep -q '/usr/local/go/bin' /root/.bashrc 2>/dev/null || \
+            echo 'export PATH="$PATH:/usr/local/go/bin"' >> /root/.bashrc
+        ok "installed Go ${GO_VER} to /usr/local/go/bin"
+    fi
+fi
+command -v go >/dev/null 2>&1 || \
+    fail "Go is still not in PATH after auto-install attempts. Install manually:
+   apt-get install -y golang-go
+OR download from https://go.dev/dl/ and extract to /usr/local/go/"
+
+# Print the Go version so we can debug version-specific issues
+go version
+
+# v0.9.1: make Go-binary build failures non-fatal. The .deb is already
+# staged in step 3; the Go binary is independent and can be built + staged
+# separately if needed (e.g. if a Go version mismatch causes a compile
+# error on one arch but not the other). Warn loudly + exit non-zero so
+# the deploy knows the Go binary wasn't updated, but don't lose the work.
+if ! CGO_ENABLED=0 go build \
+        -ldflags "-s -w -X main.dashVersionStr=${DASH_GIT_VER}" \
+        -o "bpftune-collector-go-${ARCH}" \
+        . ; then
+    warn "Go binary build FAILED — .deb is already staged, but dashboard binary is not"
+    warn "you can deploy tuner-only now:  sudo bash update.sh --tuner-only"
+    warn "and rebuild Go binary later once Go is fixed"
+    exit 2
+fi
 
 # Sanity check: binary runs and prints --help (or at least doesn't segfault)
 ./"bpftune-collector-go-${ARCH}" --help 2>&1 | head -3 || \
