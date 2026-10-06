@@ -83,21 +83,55 @@ if [ "$DO_TUNER" = 1 ]; then
     DEB_TO_INSTALL=""
 
     printf "  checking GitHub releases for %s/%s...\n" "$REPO" "$ARCH"
-    DEB_INFO=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
+    DEB_INFO=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null \
         | python3 -c "
 import json, sys
 try:
     releases = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+
+# 0.4.95 fix: previously this script took the FIRST release in the API
+# response that had any '_amd64.deb' asset.  But GitHub does not guarantee
+# newest-first ordering, AND older releases used the naming convention
+# 'bpftune_X.Y.Z_amd64.deb' while newer ones use
+# 'bpftune-custom-X.Y.Z-amd64.deb'.  Both naming conventions matched the
+# old filter, so the script sometimes picked an OLD release (e.g. 0.4.93)
+# instead of the newest one (0.4.95).
+#
+# Fix: collect ALL .deb assets across ALL releases, parse the version
+# from each, then pick the one with the highest version number.
+# Supports both naming conventions.
+
+import re
+candidates = []  # list of (version_tuple, version_str, url)
 for r in releases:
+    tag = r.get('tag_name', '').lstrip('v')
     for a in r.get('assets', []):
         name = a.get('name', '')
-        if name.endswith('_${ARCH}.deb') and 'bpftune' in name:
-            parts = name.split('_')
-            ver = parts[1] if len(parts) >= 2 else r.get('tag_name', '').lstrip('v')
-            print(ver + ' ' + a.get('browser_download_url', ''))
-            sys.exit(0)
+        url = a.get('browser_download_url', '')
+        if not url:
+            continue
+        # New naming: bpftune-custom-0.4.95-amd64.deb
+        m = re.match(r'^bpftune-custom-([0-9.]+)-${ARCH}\.deb\$', name)
+        if m:
+            ver = m.group(1)
+            candidates.append((tuple(int(x) for x in ver.split('.')), ver, url))
+            continue
+        # Old naming: bpftune_0.4.93_amd64.deb
+        m = re.match(r'^bpftune_([0-9.]+)_${ARCH}\.deb\$', name)
+        if m:
+            ver = m.group(1)
+            candidates.append((tuple(int(x) for x in ver.split('.')), ver, url))
+            continue
+
+if not candidates:
+    sys.exit(0)
+
+# Sort by version tuple (descending) and pick the highest.
+candidates.sort(key=lambda c: c[0], reverse=True)
+best = candidates[0]
+print(best[1] + ' ' + best[2])
 " 2>/dev/null || true)
     if [ -n "$DEB_INFO" ]; then
         NEW_VER=$(printf "%s" "$DEB_INFO" | awk '{print $1}')
@@ -169,10 +203,32 @@ if [ "$DO_DASHBOARD" = 1 ]; then
         mkdir -p "$DASH_BIN" "$SERVED/data"
 
         # --- 2a. Get updated Go binary ---
-        # Search GitHub API for the latest release with the dashboard binary
-        # (can't use "releases/latest" because the tuner is marked as latest)
-        DASH_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null | \
-            python3 -c "import json,sys;[print(r['tag_name']) for r in json.load(sys.stdin) if any(a['name']=='bpftune-collector-go-${ARCH}' for a in r.get('assets',[]))]" 2>/dev/null | head -1)
+        # 0.4.95 fix: pick the release with the highest version that has
+        # the dashboard binary, not just the first one GitHub returns.
+        # GitHub's API doesn't guarantee newest-first ordering.
+        DASH_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null | \
+            python3 -c "
+import json, sys, re
+try:
+    releases = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+candidates = []
+for r in releases:
+    tag = r.get('tag_name', '').lstrip('v')
+    m = re.match(r'^v?(\d+\.\d+\.\d+)\$', tag)
+    if not m:
+        continue
+    ver_tuple = tuple(int(x) for x in m.group(1).split('.'))
+    for a in r.get('assets', []):
+        if a.get('name') == 'bpftune-collector-go-${ARCH}':
+            candidates.append((ver_tuple, r['tag_name']))
+            break
+if not candidates:
+    sys.exit(0)
+candidates.sort(key=lambda c: c[0], reverse=True)
+print(candidates[0][1])
+" 2>/dev/null)
         if [ -n "$DASH_TAG" ]; then
             BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-collector-go-${ARCH}"
         fi
