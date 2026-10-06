@@ -282,6 +282,12 @@
 
 </script>
 
+<!-- v0.9.5: load Chart.js + adapter as regular script tags (not dynamic loadScript).
+     This is more reliable than loadScript() — the browser handles loading
+     and caching, and the scripts are guaranteed to be available before
+     dashboard.js runs. -->
+<script src="chart.umd.min.js"></script>
+<script src="chartjs-adapter-date-fns.bundle.min.js"></script>
 <script src="dashboard.js"></script>
 
 <!-- Label Editor Modal -->

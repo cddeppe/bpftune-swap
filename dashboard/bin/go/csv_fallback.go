@@ -11,10 +11,10 @@ package main
 // the dashboard renders them identically.
 
 import (
-	"bufio"
-	"os"
-	"strconv"
-	"strings"
+        "bufio"
+        "os"
+        "strconv"
+        "strings"
 )
 
 // readRecentSwapsFromCSV reads the last N rows from swaps.csv and
@@ -26,63 +26,125 @@ import (
 //   diverges, outcome, socket_rate_before, dest, dest_raw, f_ema, t_ema,
 //   srate_before, direction, rport
 func readRecentSwapsFromCSV(n int) []interface{} {
-	f, err := os.Open(swapsCSVPath)
-	if err != nil {
-		return []interface{}{}
-	}
-	defer f.Close()
+        f, err := os.Open(swapsCSVPath)
+        if err != nil {
+                return []interface{}{}
+        }
+        defer f.Close()
 
-	// Read all lines (swaps.csv is typically 1-30MB, not huge)
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 65536), 1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if len(lines) < 2 {
-		return []interface{}{}
-	}
+        // Read all lines (swaps.csv is typically 1-30MB, not huge)
+        var lines []string
+        scanner := bufio.NewScanner(f)
+        scanner.Buffer(make([]byte, 0, 65536), 1024*1024)
+        for scanner.Scan() {
+                lines = append(lines, scanner.Text())
+        }
+        if len(lines) < 2 {
+                return []interface{}{}
+        }
 
-	// Skip header (first line)
-	lines = lines[1:]
+        // Skip header (first line)
+        lines = lines[1:]
 
-	// Take last N
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
+        // Take last N
+        if len(lines) > n {
+                lines = lines[len(lines)-n:]
+        }
 
-	out := make([]interface{}, 0, len(lines))
-	// Reverse so newest-first (CSV is oldest-first)
-	for i := len(lines) - 1; i >= 0; i-- {
-		fields := strings.Split(lines[i], ",")
-		if len(fields) < 18 {
-			continue
-		}
-		bootTs, _ := strconv.ParseFloat(fields[1], 64)
-		fromAlg := fields[3]
-		toAlg := fields[4]
-		d, _ := strconv.Atoi(fields[5])
-		mtAlg := fields[6]
-		rbAlg := fields[7]
-		outcome := fields[9]
-		dest := fields[11]
-		// Apply label resolution
-		destLabel := labelFor(dest)
-		if destLabel == "" {
-			destLabel = dest
-		}
-		row := map[string]interface{}{
-			"boot_ts":           bootTs,
-			"from_alg":          fromAlg,
-			"to_alg":            toAlg,
-			"d":                 d,
-			"outcome":           outcome,
-			"outcome_sustained": outcome, // CSV already has the sustained outcome
-			"mt_alg":            mtAlg,
-			"rb_alg":            rbAlg,
-			"dest":              destLabel,
-		}
-		out = append(out, row)
-	}
-	return out
+        out := make([]interface{}, 0, len(lines))
+        // Reverse so newest-first (CSV is oldest-first)
+        for i := len(lines) - 1; i >= 0; i-- {
+                fields := strings.Split(lines[i], ",")
+                if len(fields) < 18 {
+                        continue
+                }
+                bootTs, _ := strconv.ParseFloat(fields[1], 64)
+                fromAlg := fields[3]
+                toAlg := fields[4]
+                d, _ := strconv.Atoi(fields[5])
+                mtAlg := fields[6]
+                rbAlg := fields[7]
+                outcome := fields[9]
+                dest := fields[11]
+                // Apply label resolution
+                destLabel := labelFor(dest)
+                if destLabel == "" {
+                        destLabel = dest
+                }
+                row := map[string]interface{}{
+                        "boot_ts":           bootTs,
+                        "from_alg":          fromAlg,
+                        "to_alg":            toAlg,
+                        "d":                 d,
+                        "outcome":           outcome,
+                        "outcome_sustained": outcome, // CSV already has the sustained outcome
+                        "mt_alg":            mtAlg,
+                        "rb_alg":            rbAlg,
+                        "dest":              destLabel,
+                }
+                out = append(out, row)
+        }
+        return out
+}
+
+// readRecentProofsFromCSV reads the last N rows from proofs.csv and
+// returns them in the same format as buildRecentProofRows (newest-first).
+// Returns empty slice if the file doesn't exist or is unreadable.
+//
+// proofs.csv columns (8):
+//   collected_ts, boot_ts, cookie, alg, rate_bps, mbps, tier, dest
+func readRecentProofsFromCSV(n int) []interface{} {
+        f, err := os.Open(proofsCSVPath)
+        if err != nil {
+                return []interface{}{}
+        }
+        defer f.Close()
+
+        var lines []string
+        scanner := bufio.NewScanner(f)
+        scanner.Buffer(make([]byte, 0, 65536), 1024*1024)
+        for scanner.Scan() {
+                lines = append(lines, scanner.Text())
+        }
+        if len(lines) < 2 {
+                return []interface{}{}
+        }
+
+        // Skip header
+        lines = lines[1:]
+
+        // Take last N
+        if len(lines) > n {
+                lines = lines[len(lines)-n:]
+        }
+
+        out := make([]interface{}, 0, len(lines))
+        // Reverse so newest-first
+        for i := len(lines) - 1; i >= 0; i-- {
+                fields := strings.Split(lines[i], ",")
+                if len(fields) < 8 {
+                        continue
+                }
+                ts, _ := strconv.ParseFloat(fields[1], 64)
+                alg := fields[3]
+                mbps, _ := strconv.ParseFloat(fields[5], 64)
+                tier := fields[6]
+                tierLabel := "good"
+                if tier == "2" {
+                        tierLabel = "proved"
+                }
+                dest := fields[7]
+                destLabel := labelFor(dest)
+                if destLabel == "" {
+                        destLabel = dest
+                }
+                out = append(out, map[string]interface{}{
+                        "boot_ts": ts,
+                        "alg":     alg,
+                        "mbps":    mbps,
+                        "tier":    tierLabel,
+                        "dest":    destLabel,
+                })
+        }
+        return out
 }
