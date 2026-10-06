@@ -313,6 +313,43 @@
     // 0.4.87: do NOT silently fall back to keys[0] (the first bucket).
     // The previous behaviour showed whichever bucket happened to sort
     // first, which looked correct but was for the wrong destination.
+    if (!rows.length) {
+      // v0.9.3: no live metric_by_bucket data for this bucket.
+      // Instead of showing "(no metrics yet)", show the last row of
+      // the 24h series from bucketDoc (which has re_/ss_/bs_/ns_ per
+      // alg). This keeps the Swap Target Pick table populated on all
+      // ranges instead of going empty on 7d/30d/all.
+      var doc = state.bucketDoc;
+      if (doc && doc.last && doc.last.re) {
+        var re = doc.last.re;
+        var ss = doc.last.ss || {};
+        var bs_arr = doc.last.bs || {};
+        var ns = doc.last.ns || {};
+        var _algs = (state.meta && state.meta.algs) || Object.keys(re);
+        rows = _algs.map(function (alg) {
+          var _re = re[alg] != null ? re[alg] : null;
+          var _ss = ss[alg] != null ? ss[alg] : 256;
+          var _bs = bs_arr[alg] != null ? bs_arr[alg] : 0;
+          var _ns = ns[alg] != null ? ns[alg] : 0;
+          // Compute penalty + score (same formula as the Go collector):
+          //   penalty = 16 / (16 + bad*4 + null*2)
+          //   score = rate_ema * (swap_score/256) * penalty
+          var pen = 16.0 / (16.0 + _bs * 4.0 + _ns * 2.0);
+          var sc = _re != null ? (_re * (_ss / 256.0) * pen) : null;
+          return {
+            alg: alg,
+            rate_ema: _re,
+            swap_score: _ss,
+            bad_streak: _bs,
+            null_streak: _ns,
+            penalty: pen,
+            score: sc,
+            metric: null,  // metric value not available in bucketDoc.last
+            active: _re != null && _re > 0,
+          };
+        }).filter(function (r) { return r.rate_ema != null; });
+      }
+    }
     renderMetric(rows);
   }
 
