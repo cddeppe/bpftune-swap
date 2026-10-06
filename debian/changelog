@@ -1,3 +1,22 @@
+bpftune (0.4.95) unstable; urgency=medium
+
+  * Fix: skip RFC 1918 private IPv4 ranges (10.0.0.0/8, 172.16.0.0/12,
+    192.168.0.0/16) + special-use ranges (0.0.0.0/16, 192.0.2.0/24,
+    198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24) in both BPF
+    filter branches (active_estab + vote path). Previously only
+    127.0.0.0/8 (loopback) + 169.254.0.0/16 (link-local) were skipped,
+    so LAN traffic showed up in the dashboard as '192.168.0.0' or
+    '10.0.0.0' buckets — useless noise that crowded out real internet
+    destinations.
+  * Fix: same RFC 1918 filter applied to v4-in-v6 form (the
+    IPv4-mapped IPv6 case from v0.4.94). Without this, LAN traffic
+    over a dual-stack AF_INET6 socket would slip past the AF_INET
+    filter above.
+  * Fix: skip IPv6 ULA (fc00::/7), multicast (ff00::/8), and
+    documentation (2001:db8::/32) ranges.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Tue, 06 Oct 2026 03:30:00 +0200
+
 bpftune (0.4.94) unstable; urgency=medium
 
   * Fix: detect IPv4-mapped IPv6 (::ffff:0:0/96) connections and route

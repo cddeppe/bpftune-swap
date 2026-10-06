@@ -393,11 +393,32 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     __u32 v4_addr_from_v6 = 0;
     if (ops->family == AF_INET) {
         __u32 ip4 = bpf_ntohl(ops->remote_ip4);
-        if ((ip4 & 0xff000000) == 0x7f000000) return 1;
-        if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+        /* 0.4.95: skip RFC 1918 + special-use v4 ranges.  These are
+         * either loopback, link-local, private LAN, or documentation
+         * ranges — none of them benefit from congestion-control
+         * tuning (they're either local or never route over the
+         * internet).  Previously only 127.0.0.0/8 + 169.254.0.0/16
+         * were skipped, so LAN traffic showed up in the dashboard
+         * as '192.168.0.0' or '10.0.0.0' buckets — useless noise. */
+        if ((ip4 & 0xff000000) == 0x7f000000) return 1;  /* 127.0.0.0/8 loopback */
+        if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;  /* 169.254.0.0/16 link-local */
+        if ((ip4 & 0xff000000) == 0x0a000000) return 1;  /* 10.0.0.0/8 private */
+        if ((ip4 & 0xfff00000) == 0xac100000) return 1;  /* 172.16.0.0/12 private */
+        if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;  /* 192.168.0.0/16 private */
+        if ((ip4 & 0xffff0000) == 0xc0000000) return 1;  /* 0.0.0.0/16 reserved */
+        if ((ip4 & 0xffff0000) == 0xc000a800) return 1;  /* 192.0.2.0/24 documentation */
+        if ((ip4 & 0xffff0000) == 0xc6120000) return 1;  /* 198.18.0.0/15 benchmark */
+        if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;  /* 198.51.100.0/24 documentation */
+        if ((ip4 & 0xffff0000) == 0xcb007100) return 1;  /* 203.0.113.0/24 documentation */
     } else if (ops->family == AF_INET6) {
         if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 && ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1)) return 1;
         if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return 1;
+        /* 0.4.95: skip IPv6 ULA (fc00::/7), multicast (ff00::/8), and
+         * documentation (2001:db8::/32).  These are either private or
+         * not routable on the public internet. */
+        if ((ops->remote_ip6[0] & bpf_htonl(0xfe000000)) == bpf_htonl(0xfc000000)) return 1;
+        if ((ops->remote_ip6[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000)) return 1;
+        if (ops->remote_ip6[0] == bpf_htonl(0x20010db8)) return 1;
         /* 0.4.94: IPv4-mapped IPv6 (::ffff:a.b.c.d).  remote_ip6[2]
          * in network byte order is 0xffff0000 when read as __u32,
          * but we compare against bpf_htonl(0xffff) which is the
@@ -407,6 +428,21 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
             ops->remote_ip6[2] == bpf_htonl(0xffff)) {
             is_v4_mapped = true;
             v4_addr_from_v6 = ops->remote_ip6[3];
+            /* 0.4.95: apply the same RFC 1918 + special-use v4 filter
+             * to the v4 address extracted from v4-in-v6 form.  Without
+             * this, LAN traffic over a dual-stack socket would slip
+             * past the AF_INET filter above. */
+            __u32 ip4 = bpf_ntohl(v4_addr_from_v6);
+            if ((ip4 & 0xff000000) == 0x7f000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+            if ((ip4 & 0xff000000) == 0x0a000000) return 1;
+            if ((ip4 & 0xfff00000) == 0xac100000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc000a800) return 1;
+            if ((ip4 & 0xffff0000) == 0xc6120000) return 1;
+            if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;
+            if ((ip4 & 0xffff0000) == 0xcb007100) return 1;
         }
     }
     switch (ops->family) {
@@ -802,15 +838,40 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     __u32 v4_addr_from_v6 = 0;
     if (ops->family == AF_INET) {
         __u32 ip4 = bpf_ntohl(ops->remote_ip4);
+        /* 0.4.95: skip RFC 1918 + special-use v4 ranges (see active_estab). */
         if ((ip4 & 0xff000000) == 0x7f000000) return 1;
         if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+        if ((ip4 & 0xff000000) == 0x0a000000) return 1;
+        if ((ip4 & 0xfff00000) == 0xac100000) return 1;
+        if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;
+        if ((ip4 & 0xffff0000) == 0xc0000000) return 1;
+        if ((ip4 & 0xffff0000) == 0xc000a800) return 1;
+        if ((ip4 & 0xffff0000) == 0xc6120000) return 1;
+        if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;
+        if ((ip4 & 0xffff0000) == 0xcb007100) return 1;
     } else if (ops->family == AF_INET6) {
         if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 && ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1)) return 1;
         if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return 1;
+        /* 0.4.95: skip ULA + multicast + documentation (see active_estab). */
+        if ((ops->remote_ip6[0] & bpf_htonl(0xfe000000)) == bpf_htonl(0xfc000000)) return 1;
+        if ((ops->remote_ip6[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000)) return 1;
+        if (ops->remote_ip6[0] == bpf_htonl(0x20010db8)) return 1;
         if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
             ops->remote_ip6[2] == bpf_htonl(0xffff)) {
             is_v4_mapped = true;
             v4_addr_from_v6 = ops->remote_ip6[3];
+            /* 0.4.95: apply RFC 1918 + special-use filter to v4-in-v6 form. */
+            __u32 ip4 = bpf_ntohl(v4_addr_from_v6);
+            if ((ip4 & 0xff000000) == 0x7f000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+            if ((ip4 & 0xff000000) == 0x0a000000) return 1;
+            if ((ip4 & 0xfff00000) == 0xac100000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc000a800) return 1;
+            if ((ip4 & 0xffff0000) == 0xc6120000) return 1;
+            if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;
+            if ((ip4 & 0xffff0000) == 0xcb007100) return 1;
         }
     }
     switch (ops->family) {
