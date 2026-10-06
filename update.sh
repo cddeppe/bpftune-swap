@@ -264,9 +264,13 @@ print(candidates[0][1])
         fi
 
         # --- 2b. Deploy frontend files ---
+        # v0.9.1: also copy chart.umd.min.js + chartjs-adapter-date-fns
+        # (bundled locally so charts work without CDN access)
         cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$DASH_BIN"/ 2>/dev/null || true
         cp dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
         cp dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
+        cp dashboard/bin/chart.umd.min.js "$DASH_BIN"/ 2>/dev/null || true
+        cp dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$DASH_BIN"/ 2>/dev/null || true
         chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js 2>/dev/null || true
         chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
         ok "frontend files synced"
