@@ -2266,6 +2266,10 @@ function _populateBucketSelect(desiredBucket) {
           _safeRender("div", function() { renderDivChart("div", ""); });
           _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
           _safeRender("score-now", function() { renderScoreNow(); });
+          // v0.9.1: re-render the Swap Target Pick table on range change
+          // too — it reads from live metric_by_bucket data (not historical),
+          // so it should always show regardless of selected range.
+          _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
           _updateBucketTags();
         };
 
