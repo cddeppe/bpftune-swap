@@ -106,13 +106,53 @@ EXPECTED_TUNER_VER="0.4.94"
 DEB="$BACKUP_DIR/bpftune-custom-${EXPECTED_TUNER_VER}-${ARCH}.deb"
 BIN="$BACKUP_DIR/bpftune-collector-go-${ARCH}"
 
-[ -f "$DEB" ] || fail "missing $DEB (run build-and-stage.sh first)"
-[ -f "$BIN" ] || fail "missing $BIN (run build-and-stage.sh first)"
+# Auto-rebuild if .deb is missing (saves the user a manual step).
+# /mnt/backup/ may not be shared between hosts (HANDOFF warns about this),
+# so the .deb built on one builder might not be visible on another.
+if [ ! -f "$DEB" ] || [ ! -f "$BIN" ]; then
+    warn "missing staged artifacts in $BACKUP_DIR/ — running build-and-stage.sh first"
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    if [ ! -x "$SCRIPT_DIR/build-and-stage.sh" ]; then
+        fail "$SCRIPT_DIR/build-and-stage.sh not found or not executable.
+This script needs build-and-stage.sh in the same scripts/ directory."
+    fi
+    bash "$SCRIPT_DIR/build-and-stage.sh" || fail "build-and-stage.sh failed"
+    # Re-check after build
+    [ -f "$DEB" ] || fail "$DEB still missing after build-and-stage.sh"
+    [ -f "$BIN" ] || fail "$BIN still missing after build-and-stage.sh"
+    ok "artifacts now staged"
+fi
 
-# Need a GitHub token
-[ -n "${GH_TOKEN:-}" ] || fail "GH_TOKEN env var not set.
+# Need a GitHub token.  Handle three cases:
+#   1. GH_TOKEN is empty (user forgot to set it)
+#   2. GH_TOKEN is the literal placeholder 'ghp_xxxxx...' (user copy-pasted the
+#      example from the script comment)
+#   3. GH_TOKEN looks valid (starts with 'ghp_' or 'github_pat_')
+GH_TOKEN="${GH_TOKEN:-}"
+if [ -z "$GH_TOKEN" ]; then
+    fail "GH_TOKEN env var not set (or was stripped by sudo).
 Create a token at https://github.com/settings/tokens (needs 'repo' scope), then:
-  GH_TOKEN=ghp_xxxxx sudo bash $0"
+
+  export GH_TOKEN=ghp_YOUR_REAL_TOKEN
+  sudo -E bash $0
+
+OR (without exporting):
+  sudo GH_TOKEN=\$GH_TOKEN bash $0
+
+The 'sudo -E' preserves env vars; without it sudo strips GH_TOKEN."
+fi
+case "$GH_TOKEN" in
+    ghp_xxx*|ghp_your*|ghp_REAL*|ghp_PLACEHOLDER*)
+        fail "GH_TOKEN looks like a placeholder ($GH_TOKEN).
+Create a REAL token at https://github.com/settings/tokens and re-run."
+        ;;
+    ghp_*|github_pat_*)
+        ok "GH_TOKEN looks valid"
+        ;;
+    *)
+        warn "GH_TOKEN doesn't start with 'ghp_' or 'github_pat_' — proceeding anyway"
+        ;;
+esac
 
 command -v curl >/dev/null || fail "curl not found"
 command -v jq   >/dev/null || {
