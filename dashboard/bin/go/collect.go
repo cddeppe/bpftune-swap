@@ -129,6 +129,9 @@ func (c *Collector) collect() {
         // single source of truth now.
         writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
 
+        // v0.9.5: write proofs.csv for the recent-proofs panel fallback
+        writeProofsCSVFromInterface(topProofs, now)
+
         // ----- Update current state + push to SSE --------------------------
         c.mu.Lock()
         c.current = doc

@@ -383,6 +383,73 @@ func readTcpRmem() (min, def, max int) {
         return
 }
 
+// writeProofsCSVFromInterface takes the []interface{} from buildRecentProofRows
+// and writes each to proofs.csv.  Called from collect.go.
+func writeProofsCSVFromInterface(proofs []interface{}, now int64) {
+        if len(proofs) == 0 {
+                return
+        }
+        dedupMu.Lock()
+        defer dedupMu.Unlock()
+
+        writeCSVHeaderIfEmpty(proofsCSVPath, proofsCSVHeader())
+        f, err := os.OpenFile(proofsCSVPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+        if err != nil {
+                return
+        }
+        defer f.Close()
+
+        for _, p := range proofs {
+                row, ok := p.(map[string]interface{})
+                if !ok {
+                        continue
+                }
+                ts, _ := row["boot_ts"].(float64)
+                alg, _ := row["alg"].(string)
+                mbps, _ := row["mbps"].(float64)
+                tier, _ := row["tier"].(string)
+                dest, _ := row["dest"].(string)
+                // Convert tier label back to numeric for CSV
+                tierNum := "1"
+                if tier == "proved" {
+                        tierNum = "2"
+                }
+                // Compute rate_bps from mbps
+                rateBps := int64(mbps * bpsToMbps)
+                // We don't have the cookie string in the row — use a hash of ts+alg
+                // for dedup.  The cookie was used for parsing but isn't in the output.
+                // Use ts as the dedup key since each proof event has a unique ts.
+                cookieFake := int64(ts)
+                if writtenProofs[cookieFake] == nil {
+                        writtenProofs[cookieFake] = map[float64]bool{}
+                }
+                if writtenProofs[cookieFake][ts] {
+                        continue
+                }
+                writtenProofs[cookieFake][ts] = true
+
+                if len(writtenProofs[cookieFake]) > 1000 {
+                        for k := range writtenProofs[cookieFake] {
+                                if k < ts-3600 {
+                                        delete(writtenProofs[cookieFake], k)
+                                }
+                        }
+                }
+
+                csvRow := []string{
+                        strconv.FormatInt(now, 10),
+                        strconv.FormatFloat(ts, 'f', 6, 64),
+                        strconv.FormatInt(cookieFake, 10),
+                        alg,
+                        strconv.FormatInt(rateBps, 10),
+                        strconv.FormatFloat(mbps, 'f', 1, 64),
+                        tierNum,
+                        dest,
+                }
+                f.WriteString(strings.Join(csvRow, ",") + "\n")
+        }
+}
+
 // ============================================================================
 // writeProofsCSV — one row per NEW proof event (deduplicated)
 //
