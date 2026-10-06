@@ -203,11 +203,17 @@ fi
 # Truth file checks
 TRUTH="/var/lib/bpftune/history/swapscore_truth.jsonl"
 if [ -f "$TRUTH" ]; then
-    TOTAL=$(wc -l < "$TRUTH")
-    IPV6=$(grep -c '"dest":"[^"]*:' "$TRUTH" 2>/dev/null || echo 0)
+    TOTAL=$(wc -l < "$TRUTH" | tr -d ' ')
+    # grep -c returns exit code 1 when count is 0, which under `set -e`
+    # would fail the script. Use `|| true` to swallow the exit code,
+    # then default to 0 if empty (the `|| echo 0` form was producing
+    # "0\n0" multi-line values that broke `[ -gt 0 ]`).
+    IPV6=$(grep -c '"dest":"[^"]*:' "$TRUTH" 2>/dev/null || true)
+    IPV6=${IPV6:-0}
+    IPV6=$(echo "$IPV6" | head -1)
     echo "  truth file rows:    $TOTAL"
     echo "  IPv6 truth rows:    $IPV6  (was 0 before v0.9.0)"
-    if [ "$IPV6" -gt 0 ]; then
+    if [ "$IPV6" -gt 0 ] 2>/dev/null; then
         ok "IPv6 swaps now being tracked (the dashboard v0.9.0 fix is working)"
     else
         warn "no IPv6 truth rows yet — may take a few minutes for IPv6 traffic to swap"
