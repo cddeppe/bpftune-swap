@@ -1,3 +1,20 @@
+bpftune (0.4.96) unstable; urgency=medium
+
+  * Fix: skip passive (incoming) connections in the vote path too.
+    v0.4.92 added the `if (statep->swap_target == 0xff) return 1;`
+    check to the active_estab function (line 380) but FORGOT to add
+    it to the vote function (bpftune_conn_tuner_vote, line 714+).
+    Result: passive connections (incoming requests to nginx, xray,
+    etc.) were still firing proof/srate/met/cwnd events without
+    ever having fired an estab event.  The dashboard's cookie→dest
+    map had no entry for these cookies, so proofs showed up with
+    empty dest (the user-reported "no dest labels" bug).
+  * The close path (STATE_CB) is still allowed through so the
+    proof counters (sockets_good, sockets_proved) get decremented
+    on socket close — matching the v0.4.44 behavior.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Tue, 06 Oct 2026 04:30:00 +0200
+
 bpftune (0.4.95) unstable; urgency=medium
 
   * Fix: skip RFC 1918 private IPv4 ranges (10.0.0.0/8, 172.16.0.0/12,

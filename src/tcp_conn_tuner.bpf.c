@@ -908,6 +908,17 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     statep = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
     if (!statep)
         return 1;
+    /* 0.4.96: skip all tracking for passive (incoming) connections in
+     * the vote path too.  v0.4.92 added this check to active_estab
+     * (line 380) but forgot to add it here — so passive connections
+     * were still firing proof/srate/met events without ever having
+     * fired an estab event.  Result: proofs showed up in the dashboard
+     * with empty dest (no estab = no cookie→dest mapping).
+     *
+     * The close path (STATE_CB) is still allowed through so the
+     * proof counters get decremented on socket close. */
+    if (!is_close && statep->swap_target == 0xff)
+        return 1;
         /* 0.4.44: decrement proof counters once per socket.
          * Only runs on STATE_CB close (is_close).  Placed before the
          * METRIC_MIN_SEGS / origin-facing early returns below so that
