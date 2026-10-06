@@ -382,6 +382,15 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 
     if (!sk)
         return 1;
+    /* 0.4.94: detect IPv4-mapped IPv6 (::ffff:0:0/96) — happens when a
+     * dual-stack AF_INET6 socket (the Linux default with IPV6_V6ONLY=0)
+     * connects to an IPv4 peer.  Without this, v4-in-v6 connections
+     * bypass the AF_INET path and get bucketed under ::/32 (all-zero
+     * after prefix6 masking), lumping every v4 peer into a single
+     * useless bucket.  Fold to v4 here so the same peer shares its
+     * bucket regardless of which socket family the app used. */
+    bool is_v4_mapped = false;
+    __u32 v4_addr_from_v6 = 0;
     if (ops->family == AF_INET) {
         __u32 ip4 = bpf_ntohl(ops->remote_ip4);
         if ((ip4 & 0xff000000) == 0x7f000000) return 1;
@@ -389,6 +398,16 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     } else if (ops->family == AF_INET6) {
         if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 && ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1)) return 1;
         if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return 1;
+        /* 0.4.94: IPv4-mapped IPv6 (::ffff:a.b.c.d).  remote_ip6[2]
+         * in network byte order is 0xffff0000 when read as __u32,
+         * but we compare against bpf_htonl(0xffff) which is the
+         * network-byte-order form of 0x0000ffff.  Both are equal on
+         * any endian CPU because bpf_htonl handles the swap. */
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+            ops->remote_ip6[2] == bpf_htonl(0xffff)) {
+            is_v4_mapped = true;
+            v4_addr_from_v6 = ops->remote_ip6[3];
+        }
     }
     switch (ops->family) {
     case AF_INET:
@@ -398,12 +417,21 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
         key->s6_addr32[3] = ops->remote_ip4;
         break;
     case AF_INET6:
-        /* 0.4.79: keep the full address; bucket_key_apply_prefix()
-         * masks to the configured prefix6 (default 32 = the old /32). */
-        key->s6_addr32[0] = ops->remote_ip6[0];
-        key->s6_addr32[1] = ops->remote_ip6[1];
-        key->s6_addr32[2] = ops->remote_ip6[2];
-        key->s6_addr32[3] = ops->remote_ip6[3];
+        if (is_v4_mapped) {
+            /* 0.4.94: route v4-in-v6 through the v4 bucket path so
+             * the same peer shares a bucket regardless of socket
+             * family.  bucket_key_apply_prefix will use prefix4
+             * (default /16) since s6_addr32[2] is 0xffff. */
+            key->s6_addr32[2] = bpf_htonl(0xffff);
+            key->s6_addr32[3] = v4_addr_from_v6;
+        } else {
+            /* 0.4.79: keep the full address; bucket_key_apply_prefix()
+             * masks to the configured prefix6 (default 32 = the old /32). */
+            key->s6_addr32[0] = ops->remote_ip6[0];
+            key->s6_addr32[1] = ops->remote_ip6[1];
+            key->s6_addr32[2] = ops->remote_ip6[2];
+            key->s6_addr32[3] = ops->remote_ip6[3];
+        }
         break;
     default:
         return 1;
@@ -427,9 +455,13 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
                 remote_host->metrics[forced].metric_value = ~((__u64)0);
             } else {
                 if (bpftune_debug)
+                /* 0.4.94: for v4-in-v6 connections, ops->remote_ip4 is 0
+                 * (the kernel only fills it for AF_INET).  Log the v4
+                 * address we extracted from remote_ip6[3] instead so the
+                 * dashboard's cdest map gets the right dest= field. */
                 bpf_printk("estab cookie=%llu alg=%u forced=1 dest=%u dest6=%u dest6b=%u",
                            bpf_get_socket_cookie(ops), (__u32)forced,
-                           (__u32)bpf_ntohl(ops->remote_ip4),
+                           is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
             }
             return 1;
@@ -493,7 +525,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
                 if (bpftune_debug)
                 bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
                            bpf_get_socket_cookie(ops), (__u32)s,
-                           (__u32)bpf_ntohl(ops->remote_ip4),
+                           is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
             }
         }
@@ -765,6 +797,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     if (!sk)
         return 1;
     tp = bpf_skc_to_tcp_sock(sk);
+    /* 0.4.94: detect IPv4-mapped IPv6 (see comment in active_estab path). */
+    bool is_v4_mapped = false;
+    __u32 v4_addr_from_v6 = 0;
     if (ops->family == AF_INET) {
         __u32 ip4 = bpf_ntohl(ops->remote_ip4);
         if ((ip4 & 0xff000000) == 0x7f000000) return 1;
@@ -772,6 +807,11 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     } else if (ops->family == AF_INET6) {
         if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 && ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1)) return 1;
         if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return 1;
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+            ops->remote_ip6[2] == bpf_htonl(0xffff)) {
+            is_v4_mapped = true;
+            v4_addr_from_v6 = ops->remote_ip6[3];
+        }
     }
     switch (ops->family) {
     case AF_INET:
@@ -780,12 +820,18 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         key->s6_addr32[3] = ops->remote_ip4;
         break;
     case AF_INET6:
-        /* 0.4.79: keep the full address; bucket_key_apply_prefix()
-         * masks to the configured prefix6 (default 32 = the old /32). */
-        key->s6_addr32[0] = ops->remote_ip6[0];
-        key->s6_addr32[1] = ops->remote_ip6[1];
-        key->s6_addr32[2] = ops->remote_ip6[2];
-        key->s6_addr32[3] = ops->remote_ip6[3];
+        if (is_v4_mapped) {
+            /* 0.4.94: route v4-in-v6 through the v4 bucket path. */
+            key->s6_addr32[2] = bpf_htonl(0xffff);
+            key->s6_addr32[3] = v4_addr_from_v6;
+        } else {
+            /* 0.4.79: keep the full address; bucket_key_apply_prefix()
+             * masks to the configured prefix6 (default 32 = the old /32). */
+            key->s6_addr32[0] = ops->remote_ip6[0];
+            key->s6_addr32[1] = ops->remote_ip6[1];
+            key->s6_addr32[2] = ops->remote_ip6[2];
+            key->s6_addr32[3] = ops->remote_ip6[3];
+        }
         break;
     default:
         return 1;
@@ -1365,7 +1411,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if (bpftune_debug)
                     bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=1 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                bpf_get_socket_cookie(ops), from_i, to_i,
-                               bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                               bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     if (bpftune_debug)
                     bpf_printk("swapctx cookie=%llu d=1 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
@@ -1393,7 +1439,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         fret = set_cong(ops, remote_host, tgt8);
                     if (bpftune_debug)
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
+                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
@@ -1443,7 +1489,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         if (bpftune_debug)
                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=2 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                    bpf_get_socket_cookie(ops), from_i, to_i,
-                                   (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                   (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                         if (bpftune_debug)
                         bpf_printk("swapctx cookie=%llu d=2 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
@@ -1471,7 +1517,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         fret = set_cong(ops, remote_host, tgt8);
                     if (bpftune_debug)
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
+                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
@@ -1521,7 +1567,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         if (bpftune_debug)
                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=3 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                    bpf_get_socket_cookie(ops), from_i, to_i,
-                                   (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                   (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                         if (bpftune_debug)
                         bpf_printk("swapctx cookie=%llu d=3 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
@@ -1551,7 +1597,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         fret = set_cong(ops, remote_host, tgt8);
                     if (bpftune_debug)
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, (__u32)bpf_ntohl(ops->remote_ip4),
+                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     if (bpftune_debug)
                     bpf_printk("swapctx cookie=%llu d=f cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
@@ -1633,7 +1679,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                                 if (bpftune_debug)
                                 bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=0 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
                                            bpf_get_socket_cookie(ops), from_i, to_i,
-                                           bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, (__u32)bpf_ntohl(ops->remote_ip4),
+                                           bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                                 if (bpftune_debug)
                                 bpf_printk("swapctx cookie=%llu d=0 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",

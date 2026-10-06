@@ -1,3 +1,23 @@
+bpftune (0.4.94) unstable; urgency=medium
+
+  * Fix: detect IPv4-mapped IPv6 (::ffff:0:0/96) connections and route
+    them through the v4 bucket path. Without this, dual-stack AF_INET6
+    sockets (the Linux default with IPV6_V6ONLY=0) connecting to an
+    IPv4 peer would get bucketed under ::/32 (all-zero after prefix6
+    masking), lumping every v4 peer into a single useless bucket.
+    Now the same peer shares its bucket regardless of which socket
+    family the app used.
+  * Fix: all 9 bpf_printk sites that emit dest= now log the correct
+    v4 address for v4-in-v6 connections (was 0 because the kernel
+    only fills ops->remote_ip4 for AF_INET, not for v4-in-v6).
+  * Dashboard v0.9.0 (separate commit on dashboard branch) provides
+    full IPv6 dest6b support + cookie→dest persistence to fix the
+    "proofs show dash" bug. The BPF side already emitted dest6b
+    correctly since v0.4.83; this commit closes the loop on the
+    kernel side for v4-in-v6.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Tue, 06 Oct 2026 01:30:00 +0200
+
 bpftune (0.4.93) unstable; urgency=medium
 
   * Fix: clear stale swap_target=0xff on socket reuse. When a socket was
