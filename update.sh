@@ -276,6 +276,15 @@ print(candidates[0][1])
         ok "frontend files synced"
 
         # --- 2d. Start/restart Go collector ---
+        # v0.9.8: remove --collector-mode flag from service file since
+        # lean is now the default in the binary.
+        SERVICE_FILE="/etc/systemd/system/bpftune-collector-go.service"
+        if [ -f "$SERVICE_FILE" ]; then
+            if grep -q "collector-mode" "$SERVICE_FILE" 2>/dev/null; then
+                sed -i 's/ --collector-mode=[a-z]*//g' "$SERVICE_FILE"
+                systemctl daemon-reload
+            fi
+        fi
         systemctl restart bpftune-collector-go 2>/dev/null || systemctl start bpftune-collector-go 2>/dev/null || true
         sleep 5
 
