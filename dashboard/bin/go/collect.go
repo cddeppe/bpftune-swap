@@ -197,6 +197,25 @@ func (c *Collector) collect() {
         // writeTruthRows.  The in-CSV write at csv_writer.go:247 is the
         // single source of truth now.
         writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
+        // v0.9.24: write midsamp.csv from parsed events (was never called!)
+        // midsamp.csv is the fallback for the rate progression panel
+        // when the live log has no midsamp events. Without this call,
+        // midsamp.csv was only populated by the one-time backfill on
+        // first startup, and empty after a reboot with cleared logs.
+        if len(pl.MidsampRows) > 0 {
+                midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
+                for _, mr := range pl.MidsampRows {
+                        midsampEvents = append(midsampEvents, midsampEvent{
+                                Ts:     float64(now),
+                                Thr:    mr.Thr,
+                                Srate:  mr.Srate,
+                                Rport:  mr.Rport,
+                                Alg:    -1,  // not available in midsampRow
+                                Cookie: 0,   // not available in midsampRow
+                        })
+                }
+                writeMidsampCSV(midsampEvents, now)
+        }
 
         // v0.9.5: write proofs.csv for the recent-proofs panel fallback
         writeProofsCSVFromInterface(topProofs, now)
