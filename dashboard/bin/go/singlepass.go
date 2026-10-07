@@ -405,7 +405,14 @@ func (pl *parsedLog) GetProofRows(cdest map[string]cdestEntry) []interface{} {
                         "dest":    dest,
                 })
         }
-        pl.proofRowsCache = reverse(out)
+        // v0.9.16: sort by boot_ts descending (newest-first).
+        // Was: reverse(out) — same bug as buildRecentSwapRows.
+        sort.Slice(out, func(i, j int) bool {
+                ti, _ := out[i].(map[string]interface{})["boot_ts"].(float64)
+                tj, _ := out[j].(map[string]interface{})["boot_ts"].(float64)
+                return ti > tj
+        })
+        pl.proofRowsCache = out
         return pl.proofRowsCache
 }
 

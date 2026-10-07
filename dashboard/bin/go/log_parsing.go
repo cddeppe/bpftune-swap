@@ -345,8 +345,19 @@ func buildRecentSwapRows(swaps []swapRow,
                 }
                 rows = append(rows, row)
         }
-        // Newest-first (matches data_recent_swaps 0.4.90 contract).
-        return reverse(rows)
+        // v0.9.16: sort by boot_ts descending (newest-first).
+        // Was: reverse(rows) — but readLogTail reads files newest-first
+        // by mtime, and within each file lines are chronological.
+        // So the combined text is [newer_file (oldest→newest)] +
+        // [older_file (oldest→newest)] — NOT globally chronological.
+        // reverse() gave [older_newest, older_oldest, newer_newest,
+        // newer_oldest] = wrong order. Sort fixes it properly.
+        sort.Slice(rows, func(i, j int) bool {
+                ti, _ := rows[i].(map[string]interface{})["boot_ts"].(float64)
+                tj, _ := rows[j].(map[string]interface{})["boot_ts"].(float64)
+                return ti > tj
+        })
+        return rows
 }
 
 // ============================================================================
