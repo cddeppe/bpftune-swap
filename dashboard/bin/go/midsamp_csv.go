@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // midsampCSVPath is set in csv_writer.go's var block (added by v0.9.7).
@@ -242,15 +243,11 @@ func backfillProofsFromLog(text string, cdest map[string]cdestEntry) {
 	if len(allProofs) == 0 {
 		return
 	}
-	// writeProofsCSVFromInterface handles dedup via writtenProofs
-	now := int64(0)
-	if len(allProofs) > 0 {
-		if first, ok := allProofs[0].(map[string]interface{}); ok {
-			if ts, ok := first["boot_ts"].(float64); ok {
-				now = int64(ts)
-			}
-		}
-	}
+	// v0.9.21: use wall-clock epoch time, NOT boot_ts (BPF ktime).
+	// The old code set now = boot_ts (e.g., 734) which was written
+	// as collected_ts in the CSV. This caused the frontend's epoch_ts
+	// age calculation to show "20734d" instead of the correct age.
+	now := time.Now().Unix()
 	writeProofsCSVFromInterface(allProofs, now)
 	fmt.Fprintf(os.Stderr, "[backfill] proofs.csv: wrote %d proofs from log tail\n", len(allProofs))
 }

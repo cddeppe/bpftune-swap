@@ -59,6 +59,12 @@ func readRecentSwapsFromCSV(n int) []interface{} {
                         continue
                 }
                 collectedTs, _ := strconv.ParseInt(fields[0], 10, 64)
+                // v0.9.21: sanity check — if collected_ts < 1e9 (before 2001),
+                // it's BPF ktime from the old backfill bug, not wall-clock epoch.
+                // Set to 0 so ageLabel skips it (returns empty, same as before).
+                if collectedTs > 0 && collectedTs < 1000000000 {
+                        collectedTs = 0
+                }
                 bootTs, _ := strconv.ParseFloat(fields[1], 64)
                 fromAlg := fields[3]
                 toAlg := fields[4]
@@ -128,6 +134,9 @@ func readRecentProofsFromCSV(n int) []interface{} {
                         continue
                 }
                 collectedTs, _ := strconv.ParseInt(fields[0], 10, 64)
+                if collectedTs > 0 && collectedTs < 1000000000 {
+                        collectedTs = 0
+                }
                 ts, _ := strconv.ParseFloat(fields[1], 64)
                 alg := fields[3]
                 mbps, _ := strconv.ParseFloat(fields[5], 64)
