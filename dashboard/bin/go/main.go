@@ -112,6 +112,8 @@ func (c *Collector) notifySSE() {
         //
         // The first cycle after startup (prevHashes == nil) sends the full
         // document. Subsequent cycles send only the delta.
+        newHashes := computeKeyHashes(current)
+
         if len(prevHashes) == 0 {
                 // Full document — first push or after reset
                 msg := map[string]interface{}{"__t": "f", "v": current}
@@ -123,6 +125,7 @@ func (c *Collector) notifySSE() {
                         default:
                         }
                 }
+                c.keyHashes = newHashes
                 c.mu.Unlock()
                 return
         }
@@ -130,19 +133,37 @@ func (c *Collector) notifySSE() {
         // Delta — only changed keys
         // JS protocol: {"__t":"d", "c":{changed keys}, "r":[removed keys]}
         delta := map[string]interface{}{}
+        var removed []string
         for k, v := range current {
-                data, _ := json.Marshal(v)
-                sum := md5.Sum(data)
-                hash := fmt.Sprintf("%x", sum)
-                if prev, ok := prevHashes[k]; !ok || prev != hash {
+                hash, ok := newHashes[k]
+                if !ok {
+                        continue
+                }
+                prev, existed := prevHashes[k]
+                if !existed || prev != hash {
                         delta[k] = v
                 }
         }
-        if len(delta) == 0 {
+        // Detect removed keys (in prevHashes but not in current)
+        for k := range prevHashes {
+                if _, exists := current[k]; !exists {
+                        removed = append(removed, k)
+                }
+        }
+
+        // Store new hashes for next cycle regardless of whether we sent anything
+        c.mu.Lock()
+        c.keyHashes = newHashes
+        c.mu.Unlock()
+
+        if len(delta) == 0 && len(removed) == 0 {
                 return // nothing changed
         }
 
         msg := map[string]interface{}{"__t": "d", "c": delta}
+        if len(removed) > 0 {
+                msg["r"] = removed
+        }
         data, _ := json.Marshal(msg)
 
         c.mu.Lock()
@@ -612,6 +633,9 @@ func main() {
         // COL-002 fix: write sentinel so Python renderer skips data/*.json writes
         _ = os.WriteFile("/var/run/bpftune-collector-go.active", []byte("1\n"), 0644)
 
+        // v0.9.10: initialize SQLite backend (migrates CSV on first run)
+        initSQLite()
+
         collector := NewCollector()
 
         // Synchronous first collect — current.json populated before HTTP starts.
@@ -654,10 +678,13 @@ func main() {
                 next := time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
                 time.Sleep(next.Sub(now))
                 collector.renderSlowToDisk()
+                // v0.9.10: prune SQLite rows older than 30 days daily
+                pruneSQLiteOld(30)
                 ticker := time.NewTicker(24 * time.Hour)
                 defer ticker.Stop()
                 for range ticker.C {
                         collector.renderSlowToDisk()
+                        pruneSQLiteOld(30)
                 }
         }()
 

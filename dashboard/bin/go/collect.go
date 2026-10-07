@@ -157,11 +157,24 @@ func (c *Collector) collect() {
         // real time-series from the ring buffer.
         rebuildBucketLiveFromRing(bucketLive, hosts, now)
 
-        // ----- Write CSV rows (write labeled form; reader trusts label) ----
+        // ----- Write CSV + SQLite rows (write labeled form; reader trusts label) ----
         // v0.9.9: throttle buckets.csv writes to every 2nd cycle (every ~60s
         // instead of ~30s). The ring buffer already captures 30s resolution
         // for the 1h chart, so the CSV only needs 60s resolution for the
         // 24h+ charts. Halves CSV write CPU and file growth.
+        //
+        // v0.9.10: dual-write to SQLite — SQLite gets every cycle (30s res),
+        // CSV gets every 2nd cycle (60s res for backward compat). Eventually
+        // CSV will be phased out.
+        if sqliteDB != nil {
+                rmemMin, rmemDef, rmemMax := readTcpRmem()
+                for _, h := range hosts {
+                        if h.Inst < 2 {
+                                continue
+                        }
+                        writeBucketSQLite(h, now, rmemMin, rmemDef, rmemMax)
+                }
+        }
         if cycleCount%2 == 0 {
                 writeBucketsCSV(hosts, now)
         }
@@ -196,9 +209,11 @@ func (c *Collector) collect() {
         })
 
         // ----- Update current state + push to SSE --------------------------
+        // v0.9.9 fix: do NOT update keyHashes here — notifySSE() computes
+        // new hashes and compares against the PREVIOUS cycle's hashes.
+        // If we update here, prevHashes == newHashes and delta is always empty.
         c.mu.Lock()
         c.current = doc
-        c.keyHashes = computeKeyHashes(doc)
         c.mu.Unlock()
 
         c.writeCurrentJSON()
