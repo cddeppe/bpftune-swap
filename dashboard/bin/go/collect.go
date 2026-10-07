@@ -92,7 +92,7 @@ func (c *Collector) collect() {
                 "bucket_live":      bucketLive,
                 "live_leaders":     liveLeaders,
                 "hostname":         readProc("/proc/sys/kernel/hostname"),
-                "now_mono":         pl.MaxTs,
+                "now_mono":         nowMono(pl.MaxTs),
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------

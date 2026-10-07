@@ -1298,6 +1298,17 @@ func readBPFClock(text string) float64 {
         return readProcUptime()
 }
 
+// nowMono returns the BPF clock, falling back to /proc/uptime when the
+// log tail is empty (e.g., just after rotation). This ensures the
+// frontend always has a valid now_mono for converting BPF ktime → epoch
+// timestamps in swaps_list, even when the log is temporarily empty.
+func nowMono(maxTs float64) float64 {
+        if maxTs > 0 {
+                return maxTs
+        }
+        return readProcUptime()
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -1363,6 +1374,11 @@ func contains(s []string, v string) bool {
 }
 
 func emptySwapOutcomes() map[string]interface{} {
+        // v0.9.11 fix: swaps_list goes at the TOP level (matching
+        // buildSwapOutcomes), not inside each ruler sub-map. The old
+        // code put swaps_list inside composite/srate/sustained, but
+        // the frontend reads swap_outcomes.swaps_list — so the
+        // swaps-per-bin chart showed no data when the log was empty.
         empty := map[string]interface{}{
                 "measurable": 0, "unmeasurable": 0,
                 "win": 0, "win_pct": 0.0,
@@ -1370,12 +1386,12 @@ func emptySwapOutcomes() map[string]interface{} {
                 "loss": 0, "loss_pct": 0.0,
                 "rescued": 0, "full_loss": 0, "open": 0,
                 "rescued_pct": 0.0, "full_loss_pct": 0.0, "open_pct": 0.0,
-                "swaps_list": []interface{}{},
         }
         return map[string]interface{}{
-                "composite": copyMap(empty),
-                "srate":     copyMap(empty),
-                "sustained": copyMap(empty),
+                "composite":  copyMap(empty),
+                "srate":      copyMap(empty),
+                "sustained":  copyMap(empty),
+                "swaps_list": []interface{}{},
         }
 }
 
