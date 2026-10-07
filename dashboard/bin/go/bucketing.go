@@ -498,7 +498,7 @@ func prefix6Value() int {
 }
 
 func explorePctValue() int {
-	n := explorePctHolder.get(explorePctPath, 100)
+	n := explorePctHolder.get(explorePctPath, 5)  // v0.9.22: match EXPLORE_PCT_DEFAULT in tcp_conn_tuner.h
 	if n < 0 || n > 100 {
 		return 100
 	}

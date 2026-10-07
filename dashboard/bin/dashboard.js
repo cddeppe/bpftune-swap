@@ -413,7 +413,12 @@
             metric: null,  // metric value not available in bucketDoc.last
             active: _re != null && _re > 0,
           };
-        }).filter(function (r) { return r.rate_ema != null; });
+        }).filter(function (r) { return r.rate_ema != null; })
+         .sort(function (a, b) {
+           // v0.9.22: sort by active desc, then score desc (matches Go backend)
+           if (a.active !== b.active) return a.active ? -1 : 1;
+           return (b.score || 0) - (a.score || 0);
+         });
       }
     }
     renderMetric(rows);

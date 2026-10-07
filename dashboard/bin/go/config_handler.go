@@ -66,19 +66,30 @@ func (c *Collector) handleConfig(w http.ResponseWriter, r *http.Request) {
 			n := toInt(v)
 			if n >= 0 && n <= 100 {
 				os.WriteFile(explorePctPath, []byte(fmt.Sprintf("%d", n)), 0644)
+				// v0.9.22: update BPF map LIVE (key=0, no daemon restart).
+				// The old code restarted bpftune, disrupting all sockets.
+				// Now the BPF program reads tuner_config_map[0] on every
+				// ESTABLISHED callback, so the change takes effect immediately
+				// on the next connection.
+				exec.Command("bpftool", "map", "update", "pinned",
+					"/sys/fs/bpf/bpftune/tcp_conn/explore",
+					"key", "hex", "00 00 00 00",
+					"value", "hex", fmt.Sprintf("%02x %02x %02x %02x",
+						byte(n), byte(n>>8), byte(n>>16), byte(n>>24))).Run()
 				changed = append(changed, "explore_pct")
 			}
 		}
 
+		// v0.9.22: proof_good_bps and proof_proved_bps are stored to file
+		// but NOT written to the BPF map (tuner_config_map only has 1 entry,
+		// key=0=explore_pct; keys 4 and 5 are out of bounds). These values
+		// are read by the BPF program from tuner_config_map slots 4 and 5,
+		// but the map is defined as max_entries=1 in the BPF program.
+		// TODO: expand tuner_config_map to 6 entries and add BPF readers.
 		if v, ok := req["proof_good_bps"]; ok {
 			n := toInt(v)
 			if n > 0 {
 				os.WriteFile(proofGoodBpsPath, []byte(fmt.Sprintf("%d", n)), 0644)
-				exec.Command("bpftool", "map", "update", "pinned",
-					"/sys/fs/bpf/bpftune/tcp_conn/explore",
-					"key", "hex", "04 00 00 00",
-					"value", "hex", fmt.Sprintf("%02x %02x %02x %02x",
-						byte(n), byte(n>>8), byte(n>>16), byte(n>>24))).Run()
 				changed = append(changed, "proof_good_bps")
 			}
 		}
@@ -86,11 +97,6 @@ func (c *Collector) handleConfig(w http.ResponseWriter, r *http.Request) {
 			n := toInt(v)
 			if n > 0 {
 				os.WriteFile(proofProvedBpsPath, []byte(fmt.Sprintf("%d", n)), 0644)
-				exec.Command("bpftool", "map", "update", "pinned",
-					"/sys/fs/bpf/bpftune/tcp_conn/explore",
-					"key", "hex", "05 00 00 00",
-					"value", "hex", fmt.Sprintf("%02x %02x %02x %02x",
-						byte(n), byte(n>>8), byte(n>>16), byte(n>>24))).Run()
 				changed = append(changed, "proof_proved_bps")
 			}
 		}
@@ -105,10 +111,9 @@ func (c *Collector) handleConfig(w http.ResponseWriter, r *http.Request) {
 		explorePctHolder.mtime = time.Time{}
 		explorePctHolder.mu.Unlock()
 
-		// Restart bpftune to pick up new config values (reads file on startup)
-		if len(changed) > 0 {
-			exec.Command("systemctl", "restart", "bpftune").Run()
-		}
+		// v0.9.22: do NOT restart bpftune — it disrupts all TCP sockets.
+		// explore_pct is now updated live via bpftool (see above).
+		// prefix4/prefix6 take effect on next bpftune restart (reboot/maintenance).
 
 		// Invalidate static files
 		staticFilesDirtyMu.Lock()
