@@ -29,6 +29,7 @@ package main
 import (
         "net"
         "sort"
+	"sync"
         "strconv"
         "strings"
 )
@@ -64,6 +65,21 @@ type midsampRow struct {
 
 // parseLogSinglePass does ONE pass over text and extracts everything.
 // This replaces the 9 separate strings.Split(text, "\n") scans.
+// bootUptimeCache caches /proc/uptime to avoid re-reading on every parse.
+var bootUptimeCache struct {
+	sync.Once
+	value float64
+}
+
+// getBootUptime returns /proc/uptime (seconds since boot).
+// Used to filter out events from previous boots.
+func getBootUptime() float64 {
+	bootUptimeCache.Do(func() {
+		bootUptimeCache.value = readProcUptime()
+	})
+	return bootUptimeCache.value
+}
+
 func parseLogSinglePass(text string) *parsedLog {
         pl := &parsedLog{
                 MetByCookie:  map[int64][]metEntry{},
@@ -91,6 +107,9 @@ func parseLogSinglePass(text string) *parsedLog {
 
                 // --- readBPFClock: extract max timestamp from any trace_pipe line ---
                 // This is the cheapest check — do it first for every line.
+                // v0.9.19: filter out events from previous boots.
+                // BPF ktime resets to 0 on kernel boot. If ktime > /proc/uptime,
+                // the event is from a PREVIOUS boot (stale log file). Skip it.
                 if idx := strings.Index(line, ": bpf_trace_printk:"); idx >= 0 {
                         start := idx
                         for start > 0 {
@@ -103,6 +122,11 @@ func parseLogSinglePass(text string) *parsedLog {
                         }
                         if start < idx {
                                 if ts, err := strconv.ParseFloat(line[start:idx], 64); err == nil {
+                                        uptime := getBootUptime()
+                                        if uptime > 0 && ts > uptime+300 {
+                                                // Event is from a previous boot (ktime > uptime + 5min margin)
+                                                continue
+                                        }
                                         if ts > pl.MaxTs {
                                                 pl.MaxTs = ts
                                         }
