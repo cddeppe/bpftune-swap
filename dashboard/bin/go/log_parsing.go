@@ -143,12 +143,14 @@ func buildLogPanels(swaps []swapRow,
         // ----- recent_swaps (newest-first, last 18) --------------------------
         allSwaps := buildRecentSwapRows(swaps, metByCookie, srateByCookie, cdest)
         topSwapsSlice := lastN(allSwaps, 18)
-        // v0.9.4: if the log tail has fewer than 18 swaps, fall back to
-        // swaps.csv so the panel always shows data (even after log rotation).
+        // v0.9.13: MERGE live + CSV instead of replacing. The old code
+        // did topSwapsSlice = csvSwaps which LOST all live swaps when
+        // the log had fewer than 18. Now we merge both sources, dedup
+        // by boot_ts+cookie, and take the newest 18.
         if len(topSwapsSlice) < 18 {
                 csvSwaps := readRecentSwapsFromCSV(18)
-                if len(csvSwaps) > len(topSwapsSlice) {
-                        topSwapsSlice = csvSwaps
+                if len(csvSwaps) > 0 {
+                        topSwapsSlice = mergeSwapsNewestFirst(topSwapsSlice, csvSwaps, 18)
                 }
         }
         topSwaps = topSwapsSlice
@@ -161,12 +163,11 @@ func buildLogPanels(swaps []swapRow,
                 allProofs = buildRecentProofRows(text, cdest)
         }
         topProofsSlice := lastN(allProofs, 18)
-        // v0.9.5: if the log tail has fewer than 18 proofs, fall back to
-        // proofs.csv so the panel always shows data (even after log rotation).
+        // v0.9.13: MERGE live + CSV instead of replacing.
         if len(topProofsSlice) < 18 {
                 csvProofs := readRecentProofsFromCSV(18)
-                if len(csvProofs) > len(topProofsSlice) {
-                        topProofsSlice = csvProofs
+                if len(csvProofs) > 0 {
+                        topProofsSlice = mergeProofsNewestFirst(topProofsSlice, csvProofs, 18)
                 }
         }
         topProofs = topProofsSlice
@@ -1418,3 +1419,74 @@ func emptyLogWindow() map[string]interface{} {
 // wrote to collector-go-state.json but was never called from anywhere,
 // creating the misleading impression that the cookie→dest map survived
 // restarts.  It did not.
+
+// ============================================================================
+// v0.9.13: merge helpers — combine live + CSV data, newest-first, deduped
+// ============================================================================
+
+// mergeSwapsNewestFirst merges two newest-first swap lists, deduplicates
+// by boot_ts+cookie, and returns the top N newest entries.
+func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
+	seen := make(map[string]bool)
+	var merged []interface{}
+	add := func(row interface{}) {
+		if m, ok := row.(map[string]interface{}); ok {
+			ts, _ := m["boot_ts"].(float64)
+			cookie, _ := m["dest"].(string)
+			key := fmt.Sprintf("%.3f:%s", ts, cookie)
+			if !seen[key] {
+				seen[key] = true
+				merged = append(merged, row)
+			}
+		}
+	}
+	for _, r := range live {
+		add(r)
+	}
+	for _, r := range csv {
+		add(r)
+	}
+	// Sort by boot_ts descending (newest first)
+	sort.Slice(merged, func(i, j int) bool {
+		ti, _ := merged[i].(map[string]interface{})["boot_ts"].(float64)
+		tj, _ := merged[j].(map[string]interface{})["boot_ts"].(float64)
+		return ti > tj
+	})
+	if len(merged) > n {
+		merged = merged[:n]
+	}
+	return merged
+}
+
+// mergeProofsNewestFirst merges two newest-first proof lists, deduplicates
+// by boot_ts+alg, and returns the top N newest entries.
+func mergeProofsNewestFirst(live, csv []interface{}, n int) []interface{} {
+	seen := make(map[string]bool)
+	var merged []interface{}
+	add := func(row interface{}) {
+		if m, ok := row.(map[string]interface{}); ok {
+			ts, _ := m["boot_ts"].(float64)
+			alg, _ := m["alg"].(string)
+			key := fmt.Sprintf("%.3f:%s", ts, alg)
+			if !seen[key] {
+				seen[key] = true
+				merged = append(merged, row)
+			}
+		}
+	}
+	for _, r := range live {
+		add(r)
+	}
+	for _, r := range csv {
+		add(r)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		ti, _ := merged[i].(map[string]interface{})["boot_ts"].(float64)
+		tj, _ := merged[j].(map[string]interface{})["boot_ts"].(float64)
+		return ti > tj
+	})
+	if len(merged) > n {
+		merged = merged[:n]
+	}
+	return merged
+}

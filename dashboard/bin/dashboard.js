@@ -2288,7 +2288,13 @@ _safeRender("score-now", function() { renderScoreNow(); });
     var safe = (id || "").replace(/[^A-Za-z0-9._-]/g, "_");
     return j("data/bucket_" + safe.replace(/:/g, "_") + ".json").then(function (doc) {
       state.bucketDoc = doc;
-      renderBucket();
+      // v0.9.13: only re-render from static file for ranges > 1h.
+      // For 1h, the live SSE data (state.bucketLive) is always fresher
+      // — re-rendering from the static file causes chart flicker.
+      var _rng = $("range") ? $("range").value : "1h";
+      if (_rng !== "1h" || !state.bucketLive || Object.keys(state.bucketLive).length === 0) {
+        renderBucket();
+      }
       renderNow();
       renderRecentSwapsForBucket();
       renderMetricForBucket();
