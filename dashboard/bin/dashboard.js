@@ -115,6 +115,19 @@
   }
 
   function renderBuild(b) {
+    // v0.9.10 fix: check focus BEFORE setHTML destroys the inputs.
+    // The old E2-fix checked focus AFTER setHTML, by which point the
+    // inputs were already gone and document.activeElement was <body>.
+    // Now we skip the entire rebuild if any config input has focus.
+    var _cfgIds = ['cfg-p4', 'cfg-p6', 'cfg-ep', 'cfg-pg', 'cfg-pp'];
+    var _activeEl = document.activeElement;
+    for (var _ci = 0; _ci < _cfgIds.length; _ci++) {
+      var _el = document.getElementById(_cfgIds[_ci]);
+      if (_el && _el === _activeEl) {
+        // User is editing — skip the rebuild entirely.
+        return;
+      }
+    }
     var rows = [
       ["tuner",     b.version, "hi"],
       ["dashboard", b.dash_version || "?", "hi"],
@@ -1165,7 +1178,13 @@
     _safeRender('recent_proofs', function() { renderRecentProofs(_fdoc.recent_proofs || []); });
   }
 
-  function _fetchAndApplyLabels() {
+  var _lastLabelsFetch = 0;
+  function _fetchAndApplyLabels(force) {
+    // v0.9.10 fix: debounce — only fetch labels at most once per 5 minutes
+    // from SSE pushes. Labels rarely change, and fetching on every 30s
+    // push was wasteful. Use force=true after a label edit to bypass.
+    if (!force && Date.now() - _lastLabelsFetch < 300000) return;
+    _lastLabelsFetch = Date.now();
     fetch('/api/labels', {cache: 'no-store'}).then(function(r) { return r.json(); }).then(function(ld) {
       window.__labels = ld.labels || {};
       // 0.4.123: build a /16 -> label index so a bucket id like
@@ -1425,9 +1444,6 @@
       var _bad = _top.bad || 0;
       var _nul = _top.null || 0;
       var _pen = 16 + _bad * 4 + _nul * 2;
-      var _st = (16/_pen).toFixed(3);
-      if (_bad > 0) _st += " b=" + _bad;
-      if (_nul > 0) _st += " n=" + _nul;
       var _st = (16/_pen).toFixed(3);
       if (_bad > 0) _st += " b=" + _bad;
       if (_nul > 0) _st += " n=" + _nul;
@@ -1975,7 +1991,9 @@
 
   function renderScoreNow() {
     if (!state.meta) return;
-    var rng = $("range").value;
+    var _rs = $("range");
+    if (!_rs) return;
+    var rng = _rs.value;
     var bid = $("bucket") ? $("bucket").value : null;
     if (!bid || bid === "all") { var hb = _heaviestBucketWithCoverage(); if (hb) bid = hb.bid; }
     var s = null, ts = null;
@@ -2155,6 +2173,17 @@
     }
     if (!d) { var doc = state.swaps; d = doc ? doc[rng] : null; }
     if (!d) return;
+    // v0.9.10 fix: set axis globals for this path too — renderScoreNow and
+    // renderDivChart read them via timeOpts(). Without this, they'd use
+    // stale axis values from a previous renderBucket/renderSwaps call.
+    var _fa = buildFixedAxis(rng);
+    if (_fa && d.ts && d.ts.length) {
+      window.__chart_axis_min = _fa.ts[0] * 1000;
+      window.__chart_axis_max = _fa.ts[_fa.ts.length - 1] * 1000;
+    } else {
+      window.__chart_axis_min = undefined;
+      window.__chart_axis_max = undefined;
+    }
     var ts = d.ts;
 
     mk("swaps", {
@@ -2629,27 +2658,33 @@ function _populateBucketSelect(desiredBucket) {
   // and the blur listener (per-input blur) can call it. Eliminates
   // the silent-failure mode where input.blur() was a no-op because
   // the input didn't have focus.
-  function _le_do_rename(input, newLabel, oldLabel) {
+  // v0.9.10 fix: use async/await with Promise.all to guarantee ordering.
+  // The old fire-and-forget approach could execute set-before-clear on a
+  // slow server, leaving labels cleared instead of renamed.
+  async function _le_do_rename(input, newLabel, oldLabel) {
     var ips;
     try { ips = JSON.parse(decodeURIComponent(input.getAttribute('data-ips') || '[]')); }
     catch (e) { ips = []; }
     if (!ips.length) return;
-    ips.forEach(function(ip) {
-      fetch('/api/labels', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ip: ip, label: ''})});
-    });
-    setTimeout(function() {
-      ips.forEach(function(ip) {
-        fetch('/api/labels', {method:'POST', headers:{'Content-Type':'application/json'},
+    try {
+      // Phase 1: clear all labels (wait for ALL to complete)
+      await Promise.all(ips.map(function(ip) {
+        return fetch('/api/labels', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ip: ip, label: ''})});
+      }));
+      // Phase 2: set new label on all IPs (wait for ALL to complete)
+      await Promise.all(ips.map(function(ip) {
+        return fetch('/api/labels', {method:'POST', headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ip: ip, label: newLabel})});
-      });
-      setTimeout(function() {
-        fetch('/api/labels').then(function(r){return r.json()}).then(function(d){
-          _le_render(d.labels || {}, d.groups || {});
-          if (window.__liveFetch) window.__liveFetch();
-        });
-      }, 300);
-    }, 300);
+      }));
+      // Phase 3: refresh labels from server
+      var r = await fetch('/api/labels');
+      var d = await r.json();
+      _le_render(d.labels || {}, d.groups || {});
+      if (window.__liveFetch) window.__liveFetch();
+    } catch (e) {
+      console.error('rename failed:', e);
+    }
   }
   function saveLabel(ip, label) {
     fetch('/api/labels', {method:'POST', headers:{'Content-Type':'application/json'},
