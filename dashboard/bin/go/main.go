@@ -103,10 +103,46 @@ func computeKeyHashes(doc map[string]interface{}) map[string]string {
 func (c *Collector) notifySSE() {
         c.mu.RLock()
         current := c.current
+        prevHashes := c.keyHashes
         c.mu.RUnlock()
 
-        // v0.7.5m: marshal ONCE, send to all clients
-        msg := map[string]interface{}{"__t": "f", "v": current}
+        // v0.9.9: SSE delta encoding — only send keys whose MD5 hash changed
+        // since the last cycle. Most cycles only generated_ts, bucket_live,
+        // and maybe recent_swaps change. Cuts SSE payload by ~80%.
+        //
+        // The first cycle after startup (prevHashes == nil) sends the full
+        // document. Subsequent cycles send only the delta.
+        if len(prevHashes) == 0 {
+                // Full document — first push or after reset
+                msg := map[string]interface{}{"__t": "f", "v": current}
+                data, _ := json.Marshal(msg)
+                c.mu.Lock()
+                for client := range c.sseClients {
+                        select {
+                        case client <- data:
+                        default:
+                        }
+                }
+                c.mu.Unlock()
+                return
+        }
+
+        // Delta — only changed keys
+        // JS protocol: {"__t":"d", "c":{changed keys}, "r":[removed keys]}
+        delta := map[string]interface{}{}
+        for k, v := range current {
+                data, _ := json.Marshal(v)
+                sum := md5.Sum(data)
+                hash := fmt.Sprintf("%x", sum)
+                if prev, ok := prevHashes[k]; !ok || prev != hash {
+                        delta[k] = v
+                }
+        }
+        if len(delta) == 0 {
+                return // nothing changed
+        }
+
+        msg := map[string]interface{}{"__t": "d", "c": delta}
         data, _ := json.Marshal(msg)
 
         c.mu.Lock()
@@ -533,10 +569,10 @@ func main() {
         // v0.7.3: configurable ring buffer cap.  Default 120 = 1h at 30s.
         // For servers with more buckets, use 60 (30min) to save memory.
         ringCapFlag := flag.Int("ring-cap", 120, "ring buffer entries per bucket (120=1h, 60=30min, 240=2h)")
-	collectorModeFlag := flag.String("collector-mode", "lean", "collector mode: lean|normal|debug")
+        collectorModeFlag := flag.String("collector-mode", "lean", "collector mode: lean|normal|debug")
         flag.Parse()
-	collectorMode = parseCollectorMode(*collectorModeFlag)
-	fmt.Fprintf(os.Stderr, "collector: mode=%s interval=%s logTail=%dMB\n", collectorMode.Name, collectorMode.CollectInterval, collectorMode.LogTailBytes/1_000_000)
+        collectorMode = parseCollectorMode(*collectorModeFlag)
+        fmt.Fprintf(os.Stderr, "collector: mode=%s interval=%s logTail=%dMB\n", collectorMode.Name, collectorMode.CollectInterval, collectorMode.LogTailBytes/1_000_000)
 
         // v0.7.3: set ring buffer cap
         ringCap = *ringCapFlag

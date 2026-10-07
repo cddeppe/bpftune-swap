@@ -134,6 +134,12 @@ func buildLogPanels(swaps []swapRow,
                         emptyLogWindow(), []interface{}{}
         }
 
+        // v0.9.9: use single-pass parsed data if available via the
+        // package-level parsedLog pointer. Set by collect() before calling
+        // buildLogPanels. Falls back to the old multi-scan path if nil
+        // (e.g. in tests).
+        pl := currentParsedLog
+
         // ----- recent_swaps (newest-first, last 18) --------------------------
         allSwaps := buildRecentSwapRows(swaps, metByCookie, srateByCookie, cdest)
         topSwapsSlice := lastN(allSwaps, 18)
@@ -148,7 +154,12 @@ func buildLogPanels(swaps []swapRow,
         topSwaps = topSwapsSlice
 
         // ----- recent_proofs (newest-first, last 18) --------------------------
-        allProofs := buildRecentProofRows(text, cdest)
+        var allProofs []interface{}
+        if pl != nil {
+                allProofs = pl.GetProofRows(cdest)
+        } else {
+                allProofs = buildRecentProofRows(text, cdest)
+        }
         topProofsSlice := lastN(allProofs, 18)
         // v0.9.5: if the log tail has fewer than 18 proofs, fall back to
         // proofs.csv so the panel always shows data (even after log rotation).
@@ -184,7 +195,11 @@ func buildLogPanels(swaps []swapRow,
         }
 
         // ----- bucket_ips (all dest= occurrences, /16 or /32 grouped) ------
-        bucketIPs = buildBucketIPs(text)
+        if pl != nil {
+                bucketIPs = pl.GetBucketIPs()
+        } else {
+                bucketIPs = buildBucketIPs(text)
+        }
 
         // ----- log_window (oldest/newest swap ts, span, age) ----------------
         logWindow = buildLogWindow(swaps, topProofs)
@@ -193,8 +208,13 @@ func buildLogPanels(swaps []swapRow,
         // v0.9.7: ALWAYS merge CSV data into the leaderboard. The log tail
         // only covers a few hours; proofs.csv accumulates over days. We
         // merge both sources so the leaderboard shows full history.
-        logProofsRaw := buildProofsRaw(text)
-        csvProofsRaw := buildProofsRawFromCSV()
+        var logProofsRaw []interface{}
+        if pl != nil {
+                logProofsRaw = pl.GetProofsRaw()
+        } else {
+                logProofsRaw = buildProofsRaw(text)
+        }
+        csvProofsRaw := buildProofsRawFromCSVCached()
         if len(csvProofsRaw) > 0 {
                 proofsRaw = mergeProofsRaw(logProofsRaw, csvProofsRaw)
         } else {
@@ -203,6 +223,11 @@ func buildLogPanels(swaps []swapRow,
 
         return topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw
 }
+
+// currentParsedLog is set by collect() before calling buildLogPanels.
+// It allows buildLogPanels to use the single-pass parsed data instead
+// of re-scanning the log text. Nil in tests.
+var currentParsedLog *parsedLog
 
 // ============================================================================
 // parseSwapsMetsSrates — extract swap / met / srate events from text
@@ -1170,7 +1195,10 @@ func readLogTail(budget int64) string {
                 fj, _ := os.Stat(files[j])
                 return fi.ModTime().After(fj.ModTime())
         })
-        var chunks []string
+        // v0.9.9: use a strings.Builder with pooled buffer to reduce GC pressure.
+        // Was: var chunks []string + strings.Join — allocated a new []string
+        // slice and concatenated all chunks into one big string per cycle.
+        var sb strings.Builder
         remaining := budget
         for _, p := range files {
                 if remaining <= 0 {
@@ -1193,10 +1221,11 @@ func readLogTail(budget int64) string {
                 buf := make([]byte, take)
                 _, _ = f.Read(buf)
                 f.Close()
-                chunks = append(chunks, string(buf))
+                sb.Write(buf)
+                sb.WriteByte('\n')
                 remaining -= take
         }
-        return strings.Join(chunks, "\n")
+        return sb.String()
 }
 
 // readProcUptime returns /proc/uptime seconds (or 0 on error).

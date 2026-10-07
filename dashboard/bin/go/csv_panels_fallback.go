@@ -446,3 +446,25 @@ func mergeProofsRaw(logData, csvData []interface{}) []interface{} {
         })
         return out
 }
+
+// v0.9.9: lazy-load proofs.csv — cache the parsed result and only re-read
+// when the file's mtime changes. Most cycles the file hasn't been written
+// to yet (writes happen at the end of collect()).
+var (
+        proofsRawCache     []interface{}
+        proofsRawCacheMtime int64
+)
+
+func buildProofsRawFromCSVCached() []interface{} {
+        fi, err := os.Stat(proofsCSVPath)
+        if err != nil {
+                return []interface{}{}
+        }
+        mtime := fi.ModTime().Unix()
+        if proofsRawCache != nil && mtime == proofsRawCacheMtime {
+                return proofsRawCache
+        }
+        proofsRawCache = buildProofsRawFromCSV()
+        proofsRawCacheMtime = mtime
+        return proofsRawCache
+}

@@ -51,16 +51,20 @@ func (c *Collector) collect() {
         }
 
         // ----- Parse log tail ONCE for the entire cycle ---------------------
-        // All consumers below (recent_swaps, swap_outcomes, churn, divergence,
-        // writeSwapsCSV, writeSrateCSV) reuse these parsed results.
+        // v0.9.9: single-pass parser — eliminates 8 redundant strings.Split
+        // calls on the 2-16MB log tail. Was: parseSwapsMetsSrates +
+        // cookieDestMap + buildRecentProofRows + proofEvents +
+        // buildProofsRawEvents + buildRate + buildBucketIPs + readBPFClock
+        // = 9 scans × 237K lines = 2.1M allocations per cycle.
+        // Now: 1 scan, all data extracted into parsedLog struct.
         logText := readLogTail(collectorMode.LogTailBytes)
-        allSwaps, allMets, allSrates := parseSwapsMetsSrates(logText)
+        pl := parseLogSinglePass(logText)
+        allSwaps := pl.Swaps
+        allMets := pl.MetByCookie
+        allSrates := pl.SrateByCookie
         // v0.9.0: persist cookie→dest map across cycles so proofs with
         // cookies established before the 2 MB log tail still get a dest.
-        // Without this, recent_proofs rows for old cookies showed dest=""
-        // and rendered as a bare middot.  Also picks up dest6b from prior
-        // estab events for IPv6 connections (needed for /64 labels).
-        cdest := persistCookieDest(cookieDestMap(logText))
+        cdest := persistCookieDest(pl.Cdest)
 
         // ----- Build live buckets + metric_by_bucket + bucket_live ---------
         buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
@@ -88,10 +92,15 @@ func (c *Collector) collect() {
                 "bucket_live":      bucketLive,
                 "live_leaders":     liveLeaders,
                 "hostname":         readProc("/proc/sys/kernel/hostname"),
-                "now_mono":         readBPFClock(logText),
+                "now_mono":         pl.MaxTs,
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------
+        // v0.9.9: set currentParsedLog so buildLogPanels uses the single-pass
+        // parsed data instead of re-scanning text 4 more times.
+        currentParsedLog = pl
+        defer func() { currentParsedLog = nil }()
+
         topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText)
 
         // v0.7.6: streak writeback — patch BPF map bad_streak/null_streak from
@@ -103,7 +112,7 @@ func (c *Collector) collect() {
         doc["swap_outcomes"] = swapOutcomes
         doc["bucket_ips"] = bucketIPs
         doc["log_window"] = logWindow
-        doc["proofs_raw"] = buildProofsRawEvents(logText, cdest)
+        doc["proofs_raw"] = pl.GetProofsRawEvents(cdest)
         doc["proof"] = proofsRaw
 
         // ----- Other data panels (reuse parsed log results) ----------------
@@ -121,9 +130,10 @@ func (c *Collector) collect() {
         doc["churn"] = churnResult
         // v0.9.7: rate progression now falls back to midsamp.csv when the
         // log tail is sparse, so the panel always shows data after restart.
-        rateResult := buildRate(logText)
+        // v0.9.9: use single-pass parsed midsamp data instead of re-scanning text.
+        rateResult := pl.GetRate()
         if collectorMode.CSVFallback && len(rateResult) == 0 {
-                csvRate := buildRateFromCSV()
+                csvRate := buildRateFromCSVCached()
                 if len(csvRate) > 0 {
                         rateResult = csvRate
                 }
@@ -148,7 +158,13 @@ func (c *Collector) collect() {
         rebuildBucketLiveFromRing(bucketLive, hosts, now)
 
         // ----- Write CSV rows (write labeled form; reader trusts label) ----
-        writeBucketsCSV(hosts, now)
+        // v0.9.9: throttle buckets.csv writes to every 2nd cycle (every ~60s
+        // instead of ~30s). The ring buffer already captures 30s resolution
+        // for the 1h chart, so the CSV only needs 60s resolution for the
+        // 24h+ charts. Halves CSV write CPU and file growth.
+        if cycleCount%2 == 0 {
+                writeBucketsCSV(hosts, now)
+        }
         // v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
         // Mirrors Python _resolve_pending enrichment logic.
         enrichSwapsForCSV(allSwaps, allMets, allSrates, cdest)

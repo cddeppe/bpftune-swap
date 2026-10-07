@@ -257,3 +257,25 @@ func backfillProofsFromLog(text string, cdest map[string]cdestEntry) {
 
 // backfillDone prevents repeated backfill on every collect cycle.
 var backfillDone sync.Once
+
+// v0.9.9: lazy-load midsamp.csv — cache the parsed result and only re-read
+// when the file's mtime changes. Most cycles the file hasn't been written
+// to yet (writes happen at the end of collect()).
+var (
+        rateCSVCache     []interface{}
+        rateCSVCacheMtime int64
+)
+
+func buildRateFromCSVCached() []interface{} {
+        fi, err := os.Stat(midsampCSVPath)
+        if err != nil {
+                return []interface{}{}
+        }
+        mtime := fi.ModTime().Unix()
+        if rateCSVCache != nil && mtime == rateCSVCacheMtime {
+                return rateCSVCache
+        }
+        rateCSVCache = buildRateFromCSV()
+        rateCSVCacheMtime = mtime
+        return rateCSVCache
+}
