@@ -651,6 +651,7 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
                 }
                 out = append(out, map[string]interface{}{
                         "ts":                s.Ts,
+                        "boot_ts":           s.Ts, // v0.9.14: add boot_ts for merge sort
                         "cookie":            s.Cookie,
                         "dest":              s.Dest,
                         "outcome":           oc,
@@ -1429,9 +1430,22 @@ func emptyLogWindow() map[string]interface{} {
 func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
 	seen := make(map[string]bool)
 	var merged []interface{}
+	// getTs reads boot_ts, falling back to ts (v0.9.14 fix: live rows
+	// historically used "ts" while CSV rows used "boot_ts" — the merge
+	// sort read boot_ts for all rows, giving live rows a 0.0 timestamp
+	// and sorting them to the bottom).
+	getTs := func(m map[string]interface{}) float64 {
+		if ts, ok := m["boot_ts"].(float64); ok && ts > 0 {
+			return ts
+		}
+		if ts, ok := m["ts"].(float64); ok {
+			return ts
+		}
+		return 0
+	}
 	add := func(row interface{}) {
 		if m, ok := row.(map[string]interface{}); ok {
-			ts, _ := m["boot_ts"].(float64)
+			ts := getTs(m)
 			cookie, _ := m["dest"].(string)
 			key := fmt.Sprintf("%.3f:%s", ts, cookie)
 			if !seen[key] {
@@ -1446,10 +1460,10 @@ func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
 	for _, r := range csv {
 		add(r)
 	}
-	// Sort by boot_ts descending (newest first)
+	// Sort by timestamp descending (newest first)
 	sort.Slice(merged, func(i, j int) bool {
-		ti, _ := merged[i].(map[string]interface{})["boot_ts"].(float64)
-		tj, _ := merged[j].(map[string]interface{})["boot_ts"].(float64)
+		ti := getTs(merged[i].(map[string]interface{}))
+		tj := getTs(merged[j].(map[string]interface{}))
 		return ti > tj
 	})
 	if len(merged) > n {
