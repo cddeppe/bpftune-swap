@@ -139,6 +139,11 @@ func (c *Collector) collect() {
                 }
         }
         doc["rate"] = rateResult
+        // v0.9.23: add rate_raw for bucket filtering in the frontend.
+        // proofs_raw already exists; rate_raw was missing, causing the
+        // rate progression panel to go empty when a specific bucket
+        // was selected (frontend's _filterByBucket looks for rate_raw).
+        doc["rate_raw"] = pl.GetRateRaw()
         divResult := buildDivergenceFromParsed(allSwaps, allMets, allSrates)
         if collectorMode.CSVFallback && len(allSwaps) < 50 {
                 csvDiv := buildDivergenceFromCSV(200)

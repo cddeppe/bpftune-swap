@@ -541,6 +541,21 @@ func (pl *parsedLog) GetProofsRawEvents(cdest map[string]cdestEntry) []interface
         return pl.proofsRawEventsCache
 }
 
+// GetRateRaw returns raw midsamp rows with dest field, for bucket filtering.
+// Each row has: thr, srate, rport, dest
+func (pl *parsedLog) GetRateRaw() []interface{} {
+        out := make([]interface{}, 0, len(pl.MidsampRows))
+        for _, mr := range pl.MidsampRows {
+                out = append(out, map[string]interface{}{
+                        "thr":   mr.Thr,
+                        "srate": mr.Srate,
+                        "rport": mr.Rport,
+                        "dest":  "",  // midsamp rows don't have dest in the log
+                })
+        }
+        return out
+}
+
 // GetRate returns the pre-computed rate progression panel.
 // Built once from pl.MidsampRows and cached.
 func (pl *parsedLog) GetRate() []interface{} {
