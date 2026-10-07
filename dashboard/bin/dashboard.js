@@ -61,14 +61,32 @@
   function setHTML(id, s) { var e = $(id); if (e) e.innerHTML = s; }
   /* 0.4.79: monotonic-age label for recent swaps / proofs. */
   var SERVER_NOW_MONO = 0;
-  function ageLabel(boot_ts) {
-    if (!boot_ts || !SERVER_NOW_MONO) return '';
-    var age = SERVER_NOW_MONO - boot_ts;
-    if (age < 0) return '';
-    if (age < 60)    return Math.round(age) + 's';
-    if (age < 3600)  return Math.round(age/60) + 'm';
-    if (age < 86400) return Math.round(age/3600) + 'h';
-    return Math.round(age/86400) + 'd';
+  // v0.9.20: ageLabel accepts optional epoch_ts (wall-clock).
+  // When boot_ts is from a PREVIOUS boot (age < 0), fall back to
+  // epoch_ts so ages display correctly after a reboot.
+  // Backward compat: if epoch_ts is missing, returns '' (same as before).
+  function ageLabel(boot_ts, epoch_ts) {
+    if (!boot_ts) return '';
+    if (SERVER_NOW_MONO) {
+      var age = SERVER_NOW_MONO - boot_ts;
+      if (age >= 0) {
+        if (age < 60)    return Math.round(age) + 's';
+        if (age < 3600)  return Math.round(age/60) + 'm';
+        if (age < 86400) return Math.round(age/3600) + 'h';
+        return Math.round(age/86400) + 'd';
+      }
+    }
+    // boot_ts is from a different boot (age < 0) — use epoch_ts
+    if (epoch_ts) {
+      var nowSec = Math.floor(Date.now() / 1000);
+      var eAge = nowSec - epoch_ts;
+      if (eAge < 0) return '';
+      if (eAge < 60)    return Math.round(eAge) + 's';
+      if (eAge < 3600)  return Math.round(eAge/60) + 'm';
+      if (eAge < 86400) return Math.round(eAge/3600) + 'h';
+      return Math.round(eAge/86400) + 'd';
+    }
+    return '';
   }
 
   function esc(s) {
@@ -675,7 +693,7 @@
         '<span class="flow">' + esc(r.alg) + '</span>' +
         '<span class="meta">' + destLabel +
           ' &middot; ' + r.mbps.toFixed(1) + ' Mb/s' +
-          (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
+          (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts, r.epoch_ts) : '') +
           '</span>' +
         '<span class="sp ' + r.tier + '">' + r.tier + '</span>' +
         '</div>';
@@ -759,7 +777,7 @@
           '<span class="arrow">&rarr;</span>' + esc(r.to_alg) + '</span>' +
         '<span class="meta">' + destLabel +
           ' &middot; d' + r.d +
-          (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts) : '') +
+          (r.boot_ts ? ' &middot; ' + ageLabel(r.boot_ts, r.epoch_ts) : '') +
           '</span>' +
         pill +
         '</div>';

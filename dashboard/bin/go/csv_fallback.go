@@ -58,6 +58,7 @@ func readRecentSwapsFromCSV(n int) []interface{} {
                 if len(fields) < 18 {
                         continue
                 }
+                collectedTs, _ := strconv.ParseInt(fields[0], 10, 64)
                 bootTs, _ := strconv.ParseFloat(fields[1], 64)
                 fromAlg := fields[3]
                 toAlg := fields[4]
@@ -73,6 +74,7 @@ func readRecentSwapsFromCSV(n int) []interface{} {
                 }
                 row := map[string]interface{}{
                         "boot_ts":           bootTs,
+                        "epoch_ts":          collectedTs,
                         "from_alg":          fromAlg,
                         "to_alg":            toAlg,
                         "d":                 d,
@@ -125,6 +127,7 @@ func readRecentProofsFromCSV(n int) []interface{} {
                 if len(fields) < 8 {
                         continue
                 }
+                collectedTs, _ := strconv.ParseInt(fields[0], 10, 64)
                 ts, _ := strconv.ParseFloat(fields[1], 64)
                 alg := fields[3]
                 mbps, _ := strconv.ParseFloat(fields[5], 64)
@@ -139,10 +142,11 @@ func readRecentProofsFromCSV(n int) []interface{} {
                         destLabel = dest
                 }
                 out = append(out, map[string]interface{}{
-                        "boot_ts": ts,
-                        "alg":     alg,
-                        "mbps":    mbps,
-                        "tier":    tierLabel,
+                        "boot_ts":  ts,
+                        "epoch_ts": collectedTs,
+                        "alg":      alg,
+                        "mbps":     mbps,
+                        "tier":     tierLabel,
                         "dest":    destLabel,
                 })
         }
