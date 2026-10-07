@@ -128,10 +128,16 @@ func buildLogPanels(swaps []swapRow,
         cdest map[string]cdestEntry, text string) (topSwaps, topProofs []interface{},
         swapOutcomes, bucketIPs, logWindow, proofsRaw interface{}) {
 
+        // v0.9.17: don't return early when text is empty — fall through
+        // to the CSV fallback paths below. The old code returned empty
+        // for everything, which meant the dashboard showed no data
+        // after log rotation, reboot, or log clearing.
         if text == "" {
-                return []interface{}{}, []interface{}{},
-                        emptySwapOutcomes(), map[string]interface{}{},
-                        emptyLogWindow(), []interface{}{}
+                // Still return empty for bucket_ips and proofsRaw (no log
+                // data to scan), but fall through for swaps/proofs which
+                // have CSV fallbacks below.
+                // Actually, just set text to empty and let the code below
+                // handle it — the CSV fallback triggers on len < 18.
         }
 
         // v0.9.9: use single-pass parsed data if available via the
