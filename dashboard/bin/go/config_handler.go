@@ -71,12 +71,16 @@ func (c *Collector) handleConfig(w http.ResponseWriter, r *http.Request) {
 				// Now the BPF program reads tuner_config_map[0] on every
 				// ESTABLISHED callback, so the change takes effect immediately
 				// on the next connection.
-				exec.Command("bpftool", "map", "update", "pinned",
-					"/sys/fs/bpf/bpftune/tcp_conn/explore",
+				// v0.9.25: check for errors instead of silently ignoring
+				if err := exec.Command("bpftool", "map", "update", "pinned",
+					"/sys/fs/bpftune/tcp_conn/explore",
 					"key", "hex", "00 00 00 00",
 					"value", "hex", fmt.Sprintf("%02x %02x %02x %02x",
-						byte(n), byte(n>>8), byte(n>>16), byte(n>>24))).Run()
-				changed = append(changed, "explore_pct")
+						byte(n), byte(n>>8), byte(n>>16), byte(n>>24))).Run(); err == nil {
+					changed = append(changed, "explore_pct")
+				} else {
+					changed = append(changed, "explore_pct (file only, BPF map update failed)")
+				}
 			}
 		}
 

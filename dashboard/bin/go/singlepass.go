@@ -30,6 +30,7 @@ import (
         "net"
         "sort"
 	"sync"
+	"time"
         "strconv"
         "strings"
 )
@@ -65,19 +66,26 @@ type midsampRow struct {
 
 // parseLogSinglePass does ONE pass over text and extracts everything.
 // This replaces the 9 separate strings.Split(text, "\n") scans.
-// bootUptimeCache caches /proc/uptime to avoid re-reading on every parse.
-var bootUptimeCache struct {
-	sync.Once
+// bootUptime caches /proc/uptime with a 30s TTL.
+// v0.9.25: was sync.Once (cached forever) — after 5 min, ALL new events
+// were filtered as "previous boot" because the cached uptime was stale.
+var bootUptime struct {
+	mu    sync.Mutex
 	value float64
+	ts    time.Time
 }
 
 // getBootUptime returns /proc/uptime (seconds since boot).
 // Used to filter out events from previous boots.
 func getBootUptime() float64 {
-	bootUptimeCache.Do(func() {
-		bootUptimeCache.value = readProcUptime()
-	})
-	return bootUptimeCache.value
+	bootUptime.mu.Lock()
+	defer bootUptime.mu.Unlock()
+	if time.Since(bootUptime.ts) < 30*time.Second {
+		return bootUptime.value
+	}
+	bootUptime.value = readProcUptime()
+	bootUptime.ts = time.Now()
+	return bootUptime.value
 }
 
 func parseLogSinglePass(text string) *parsedLog {

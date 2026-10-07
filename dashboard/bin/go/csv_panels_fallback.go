@@ -231,8 +231,8 @@ func buildProofsRawFromCSV() []interface{} {
                         provenMax = round1(float64(s.provenMax) / bpsToMbps)
                 }
                 if s.sampleN > 0 {
-                        sampledAvg = round1(float64(s.sampleSum) / float64(s.sampleN) / bpsToMbps)
-                        sampledMax = round1(float64(s.sampleMax) / bpsToMbps)
+                        sampledAvg = round1(float64(s.sampleSum) / float64(s.sampleN))  // v0.9.25: already Mbps
+                        sampledMax = round1(float64(s.sampleMax))  // v0.9.25: already Mbps
                 }
                 var samplesN interface{}
                 if s.sampleN > 0 {
@@ -422,8 +422,8 @@ func mergeProofsRaw(logData, csvData []interface{}) []interface{} {
                         provenMax = s.provenMax
                 }
                 if s.sampleN > 0 {
-                        sampledAvg = round1(float64(s.sampleSum) / float64(s.sampleN) / bpsToMbps)
-                        sampledMax = round1(float64(s.sampleMax) / bpsToMbps)
+                        sampledAvg = round1(float64(s.sampleSum) / float64(s.sampleN))  // v0.9.25: already Mbps
+                        sampledMax = round1(float64(s.sampleMax))  // v0.9.25: already Mbps
                 }
                 var samplesN interface{}
                 if s.sampleN > 0 {

@@ -76,7 +76,7 @@ func readBPFMap() ([]hostEntry, error) {
 		}
 		b := make([]int, 16)
 		for i, v := range addrBytes {
-			b[i] = int(v.(float64))
+			b[i] = toInt(v)  // v0.9.25: safe type assertion (was int(v.(float64)) which panics on nil)
 		}
 		var addr string
 		if b[10] == 0xff && b[11] == 0xff {

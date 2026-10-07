@@ -84,8 +84,6 @@ func (h *historyStore) addSnapshot(bucketID string, snap bucketSnapshot) {
                 h.raw[bucketID] = h.raw[bucketID][len(h.raw[bucketID])-ringCap:]
         }
 
-        h.cycleCount++
-
         // v0.7.3: save to disk every 10 cycles (5 min) for crash recovery.
         // No more bin5m/bin1h/bin6h — those were for 24h/7d/all which now
         // come from CSV.
@@ -210,6 +208,7 @@ func captureSnapshotsFromBPF(hosts []hostEntry, now int64) {
         // that haven't been seen in the BPF map for 5 cycles (~2.5 min).
         // This prevents the ring buffer from accumulating entries for
         // hundreds of dead hosts over weeks of operation.
+        hist.cycleCount++  // v0.9.25: increment once per cycle (was per-snapshot)
         if hist.cycleCount%5 == 0 {
                 hist.pruneDeadBuckets(hosts)
         }

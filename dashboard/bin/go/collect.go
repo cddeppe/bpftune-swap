@@ -42,6 +42,7 @@ import (
 // bucket_live, live_leaders) and CSV appends. This prevents the frontend
 // from freezing for 30+ seconds on a transient bpftool failure.
 func (c *Collector) collect() {
+        cycleCount++  // v0.9.25: increment cycle counter (was never incremented — throttle was dead)
         now := time.Now().Unix()
 
         hosts, err := readBPFMap()

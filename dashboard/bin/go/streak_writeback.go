@@ -138,7 +138,7 @@ func detectMask(mapID int) {
 		}
 		b := make([]byte, 16)
 		for i, v := range addrBytes {
-			b[i] = byte(int(v.(float64)))
+			b[i] = byte(toInt(v))
 		}
 		if b[10] == 0xff && b[11] == 0xff {
 			v4 = append(v4, append([]byte(nil), b[12:16]...))

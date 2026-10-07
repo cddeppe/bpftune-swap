@@ -227,11 +227,8 @@ func backfillMidsampFromLog(text string) {
 	if len(events) == 0 {
 		return
 	}
-	now := int64(0)
-	if len(events) > 0 {
-		// Use the latest event's boot_ts as "now" (approximate)
-		now = int64(events[len(events)-1].Ts)
-	}
+	// v0.9.25: use wall-clock epoch time, NOT boot_ts (BPF ktime).
+	now := time.Now().Unix()
 	writeMidsampCSV(events, now)
 	fmt.Fprintf(os.Stderr, "[backfill] midsamp.csv: wrote %d events from log tail\n", len(events))
 }
