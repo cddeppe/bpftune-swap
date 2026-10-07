@@ -53,7 +53,7 @@ func (c *Collector) collect() {
         // ----- Parse log tail ONCE for the entire cycle ---------------------
         // All consumers below (recent_swaps, swap_outcomes, churn, divergence,
         // writeSwapsCSV, writeSrateCSV) reuse these parsed results.
-        logText := readLogTail(logTailBytes)
+        logText := readLogTail(collectorMode.LogTailBytes)
         allSwaps, allMets, allSrates := parseSwapsMetsSrates(logText)
         // v0.9.0: persist cookie→dest map across cycles so proofs with
         // cookies established before the 2 MB log tail still get a dest.
@@ -110,7 +110,7 @@ func (c *Collector) collect() {
         // v0.9.6: fall back to CSVs when the log tail is sparse, so churn
         // and divergence panels always show data after a restart.
         churnResult := buildChurnFromParsed(allSwaps)
-        if len(allSwaps) < 50 {
+        if collectorMode.CSVFallback && len(allSwaps) < 50 {
                 csvChurn := buildChurnFromCSV(200)
                 csvTotal := toInt(csvChurn["total"])
                 logTotal := toInt(churnResult["total"])
@@ -122,7 +122,7 @@ func (c *Collector) collect() {
         // v0.9.7: rate progression now falls back to midsamp.csv when the
         // log tail is sparse, so the panel always shows data after restart.
         rateResult := buildRate(logText)
-        if len(rateResult) == 0 {
+        if collectorMode.CSVFallback && len(rateResult) == 0 {
                 csvRate := buildRateFromCSV()
                 if len(csvRate) > 0 {
                         rateResult = csvRate
@@ -130,7 +130,7 @@ func (c *Collector) collect() {
         }
         doc["rate"] = rateResult
         divResult := buildDivergenceFromParsed(allSwaps, allMets, allSrates)
-        if len(allSwaps) < 50 {
+        if collectorMode.CSVFallback && len(allSwaps) < 50 {
                 csvDiv := buildDivergenceFromCSV(200)
                 if len(csvDiv) > len(divResult) {
                         divResult = csvDiv
@@ -168,8 +168,6 @@ func (c *Collector) collect() {
         writeProofsCSVFromInterface(topProofs, now)
 
         // v0.9.7: write midsamp.csv for the rate progression panel fallback
-        midsampEvents := parseMidsampEvents(logText)
-        writeMidsampCSV(midsampEvents, now)
 
         // v0.9.7: one-time backfill from log tail on first collect cycle.
         // Parses the 16MB log tail and writes any proof/midsamp events
