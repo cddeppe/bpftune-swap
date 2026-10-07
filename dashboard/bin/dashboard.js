@@ -2069,7 +2069,42 @@
     // the <select>, so $("range") is null briefly.  Treat as "1h".
     var rng = $("range") ? $("range").value : "1h";
     var d = null;
-    if (state.bucketDoc && state.bucketDoc.series && state.bucketDoc.series[rng] && state.bucketDoc.series[rng].swaps) {
+    // v0.9.12: check SSE swaps_list FIRST for 1h range (freshest data).
+    // The old code checked static bucketDoc first, which meant stale
+    // CSV-derived data took priority over live SSE data. For 1h, the
+    // SSE swaps_list is always more current than the 5-min static file.
+    if (rng === "1h" && window.__current_doc && window.__current_doc.swap_outcomes && window.__current_doc.swap_outcomes.swaps_list && window.__current_doc.swap_outcomes.swaps_list.length > 0) {
+      var sse = window.__current_doc;
+      var sw = sse.swap_outcomes.swaps_list;
+      var now = (sse.generated_ts) || (Date.now()/1000);
+      var fixedAxis = buildFixedAxis(rng, now);
+      var monoOffset = (sse.now_mono && sse.now_mono > 0) ? (now - sse.now_mono) : 0;
+      if (fixedAxis) {
+        window.__chart_axis_min = fixedAxis.ts[0] * 1000;
+        window.__chart_axis_max = fixedAxis.ts[fixedAxis.ts.length - 1] * 1000;
+        var swapCounts = fixedAxis.ts.map(function(){return 0;});
+        sw.forEach(function(s) {
+          var t = (s.ts || 0) + monoOffset;
+          var fa = fixedAxis.ts;
+          if (t < fa[0] || t > fa[fa.length - 1]) return;
+          if (t <= fa[0]) { swapCounts[0]++; return; }
+          var hi = fa.length - 1;
+          if (t >= fa[hi]) { swapCounts[hi]++; return; }
+          var lo = 0;
+          while (lo < hi - 1) {
+            var mid = (lo + hi) >> 1;
+            if (fa[mid] <= t) lo = mid; else hi = mid;
+          }
+          if (Math.abs(t - fa[lo]) <= Math.abs(t - fa[hi])) {
+            swapCounts[lo]++;
+          } else {
+            swapCounts[hi]++;
+          }
+        });
+        d = {ts: fixedAxis.ts, swaps: swapCounts};
+      }
+    }
+    if (!d && state.bucketDoc && state.bucketDoc.series && state.bucketDoc.series[rng] && state.bucketDoc.series[rng].swaps) {
       var s2 = state.bucketDoc.series[rng];
       // 0.8.5: rebin onto the SAME fixed axis as renderBucket() so all
       // four charts share an identical x-axis. Was using raw s2.ts which
