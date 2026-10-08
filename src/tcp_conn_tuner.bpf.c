@@ -507,15 +507,11 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
             __u64 min2 = ~((__u64)0);
             for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
                 __u64 v = remote_host->metrics[i].metric_value;
-                /* Sentinel metrics (0 unset, ~0 poisoned) may win
-                 * the min loop here and be reported as minindex,
-                 * but both consumers check before writing: the
-                 * ESTABLISHED path requires metric_count > 0, and
-                 * the vote path tracker update is guarded by its
-                 * own v != 0 && v != ~0 test.  A skip filter here
-                 * blew the verifier to the 1M instruction limit
-                 * (16-way unrolled loop, unprovable ranges), so it
-                 * is intentionally omitted. */
+                /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
+                 * Was: treated as real value, causing best_v=~0, which
+                 * made the swap gate fire and swap everything to cubic. */
+                if (v == 0 || v == ~((__u64)0))
+                    continue;
                 if (v < metric_min) {
                     min2 = metric_min;
                     metric_min = v;
@@ -531,11 +527,15 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
              * a lower position without ever being promoted through the
              * pair.  No new variables — the loop already found minindex
              * and metric_min; we just persist them. */
-            if (remote_host->metrics[minindex].metric_count > 0) {
-                /* 0.4.89 (C1): seq-wrap the tracker update. */
+            if (remote_host->metrics[minindex].metric_count > 0 &&
+                metric_min != 0 && metric_min != ~((__u64)0)) {
                 __sync_fetch_and_add(&remote_host->seq, 1);
                 remote_host->best_i = minindex;
                 remote_host->best_v = metric_min;
+                __sync_fetch_and_add(&remote_host->seq, 1);
+            } else {
+                __sync_fetch_and_add(&remote_host->seq, 1);
+                remote_host->best_v = 0;
                 __sync_fetch_and_add(&remote_host->seq, 1);
             }
             {
@@ -1230,9 +1230,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
 
         __u8 mt_alt_i = 0;
 
-        __u8 swap_tgt = 0;
+        __u8 swap_tgt = 0xff;  /* v0.4.99: 0xff = no valid target (was 0 = cubic) */
 
-        if (remote_host->best_v != 0) {
+        if (remote_host->best_v != 0 && remote_host->best_v != ~((__u64)0)) {
             if (s != remote_host->best_i) {
                 /* Socket on non-leader: target the leader. */
                 __u8 bi = (__u8)(remote_host->best_i & (NUM_TCP_CONN_METRICS - 1));
@@ -1240,7 +1240,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     best_alt = remote_host->best_v;
                     best_alt_i = bi;
                 }
-            } else if (remote_host->second_v != 0) {
+            } else if (remote_host->second_v != 0 && remote_host->second_v != ~((__u64)0)) {
                 /* Socket on leader but leader struggling for THIS socket:
                  * target second-best.  Since second_v >= best_v, the
                  * 1.25x margin bar is naturally higher here, so this

@@ -560,7 +560,7 @@ static __always_inline void
 apply_swap_outcome(struct remote_host *rh, __u8 tgt, __u64 ratio_q)
 {
         __u16 cur16 = rh->metrics[tgt].swap_score;
-        __u32 cur32 = cur16 ? cur16 : SWAP_SCORE_NEUTRAL;
+        __u32 cur32 = cur16;  /* v0.4.99: do NOT reset 0 to neutral (was undoing loss demotion) */
 
         if (ratio_q >= 282) {
                 if (ratio_q >= cur32) {

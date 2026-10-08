@@ -950,6 +950,7 @@ retry:
                          * penalty still applies on top; a recovering algo climbs
                          * back when its bad_streak clears via the EMA-rise path. */
                         ss = r.metrics[j].swap_score;
+                        if (ss == 0) continue;  /* v0.4.99: skip zeroed scores */
                         weighted = rv * ss / SWAP_SCORE_NEUTRAL;
                         {
                             __u64 pen = 16
