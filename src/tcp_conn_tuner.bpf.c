@@ -1087,7 +1087,19 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
          * to reset anything -- each alg the socket has ever touched
          * keeps its own bit, and the close handler decrements them
          * all. */
-        if (!is_close) {
+        /* 0.4.100: gate proofs on touched_bitmap to prevent misattribution.
+         * touched_bitmap is set by set_cong() (line 287). It is 0 for
+         * passive connections that were never tuned — the passive-estab
+         * handler (line 356) creates statep but skips set_cong, leaving
+         * statep->state at 0 (cubic). Without this gate, passive sockets
+         * that pass the direction gate (data_segs_out >> data_segs_in)
+         * would emit proofs with alg=0 (cubic), misattributing their
+         * throughput to cubic and corrupting the cubic counter.
+         *
+         * The 0.4.97 revert restored proofs for passive connections, but
+         * those proofs were all wrong (alg=0). This gate restores
+         * correctness: only sockets that were actually tuned emit proofs. */
+        if (!is_close && statep->touched_bitmap != 0) {
                 __u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
                 if (rate_delivered >= get_proof_proved_bps() && !(statep->proved_bitmap & bit)) {
                         statep->proved_bitmap |= bit;
