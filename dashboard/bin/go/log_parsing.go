@@ -683,6 +683,8 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
 // ============================================================================
 
 func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{} {
+        uptime := readProcUptime()
+        nowEpoch := float64(time.Now().Unix())
         var lines []string
         for _, l := range strings.Split(text, "\n") {
                 if strings.Contains(l, "proof cookie=") {
@@ -730,11 +732,12 @@ func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{
                         }
                 }
                 out = append(out, map[string]interface{}{
-                        "boot_ts": ts,
-                        "alg":     algName(alg),
-                        "mbps":    round1(float64(rate) / bpsToMbps),
-                        "tier":    tierLabel,
-                        "dest":    dest,
+                        "boot_ts":  ts,
+                        "epoch_ts": int64(nowEpoch - uptime + ts),
+                        "alg":      algName(alg),
+                        "mbps":     round1(float64(rate) / bpsToMbps),
+                        "tier":     tierLabel,
+                        "dest":     dest,
                 })
         }
         return reverse(out)
