@@ -769,8 +769,8 @@
        * (T+60..T+300 after the swap). */
       var o = r.outcome_sustained || "";
       // v0.9.28: display no_post as "nopost" with faded style
-      var pillLabel = o === 'no_post' ? 'nopost' : o;
-      var pillClass = o === 'no_post' ? 'nopost' : o;
+      var pillLabel = o === 'no_post' ? 'no post' : o;
+      var pillClass = o === 'no_post' ? 'null' : o;  // reuse null pill style
       var pill = o
         ? '<span class="sp ' + pillClass + '">' + pillLabel + '</span>'
         : (function() {
