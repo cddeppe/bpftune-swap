@@ -346,17 +346,18 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
         break;
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
         bpf_sock_ops_cb_flags_set(ops, cb_flags);
-        /* 0.4.92: mark passive (incoming) connections — skip swap/metric
-         * tracking. The server is the receiver; swapping the local
-         * congestion algorithm only affects ACK pacing, not the data
-         * transfer rate (controlled by the sender's algorithm).
-         * This also removes sources from the dashboard (no met/swap/
-         * proof events = no bucket list or leaderboard entries). */
+        /* 0.4.101: passive connections (incoming to xray/nginx on 443)
+         * MUST go through set_cong() — in this topology the VPS is the
+         * SENDER (pushing video downstream to home clients), so the
+         * local CC controls the send rate. The 0.4.92 assumption
+         * ("server is receiver") was wrong for proxy traffic.
+         *
+         * We still create statep here so it exists when the vote
+         * handler runs, but we do NOT set swap_target=0xff — that
+         * was the flag that caused line 380 to skip all tracking. */
         if (sk) {
             statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
                                         BPF_SK_STORAGE_GET_F_CREATE);
-            if (statep)
-                statep->swap_target = 0xff;
         }
         break;
     case BPF_SOCK_OPS_RETRANS_CB:

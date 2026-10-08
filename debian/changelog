@@ -1,3 +1,21 @@
+bpftune (0.4.101) unstable; urgency=medium
+
+  * Fix: passive connections (incoming to xray/nginx on 443) were
+    skipped by set_cong() since v0.4.92, causing all proofs to show
+    alg=0 (cubic) because statep->state was never set.
+    Root cause: the 0.4.92 passive-estab handler set swap_target=0xff,
+    which caused line 380 to skip all tracking for passive connections.
+    In this topology the VPS is the SENDER (pushing video downstream),
+    so the local CC controls the send rate — passive connections MUST
+    be tuned.
+    Fix: remove the swap_target=0xff mark from the passive-estab
+    handler. Passive connections now go through set_cong() like
+    active connections, getting their statep->state set correctly.
+    This restores the v0.4.70 behavior where active and passive
+    connections were handled identically.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Wed, 08 Oct 2026 11:00:00 +0200
+
 bpftune (0.4.100) unstable; urgency=medium
 
   * Fix: all proofs misattributed to cubic (alg=0).
