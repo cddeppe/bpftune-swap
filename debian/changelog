@@ -1,3 +1,19 @@
+bpftune (0.4.100) unstable; urgency=medium
+
+  * Fix: all proofs misattributed to cubic (alg=0).
+    Root cause: the passive-estab handler creates statep but does NOT
+    call set_cong(), leaving statep->state at 0 (cubic). The 0.4.97
+    revert re-enabled proofs for passive connections in the vote path,
+    but those proofs all reported alg=0 because statep->state was never
+    set. The direction gate then filtered out active connections (which
+    DO have correct statep->state), leaving only passive connections
+    reaching the proof code — all with alg=0 (cubic).
+    Fix: gate proof emission on statep->touched_bitmap != 0. This
+    bitmap is set by set_cong() and is 0 for sockets that were never
+    tuned, preventing cubic misattribution.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Wed, 08 Oct 2026 10:30:00 +0200
+
 bpftune (0.4.98) unstable; urgency=medium
 
   * Add dest=/dest6=/dest6b= to proof printk lines (both tier=1 and tier=2).
