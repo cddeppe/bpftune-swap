@@ -768,8 +768,11 @@
        * collector has classified the swap on the sustained ruler
        * (T+60..T+300 after the swap). */
       var o = r.outcome_sustained || "";
+      // v0.9.28: display no_post as "nopost" with faded style
+      var pillLabel = o === 'no_post' ? 'nopost' : o;
+      var pillClass = o === 'no_post' ? 'nopost' : o;
       var pill = o
-        ? '<span class="sp ' + o + '">' + o + '</span>'
+        ? '<span class="sp ' + pillClass + '">' + pillLabel + '</span>'
         : (function() {
             var age = (r.boot_ts && SERVER_NOW_MONO) ? (SERVER_NOW_MONO - r.boot_ts) : 0;
             if (age < 60) return '<span class="sp wait">wait</span>';

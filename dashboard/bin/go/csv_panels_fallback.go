@@ -195,7 +195,8 @@ func buildProofsRawFromCSV() []interface{} {
                                 continue
                         }
                 }
-                rate, _ := strconv.ParseInt(rateStr, 10, 64)
+                rateBps, _ := strconv.ParseInt(rateStr, 10, 64)
+                rate := int64(float64(rateBps) / bpsToMbps)  // v0.9.28: convert bytes/sec to Mbps
                 s, ok := stats[alg]
                 if !ok {
                         s = &algStats{}

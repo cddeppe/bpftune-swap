@@ -403,7 +403,8 @@
   .sp.win  { color: var(--good); background: var(--good-dim); }
   .sp.loss { color: var(--bad);  background: var(--bad-dim); }
   .sp.null { color: #fff; background: #2d333b; }
-  .sp.good { color: var(--warn); background: var(--warn-dim); }
+
+.sp.nopost { color: #fff; background: #2d333b; }  .sp.good { color: var(--warn); background: var(--warn-dim); }
   .sp.proved { color: var(--good); background: var(--good-dim); }
   .sp.dash { color: var(--muted-2); background: var(--subtle); }
   .sp.pending { color: var(--warn); background: var(--warn-dim); font-size: 9.5px; }

@@ -234,22 +234,19 @@ ConditionPathExists=$TRACE_PIPE
 [Service]
 Type=simple
 ExecStart=/bin/cat $TRACE_PIPE
-StandardOutput=append:$LOG_FILE
-StandardError=append:$LOG_FILE
+StandardOutput=file:$LOG_FILE
+StandardError=file:$LOG_FILE
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 User=root
 
 [Install]
 WantedBy=multi-user.target
 TRACEEOF
 
-    # Kill old nohup trace capture
+    # Kill old nohup trace capture (don't delete log — trace service will append)
     pkill -f "trace_pipe" 2>/dev/null
     sleep 1
-    rm -f "$LOG_FILE"
 
     # Enable and start the trace service
     systemctl daemon-reload
