@@ -193,7 +193,7 @@ static __always_inline __u32 bucket_prefix6(void)
 }
 
 
-static __always_inline void bucket_key_apply_prefix(struct in6_addr *key)
+static __noinline void bucket_key_apply_prefix(struct in6_addr *key)
 {
         if (key->s6_addr32[2] == bpf_htonl(0xffff)) {
                 __u32 pfx = bucket_prefix4();
@@ -228,7 +228,7 @@ static __always_inline void bucket_key_apply_prefix(struct in6_addr *key)
 
 /* 0.4.79: prefer an alias if the operator has declared one for
  * this exact raw destination; otherwise fall through to prefix. */
-static __always_inline void bucket_key_alias_or_prefix(struct in6_addr *key)
+static __noinline void bucket_key_alias_or_prefix(struct in6_addr *key)
 {
         struct in6_addr *a = bpf_map_lookup_elem(&dest_alias_map, key);
         if (a) {
@@ -248,7 +248,7 @@ static __always_inline void bucket_key_alias_or_prefix(struct in6_addr *key)
         }
 }
 
-static __always_inline int set_cong(struct bpf_sock_ops *ops,
+static __noinline int set_cong(struct bpf_sock_ops *ops,
                                     struct remote_host *remote_host,
                                     __u8 i)
 {
@@ -508,11 +508,15 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
             __u64 min2 = ~((__u64)0);
             for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
                 __u64 v = remote_host->metrics[i].metric_value;
-                /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
-                 * Was: treated as real value, causing best_v=~0, which
-                 * made the swap gate fire and swap everything to cubic. */
-                if (v == 0 || v == ~((__u64)0))
-                    continue;
+                /* Sentinel metrics (0 unset, ~0 poisoned) may win
+                 * the min loop here and be reported as minindex,
+                 * but the consumer below checks metric_count > 0
+                 * and the vote path guards with v != 0 && v != ~0.
+                 * A skip filter here blew the verifier to the 1M
+                 * instruction limit (16-way unrolled loop,
+                 * unprovable ranges), so it is intentionally omitted.
+                 * (v0.4.102: restored this v0.4.98 comment — the
+                 * v0.4.99 skip filter caused E2BIG load failure.) */
                 if (v < metric_min) {
                     min2 = metric_min;
                     metric_min = v;
@@ -581,7 +585,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
  * 0.4.89 (Q3): the score/streak update logic is now in
  * apply_swap_outcome() in the header; this function computes ratio_q
  * per its gating rules and delegates. */
-static __always_inline void
+static __noinline void
 score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
                    struct conn_state *statep, __u64 now,
                    __u8 cur_alg)
@@ -674,7 +678,7 @@ score_pending_swap(struct bpf_sock_ops *ops, struct remote_host *rh,
  * score_pending_rejected scores a PREEMPTED swap (socket left the
  * target); 30s is the "last chance" -- if at least 30s of post-swap
  * data exists, use the actual ratio; otherwise force loss-class. */
-static __always_inline void
+static __noinline void
 score_pending_rejected(struct bpf_sock_ops *ops, struct remote_host *rh,
                        struct conn_state *statep, __u64 now)
 {
@@ -1088,19 +1092,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
          * to reset anything -- each alg the socket has ever touched
          * keeps its own bit, and the close handler decrements them
          * all. */
-        /* 0.4.100: gate proofs on touched_bitmap to prevent misattribution.
-         * touched_bitmap is set by set_cong() (line 287). It is 0 for
-         * passive connections that were never tuned — the passive-estab
-         * handler (line 356) creates statep but skips set_cong, leaving
-         * statep->state at 0 (cubic). Without this gate, passive sockets
-         * that pass the direction gate (data_segs_out >> data_segs_in)
-         * would emit proofs with alg=0 (cubic), misattributing their
-         * throughput to cubic and corrupting the cubic counter.
-         *
-         * The 0.4.97 revert restored proofs for passive connections, but
-         * those proofs were all wrong (alg=0). This gate restores
-         * correctness: only sockets that were actually tuned emit proofs. */
-        if (!is_close && statep->touched_bitmap != 0) {
+        /* 0.4.102: removed the v0.4.100 touched_bitmap gate. It is no
+         * longer needed because the v0.4.101 fix removed the
+         * swap_target=0xff mark from the passive-estab handler, so
+         * set_cong() now runs for passive connections (VPS→Home
+         * sender topology). This means statep->state is set
+         * correctly for all connections, and touched_bitmap is
+         * always non-zero when a proof fires. */
+        if (!is_close) {
                 __u64 bit = 1ULL << (s & (NUM_TCP_CONG_ALGS - 1));
                 if (rate_delivered >= get_proof_proved_bps() && !(statep->proved_bitmap & bit)) {
                         statep->proved_bitmap |= bit;

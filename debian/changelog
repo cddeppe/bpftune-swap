@@ -1,3 +1,79 @@
+bpftune (0.4.102) unstable; urgency=medium
+
+  * Fix E2BIG BPF load failure introduced in v0.4.99.
+    v0.4.99 added a `if (v == 0 || v == ~0) continue;` skip filter to the
+    16-way unrolled min-scan loop in the ESTABLISHED handler. This exact
+    pattern was documented in v0.4.40 as having "blew the verifier to the
+    1M instruction limit" and was intentionally omitted. v0.4.99 deleted
+    the warning comment and added the filter anyway, causing the BPF
+    program to fail loading with E2BIG on all hosts. The collector then
+    fell into degraded mode reading stale CSV data — nothing updated.
+    Fix: revert the skip filter, restore the v0.4.98 loop body. The
+    consumer-side guards (metric_count > 0, v != 0 && v != ~0) already
+    handle sentinel values correctly without adding verifier complexity.
+
+  * Fix passive connections never tuned (v0.4.92 regression).
+    The v0.4.92 passive-estab handler set swap_target=0xff on all
+    incoming connections, causing set_cong() to be skipped. In the
+    VPS→Home topology, the VPS is the SENDER on these passive
+    connections (pushing video downstream), so they MUST be tuned.
+    Fix (v0.4.101, carried forward): remove the swap_target=0xff mark
+    from the passive-estab handler. Passive connections now go through
+    set_cong() like active connections. This restores the v0.4.78
+    behavior where active and passive connections were handled
+    identically.
+
+  * Remove v0.4.100 touched_bitmap proof gate.
+    No longer needed since v0.4.101's fix ensures set_cong() runs for
+    passive connections, so statep->state is always set correctly.
+
+  * Add __noinline to 5 heavy inline functions for verifier headroom.
+    set_cong, bucket_key_apply_prefix, bucket_key_alias_or_prefix,
+    score_pending_swap, and score_pending_rejected are now non-inlined
+    BPF subprograms. This reduces the verifier's state-explosion by
+    collapsing 25+ inlined call sites into 5 function calls, giving
+    significant headroom for future changes without risking E2BIG.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Wed, 08 Oct 2026 12:00:00 +0200
+
+bpftune (0.4.102) unstable; urgency=medium
+
+  * Fix E2BIG BPF load failure introduced in v0.4.99.
+    v0.4.99 added a `if (v == 0 || v == ~0) continue;` skip filter to the
+    16-way unrolled min-scan loop in the ESTABLISHED handler. This exact
+    pattern was documented in v0.4.40 as having "blew the verifier to the
+    1M instruction limit" and was intentionally omitted. v0.4.99 deleted
+    the warning comment and added the filter anyway, causing the BPF
+    program to fail loading with E2BIG on all hosts. The collector then
+    fell into degraded mode reading stale CSV data — nothing updated.
+    Fix: revert the skip filter, restore the v0.4.98 loop body. The
+    consumer-side guards (metric_count > 0, v != 0 && v != ~0) already
+    handle sentinel values correctly without adding verifier complexity.
+
+  * Fix passive connections never tuned (v0.4.92 regression).
+    The v0.4.92 passive-estab handler set swap_target=0xff on all
+    incoming connections, causing set_cong() to be skipped. In the
+    VPS→Home topology, the VPS is the SENDER on these passive
+    connections (pushing video downstream), so they MUST be tuned.
+    Fix (v0.4.101, carried forward): remove the swap_target=0xff mark
+    from the passive-estab handler. Passive connections now go through
+    set_cong() like active connections. This restores the v0.4.78
+    behavior where active and passive connections were handled
+    identically.
+
+  * Remove v0.4.100 touched_bitmap proof gate.
+    No longer needed since v0.4.101's fix ensures set_cong() runs for
+    passive connections, so statep->state is always set correctly.
+
+  * Add __noinline to 5 heavy inline functions for verifier headroom.
+    set_cong, bucket_key_apply_prefix, bucket_key_alias_or_prefix,
+    score_pending_swap, and score_pending_rejected are now non-inlined
+    BPF subprograms. This reduces the verifier's state-explosion by
+    collapsing 25+ inlined call sites into 5 function calls, giving
+    significant headroom for future changes without risking E2BIG.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Wed, 08 Oct 2026 12:00:00 +0200
+
 bpftune (0.4.101) unstable; urgency=medium
 
   * Fix: passive connections (incoming to xray/nginx on 443) were
