@@ -222,19 +222,71 @@ if [ $CHECK_ONLY -eq 0 ]; then
         warn "Run this after 5s: bpftool map update pinned /sys/fs/bpf/bpftune/tcp_conn/explore key hex 00 00 00 00 value hex 64 00 00 00"
     fi
 
-    # Kill old trace capture and start fresh
-    echo "  Starting trace capture..."
+    # Install trace capture systemd service (replaces fragile nohup)
+    echo "  Installing trace capture service..."
+    cat > /etc/systemd/system/bpftune-met-trace.service << TRACEEOF
+[Unit]
+Description=bpftune trace_pipe capture
+After=bpftune.service
+Wants=bpftune.service
+ConditionPathExists=$TRACE_PIPE
+
+[Service]
+Type=simple
+ExecStart=/bin/cat $TRACE_PIPE
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+TRACEEOF
+
+    # Kill old nohup trace capture
     pkill -f "trace_pipe" 2>/dev/null
     sleep 1
     rm -f "$LOG_FILE"
-    nohup sh -c "cat $TRACE_PIPE" > "$LOG_FILE" 2>&1 &
+
+    # Enable and start the trace service
+    systemctl daemon-reload
+    systemctl enable bpftune-met-trace 2>/dev/null
+    systemctl restart bpftune-met-trace
     sleep 3
+    if systemctl is-active --quiet bpftune-met-trace; then
+        ok "Trace capture service installed and running"
+    else
+        warn "Trace service failed — falling back to nohup"
+        nohup sh -c "cat $TRACE_PIPE" > "$LOG_FILE" 2>&1 &
+        sleep 3
+    fi
+
     if [ -f "$LOG_FILE" ]; then
         LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null)
-        ok "Trace capture started: $LOG_FILE (${LOG_SIZE} bytes)"
+        ok "Log file: $LOG_FILE (${LOG_SIZE} bytes)"
     else
-        fail "Trace capture failed to start"
+        fail "Log file NOT created"
     fi
+
+    # Install logrotate config
+    echo "  Installing logrotate..."
+    cat > /etc/logrotate.d/bpftune-met << LOGEOF
+$LOG_FILE {
+    daily
+    rotate 14
+    size 100M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0644 root root
+}
+LOGEOF
+    ok "Logrotate installed (daily, 100M max, 14 rotations)"
 
     # Restart dashboard collector
     echo "  Starting dashboard collector..."

@@ -356,14 +356,24 @@ func (c *Collector) handleSSE(w http.ResponseWriter, r *http.Request) {
                 flusher.Flush()
         }
 
-        // v0.7.5m: removed per-second hash polling (was the 9% CPU sink).
-        // notifySSE() pushes to the channel every 30s after collect().
-        // Keep a 25s keepalive comment to prevent proxy idle timeout.
+        // v0.9.27: added 5-minute heartbeat that sends the full document.
+        // Clients that missed deltas (channel full) stay in sync.
+        heartbeat := time.NewTicker(5 * time.Minute)
+        defer heartbeat.Stop()
+        // v0.7.5m: keep a 25s keepalive comment to prevent proxy idle timeout.
         for {
                 select {
                 case <-r.Context().Done():
                         return
                 case data := <-ch:
+                        fmt.Fprintf(w, "data: %s\n\n", data)
+                        flusher.Flush()
+                case <-heartbeat.C:
+                        // Send full document as heartbeat
+                        c.mu.RLock()
+                        fullMsg := map[string]interface{}{"__t": "f", "v": c.current}
+                        c.mu.RUnlock()
+                        data, _ := json.Marshal(fullMsg)
                         fmt.Fprintf(w, "data: %s\n\n", data)
                         flusher.Flush()
                 case <-time.After(25 * time.Second):

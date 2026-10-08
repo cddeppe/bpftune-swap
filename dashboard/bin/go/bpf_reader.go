@@ -19,7 +19,9 @@ package main
 
 import (
 	"encoding/json"
+	"context"
 	"fmt"
+	"time"
 	"os/exec"
 )
 
@@ -40,7 +42,10 @@ type hostEntry struct {
 // readBPFMap runs bpftool, parses the JSON, applies ResolveBucket + merges
 // by final label.  Mirrors bpftune_log.py:read_map.
 func readBPFMap() ([]hostEntry, error) {
-	cmd := exec.Command("bpftool", "--json", "map", "dump", "name", "remote_host_map")
+	// v0.9.27: add 10s timeout to prevent collector hanging on bpftool
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bpftool", "--json", "map", "dump", "name", "remote_host_map")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("bpftool: %w", err)
