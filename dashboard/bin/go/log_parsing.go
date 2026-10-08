@@ -1206,7 +1206,8 @@ func destIP(s string) string {
 // readLogTail reads the last `budget` bytes across all bpftune-met-*.log
 // files, sorted newest-first.  Mirrors bpftune_log.py:tail_recent.
 func readLogTail(budget int64) string {
-        pattern := "/var/log/bpftune-met-*.log"
+        // v0.9.31 (Bug 6): match rotated logs too (was *.log, missed .log.1 etc.)
+        pattern := "/var/log/bpftune-met-live.log*"
         files, _ := filepath.Glob(pattern)
         if len(files) == 0 {
                 return ""
@@ -1448,79 +1449,79 @@ func emptyLogWindow() map[string]interface{} {
 // mergeSwapsNewestFirst merges two newest-first swap lists, deduplicates
 // by boot_ts+cookie, and returns the top N newest entries.
 func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
-	seen := make(map[string]bool)
-	var merged []interface{}
-	// getTs reads boot_ts, falling back to ts (v0.9.14 fix: live rows
-	// historically used "ts" while CSV rows used "boot_ts" — the merge
-	// sort read boot_ts for all rows, giving live rows a 0.0 timestamp
-	// and sorting them to the bottom).
-	getTs := func(m map[string]interface{}) float64 {
-		if ts, ok := m["boot_ts"].(float64); ok && ts > 0 {
-			return ts
-		}
-		if ts, ok := m["ts"].(float64); ok {
-			return ts
-		}
-		return 0
-	}
-	add := func(row interface{}) {
-		if m, ok := row.(map[string]interface{}); ok {
-			ts := getTs(m)
-			cookie, _ := m["dest"].(string)
-			key := fmt.Sprintf("%.3f:%s", ts, cookie)
-			if !seen[key] {
-				seen[key] = true
-				merged = append(merged, row)
-			}
-		}
-	}
-	for _, r := range live {
-		add(r)
-	}
-	for _, r := range csv {
-		add(r)
-	}
-	// Sort by timestamp descending (newest first)
-	sort.Slice(merged, func(i, j int) bool {
-		ti := getTs(merged[i].(map[string]interface{}))
-		tj := getTs(merged[j].(map[string]interface{}))
-		return ti > tj
-	})
-	if len(merged) > n {
-		merged = merged[:n]
-	}
-	return merged
+        seen := make(map[string]bool)
+        var merged []interface{}
+        // getTs reads boot_ts, falling back to ts (v0.9.14 fix: live rows
+        // historically used "ts" while CSV rows used "boot_ts" — the merge
+        // sort read boot_ts for all rows, giving live rows a 0.0 timestamp
+        // and sorting them to the bottom).
+        getTs := func(m map[string]interface{}) float64 {
+                if ts, ok := m["boot_ts"].(float64); ok && ts > 0 {
+                        return ts
+                }
+                if ts, ok := m["ts"].(float64); ok {
+                        return ts
+                }
+                return 0
+        }
+        add := func(row interface{}) {
+                if m, ok := row.(map[string]interface{}); ok {
+                        ts := getTs(m)
+                        cookie, _ := m["dest"].(string)
+                        key := fmt.Sprintf("%.3f:%s", ts, cookie)
+                        if !seen[key] {
+                                seen[key] = true
+                                merged = append(merged, row)
+                        }
+                }
+        }
+        for _, r := range live {
+                add(r)
+        }
+        for _, r := range csv {
+                add(r)
+        }
+        // Sort by timestamp descending (newest first)
+        sort.Slice(merged, func(i, j int) bool {
+                ti := getTs(merged[i].(map[string]interface{}))
+                tj := getTs(merged[j].(map[string]interface{}))
+                return ti > tj
+        })
+        if len(merged) > n {
+                merged = merged[:n]
+        }
+        return merged
 }
 
 // mergeProofsNewestFirst merges two newest-first proof lists, deduplicates
 // by boot_ts+alg, and returns the top N newest entries.
 func mergeProofsNewestFirst(live, csv []interface{}, n int) []interface{} {
-	seen := make(map[string]bool)
-	var merged []interface{}
-	add := func(row interface{}) {
-		if m, ok := row.(map[string]interface{}); ok {
-			ts, _ := m["boot_ts"].(float64)
-			alg, _ := m["alg"].(string)
-			key := fmt.Sprintf("%.3f:%s", ts, alg)
-			if !seen[key] {
-				seen[key] = true
-				merged = append(merged, row)
-			}
-		}
-	}
-	for _, r := range live {
-		add(r)
-	}
-	for _, r := range csv {
-		add(r)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		ti, _ := merged[i].(map[string]interface{})["boot_ts"].(float64)
-		tj, _ := merged[j].(map[string]interface{})["boot_ts"].(float64)
-		return ti > tj
-	})
-	if len(merged) > n {
-		merged = merged[:n]
-	}
-	return merged
+        seen := make(map[string]bool)
+        var merged []interface{}
+        add := func(row interface{}) {
+                if m, ok := row.(map[string]interface{}); ok {
+                        ts, _ := m["boot_ts"].(float64)
+                        alg, _ := m["alg"].(string)
+                        key := fmt.Sprintf("%.3f:%s", ts, alg)
+                        if !seen[key] {
+                                seen[key] = true
+                                merged = append(merged, row)
+                        }
+                }
+        }
+        for _, r := range live {
+                add(r)
+        }
+        for _, r := range csv {
+                add(r)
+        }
+        sort.Slice(merged, func(i, j int) bool {
+                ti, _ := merged[i].(map[string]interface{})["boot_ts"].(float64)
+                tj, _ := merged[j].(map[string]interface{})["boot_ts"].(float64)
+                return ti > tj
+        })
+        if len(merged) > n {
+                merged = merged[:n]
+        }
+        return merged
 }

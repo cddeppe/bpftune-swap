@@ -42,6 +42,7 @@ type parsedLog struct {
         MetByCookie map[int64][]metEntry
         SrateByCookie map[int64][]srateEntry
         Cdest      map[string]cdestEntry
+        CookieAlg  map[string]int    // v0.9.31: cookie→alg for cubic-proof fix
         ProofLines []string   // raw lines matching "proof cookie="
         ProofEvents map[int]proofEvent
         ProofSamples map[int]proofSample
@@ -93,6 +94,7 @@ func parseLogSinglePass(text string) *parsedLog {
                 MetByCookie:  map[int64][]metEntry{},
                 SrateByCookie: map[int64][]srateEntry{},
                 Cdest:        map[string]cdestEntry{},
+                CookieAlg:    map[string]int{},
                 ProofEvents:  map[int]proofEvent{},
                 ProofSamples: map[int]proofSample{},
                 BucketIPs:    map[string][]string{},
@@ -153,6 +155,10 @@ func parseLogSinglePass(text string) *parsedLog {
                         val, _ := strconv.ParseInt(m[6], 10, 64)
                         pl.MetByCookie[cookie] = append(pl.MetByCookie[cookie],
                                 metEntry{Ts: ts, Val: val, Rport: rport, Alg: alg})
+                        // v0.9.31: track current alg per cookie for cubic-proof fix
+                        if alg != 0 {
+                                pl.CookieAlg[m[2]] = alg
+                        }
                         continue
                 }
 
@@ -163,6 +169,10 @@ func parseLogSinglePass(text string) *parsedLog {
                         sr, _ := strconv.ParseInt(m[4], 10, 64)
                         pl.SrateByCookie[cookie] = append(pl.SrateByCookie[cookie],
                                 srateEntry{Ts: ts, Srate: sr, Alg: alg})
+                        // v0.9.31: srate carries the current alg post-swap
+                        if alg != 0 {
+                                pl.CookieAlg[m[2]] = alg
+                        }
                         continue
                 }
 
@@ -197,6 +207,8 @@ func parseLogSinglePass(text string) *parsedLog {
 
                         // buildBucketIPs: dest= occurrences
                         pl.extractBucketIPs(line, p4, p6)
+                        // v0.9.31: swap.to is authoritative — set_cong was called
+                        pl.CookieAlg[m[2]] = ta
                         continue
                 }
 
@@ -214,6 +226,12 @@ func parseLogSinglePass(text string) *parsedLog {
                                 cur[2] = m[6]
                         }
                         pl.Cdest[cookie] = cur
+                        // v0.9.31: estab.alg is the kernel CC at conn start
+                        if estabAlg, err := strconv.Atoi(m[3]); err == nil && estabAlg != 0 {
+                                if _, exists := pl.CookieAlg[cookie]; !exists {
+                                        pl.CookieAlg[cookie] = estabAlg
+                                }
+                        }
 
                         // buildBucketIPs: estab lines also carry dest=
                         pl.extractBucketIPs(line, p4, p6)
@@ -226,6 +244,12 @@ func parseLogSinglePass(text string) *parsedLog {
 
                                 // proofEvents: aggregate good/proved/provenMax per alg
                                 a, _ := strconv.Atoi(m[3])
+                                // v0.9.31: rewrite alg=0 from cookie→alg map
+                                if a == 0 {
+                                        if realAlg, ok := pl.CookieAlg[m[2]]; ok && realAlg != 0 {
+                                                a = realAlg
+                                        }
+                                }
                                 rate, _ := strconv.ParseInt(m[4], 10, 64)
                                 tier := m[5]
                                 e := pl.ProofEvents[a]
@@ -408,6 +432,12 @@ func (pl *parsedLog) GetProofRows(cdest map[string]cdestEntry) []interface{} {
                 ts, _ := strconv.ParseFloat(m[1], 64)
                 cookie := m[2]
                 alg, _ := strconv.Atoi(m[3])
+                // v0.9.31: rewrite alg=0 from cookie→alg map (cubic-proof fix)
+                if alg == 0 {
+                        if realAlg, ok := pl.CookieAlg[cookie]; ok && realAlg != 0 {
+                                alg = realAlg
+                        }
+                }
                 rate, _ := strconv.ParseInt(m[4], 10, 64)
                 tier := m[5]
                 tierLabel := "good"
@@ -429,12 +459,16 @@ func (pl *parsedLog) GetProofRows(cdest map[string]cdestEntry) []interface{} {
                                 dest = ds
                         }
                 }
+                // v0.9.31 (Bug 1): add epoch_ts for age label (was missing)
+                uptime := readProcUptime()
+                nowEpoch := float64(time.Now().Unix())
                 out = append(out, map[string]interface{}{
-                        "boot_ts": ts,
-                        "alg":     algName(alg),
-                        "mbps":    round1(float64(rate) / bpsToMbps),
-                        "tier":    tierLabel,
-                        "dest":    dest,
+                        "boot_ts":  ts,
+                        "epoch_ts": int64(nowEpoch - uptime + ts),
+                        "alg":      algName(alg),
+                        "mbps":     round1(float64(rate) / bpsToMbps),
+                        "tier":     tierLabel,
+                        "dest":     dest,
                 })
         }
         // v0.9.16: sort by boot_ts descending (newest-first).

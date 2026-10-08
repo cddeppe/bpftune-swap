@@ -229,7 +229,9 @@ func buildProofsRawFromCSV() []interface{} {
                 s := stats[a]
                 var provenMax, sampledAvg, sampledMax interface{}
                 if s.provenMax > 0 {
-                        provenMax = round1(float64(s.provenMax) / bpsToMbps)
+                        // v0.9.31 (Bug 3): s.provenMax is already in Mbps (line 199 converts).
+                        // Was dividing by bpsToMbps AGAIN, giving 0.0008 instead of 100.
+                        provenMax = round1(float64(s.provenMax))
                 }
                 if s.sampleN > 0 {
                         sampledAvg = round1(float64(s.sampleSum) / float64(s.sampleN))  // v0.9.25: already Mbps

@@ -15,7 +15,6 @@ import (
         "os"
         "strconv"
         "strings"
-        "time"
 )
 
 // readRecentSwapsFromCSV reads the last N rows from swaps.csv and
@@ -122,9 +121,6 @@ func readRecentProofsFromCSV(n int) []interface{} {
         // Skip header
         lines = lines[1:]
 
-        uptime := readProcUptime()
-        nowEpoch := float64(time.Now().Unix())
-
         // Take last N
         if len(lines) > n {
                 lines = lines[len(lines)-n:]
@@ -156,7 +152,9 @@ func readRecentProofsFromCSV(n int) []interface{} {
                 }
                 out = append(out, map[string]interface{}{
                         "boot_ts":  ts,
-                        "epoch_ts": int64(nowEpoch - uptime + ts),
+                        // v0.9.31 (Bug 9): use collectedTs (wall-clock) not boot_ts formula.
+                        // The boot_ts formula produces future timestamps for cross-boot data.
+                        "epoch_ts": collectedTs,
                         "alg":      alg,
                         "mbps":     mbps,
                         "tier":     tierLabel,
