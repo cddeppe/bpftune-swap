@@ -172,54 +172,51 @@ func (c *Collector) collect() {
         // v0.9.10: dual-write to SQLite — SQLite gets every cycle (30s res),
         // CSV gets every 2nd cycle (60s res for backward compat). Eventually
         // CSV will be phased out.
-        if sqliteDB != nil {
-                rmemMin, rmemDef, rmemMax := readTcpRmem()
-                for _, h := range hosts {
-                        if h.Inst < 2 {
-                                continue
+        // v0.9.33: throttle CSV writes to every Nth cycle when configured.
+        // Default (normal mode): N=1, every cycle. normal-light: N=2, every 60s.
+        csvN := collectorMode.CSVWriteEveryN
+        if csvN <= 0 { csvN = 1 }
+        doCSV := (cycleCount % csvN) == 0
+
+        if doCSV {
+                if sqliteDB != nil {
+                        rmemMin, rmemDef, rmemMax := readTcpRmem()
+                        for _, h := range hosts {
+                                if h.Inst < 2 {
+                                        continue
+                                }
+                                writeBucketSQLite(h, now, rmemMin, rmemDef, rmemMax)
                         }
-                        writeBucketSQLite(h, now, rmemMin, rmemDef, rmemMax)
                 }
-        }
-        if cycleCount%2 == 0 {
-                writeBucketsCSV(hosts, now)
+                if cycleCount%2 == 0 {
+                        writeBucketsCSV(hosts, now)
+                }
         }
         // v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
         // Mirrors Python _resolve_pending enrichment logic.
         enrichSwapsForCSV(allSwaps, allMets, allSrates, cdest)
-        writeSwapsCSV(allSwaps, now)
-        // v0.8.7: removed writeTruthRows(allSwaps) call - writeSwapsCSV
-        // already writes truth rows for each NEW swap (those that pass the
-        // writtenSwaps dedup check).  Calling writeTruthRows separately
-        // was writing DUPLICATE truth rows on every collect cycle because
-        // writeTruthRows uses a SEPARATE dedup map (writtenTruth) that
-        // writeSwapsCSV never updates - so every classified swap that
-        // had just been written by writeSwapsCSV was written AGAIN by
-        // writeTruthRows.  The in-CSV write at csv_writer.go:247 is the
-        // single source of truth now.
-        writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
-        // v0.9.24: write midsamp.csv from parsed events (was never called!)
-        // midsamp.csv is the fallback for the rate progression panel
-        // when the live log has no midsamp events. Without this call,
-        // midsamp.csv was only populated by the one-time backfill on
-        // first startup, and empty after a reboot with cleared logs.
-        if len(pl.MidsampRows) > 0 {
-                midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
-                for _, mr := range pl.MidsampRows {
-                        midsampEvents = append(midsampEvents, midsampEvent{
-                                Ts:     float64(now),
-                                Thr:    mr.Thr,
-                                Srate:  mr.Srate,
-                                Rport:  mr.Rport,
-                                Alg:    -1,  // not available in midsampRow
-                                Cookie: 0,   // not available in midsampRow
-                        })
+        if doCSV {
+                writeSwapsCSV(allSwaps, now)
+                writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
+                // v0.9.24: write midsamp.csv from parsed events (was never called!)
+                if len(pl.MidsampRows) > 0 {
+                        midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
+                        for _, mr := range pl.MidsampRows {
+                                midsampEvents = append(midsampEvents, midsampEvent{
+                                        Ts:     float64(now),
+                                        Thr:    mr.Thr,
+                                        Srate:  mr.Srate,
+                                        Rport:  mr.Rport,
+                                        Alg:    -1,
+                                        Cookie: 0,
+                                })
+                        }
+                        writeMidsampCSV(midsampEvents, now)
                 }
-                writeMidsampCSV(midsampEvents, now)
-        }
 
-        // v0.9.5: write proofs.csv for the recent-proofs panel fallback
-        writeProofsCSVFromInterface(topProofs, now)
+                // v0.9.5: write proofs.csv for the recent-proofs panel fallback
+                writeProofsCSVFromInterface(topProofs, now)
+        }
 
         // v0.9.7: write midsamp.csv for the rate progression panel fallback
 

@@ -677,10 +677,24 @@ func main() {
         }()
 
         // renderToDisk loop (every 5 min): 1h + 24h + meta + swaps + fleet
+        // v0.9.33: skip when no new swaps (SkipRenderWhenIdle mode)
         go func() {
                 ticker := time.NewTicker(5 * time.Minute)
                 defer ticker.Stop()
+                lastSwapCount := 0
                 for range ticker.C {
+                        if collectorMode.SkipRenderWhenIdle {
+                                collector.mu.RLock()
+                                so := collector.current["swap_outcomes"]
+                                collector.mu.RUnlock()
+                                if m, ok := so.(map[string]interface{}); ok {
+                                        sl, _ := m["swaps_list"].([]interface{})
+                                        if len(sl) == lastSwapCount {
+                                                continue // no new swaps, skip render
+                                        }
+                                        lastSwapCount = len(sl)
+                                }
+                        }
                         collector.renderToDisk()
                 }
         }()
