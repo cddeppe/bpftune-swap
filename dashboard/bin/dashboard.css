@@ -489,8 +489,8 @@
   @media (min-width: 700px) {
     .tun-grid {
       grid-template-columns: 1fr 1fr;
-      /* v0.9.32: row-gap 4px (tight left groups), column-gap 28px */
-      gap: 4px 28px;
+      /* v0.9.32: row-gap 16px (balanced with right side), column-gap 28px */
+      gap: 16px 28px;
       align-items: start;
     }
     .tun-group:nth-child(1) { grid-column: 1; grid-row: 1; }
