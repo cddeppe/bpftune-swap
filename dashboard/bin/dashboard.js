@@ -2104,8 +2104,12 @@
     if (!s) {
       if (!state.bucketDoc || !state.bucketDoc.series) return;
       var doc = state.bucketDoc;
-      if (!doc.series || !doc.series[rng]) return;
-      s = doc.series[rng]; ts = s.ts;
+      // v0.9.32: fall back to 24h if the requested range isn't available.
+      // 7d/30d/all static files are only generated once daily, so they
+      // may not exist yet. Using 24h data is better than showing nothing.
+      var sDoc = doc.series[rng] || doc.series["24h"];
+      if (!sDoc) return;
+      s = sDoc; ts = s.ts;
       if (!ts || !ts.length) return;
     }
     var scoreCols = Object.keys(s).filter(function(k) { return k.indexOf("score_") === 0; });
