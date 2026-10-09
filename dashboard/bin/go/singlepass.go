@@ -29,8 +29,8 @@ package main
 import (
         "net"
         "sort"
-	"sync"
-	"time"
+        "sync"
+        "time"
         "strconv"
         "strings"
 )
@@ -63,6 +63,7 @@ type midsampRow struct {
         Thr   int
         Srate int64
         Rport string
+        Dest  string  // v0.9.32: resolved dest for bucket filtering
 }
 
 // parseLogSinglePass does ONE pass over text and extracts everything.
@@ -71,22 +72,22 @@ type midsampRow struct {
 // v0.9.25: was sync.Once (cached forever) — after 5 min, ALL new events
 // were filtered as "previous boot" because the cached uptime was stale.
 var bootUptime struct {
-	mu    sync.Mutex
-	value float64
-	ts    time.Time
+        mu    sync.Mutex
+        value float64
+        ts    time.Time
 }
 
 // getBootUptime returns /proc/uptime (seconds since boot).
 // Used to filter out events from previous boots.
 func getBootUptime() float64 {
-	bootUptime.mu.Lock()
-	defer bootUptime.mu.Unlock()
-	if time.Since(bootUptime.ts) < 30*time.Second {
-		return bootUptime.value
-	}
-	bootUptime.value = readProcUptime()
-	bootUptime.ts = time.Now()
-	return bootUptime.value
+        bootUptime.mu.Lock()
+        defer bootUptime.mu.Unlock()
+        if time.Since(bootUptime.ts) < 30*time.Second {
+                return bootUptime.value
+        }
+        bootUptime.value = readProcUptime()
+        bootUptime.ts = time.Now()
+        return bootUptime.value
 }
 
 func parseLogSinglePass(text string) *parsedLog {
@@ -285,10 +286,21 @@ func parseLogSinglePass(text string) *parsedLog {
                         if mt != nil && mr != nil && ms != nil {
                                 thr, _ := atoiSafe(mt[1])
                                 srate, _ := parseInt64Safe(ms[1])
+                                // v0.9.32: resolve dest from cookie→dest map
+                                cookieStr := m[2]
+                                dest := ""
+                                if d, ok := pl.Cdest[cookieStr]; ok {
+                                        ds := destStr(d[0], d[1], d[2])
+                                        dest = labelFor(ds)
+                                        if dest == "" {
+                                                dest = ds
+                                        }
+                                }
                                 pl.MidsampRows = append(pl.MidsampRows, midsampRow{
                                         Thr:   thr,
                                         Srate: srate,
                                         Rport: mr[1],
+                                        Dest:  dest,
                                 })
                         }
 
@@ -592,7 +604,7 @@ func (pl *parsedLog) GetRateRaw() []interface{} {
                         "thr":   mr.Thr,
                         "srate": mr.Srate,
                         "rport": mr.Rport,
-                        "dest":  "",  // midsamp rows don't have dest in the log
+                        "dest":  mr.Dest,  // v0.9.32: now populated from cookie→dest map
                 })
         }
         return out
