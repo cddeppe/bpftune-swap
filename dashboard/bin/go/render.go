@@ -508,28 +508,7 @@ func (h *historyStore) renderBucketToDisk(bucketID, safe string, swapOutcomes in
 
         if raw := h.raw[bucketID]; len(raw) > 0 {
                 last := raw[len(raw)-1]
-                // v0.7.2: build map from arrays for JSON output
-                reMap := map[string]interface{}{}
-                for i, alg := range CONGS {
-                        if i >= 16 {
-                                break
-                        }
-                        if last.Re[i] != 0 {
-                                reMap[alg] = last.Re[i]
-                        }
-                }
-                doc["last"] = map[string]interface{}{
-                        "collected_ts": last.Ts,
-                        "best_alg":     last.BestAlg,
-                        "best_i":       last.BestI,
-                        "instances":    last.Instances,
-                        "ref_rate":     last.RefRate,
-                        "min_rtt":      last.MinRtt,
-                        "rate_best_i":  last.RateBestI,
-                        "rate_best_v":  last.RateBestV,
-                        "tcp_rmem_max": last.TcpRmemMax,
-                        "re":           reMap,
-                }
+                doc["last"] = buildLastSnapshotMap(last)
         }
 
         writeJSONToDisk("bucket_"+safe+".json", doc)
@@ -666,27 +645,7 @@ func (h *historyStore) renderBucketToDiskPreserving(bucketID, safe string, swapO
 
         if raw := h.raw[bucketID]; len(raw) > 0 {
                 last := raw[len(raw)-1]
-                reMap := map[string]interface{}{}
-                for i, alg := range CONGS {
-                        if i >= 16 {
-                                break
-                        }
-                        if last.Re[i] != 0 {
-                                reMap[alg] = last.Re[i]
-                        }
-                }
-                doc["last"] = map[string]interface{}{
-                        "collected_ts": last.Ts,
-                        "best_alg":     last.BestAlg,
-                        "best_i":       last.BestI,
-                        "instances":    last.Instances,
-                        "ref_rate":     last.RefRate,
-                        "min_rtt":      last.MinRtt,
-                        "rate_best_i":  last.RateBestI,
-                        "rate_best_v":  last.RateBestV,
-                        "tcp_rmem_max": last.TcpRmemMax,
-                        "re":           reMap,
-                }
+                doc["last"] = buildLastSnapshotMap(last)
         }
 
         writeJSONToDisk("bucket_"+safe+".json", doc)
@@ -797,6 +756,49 @@ func writeJSONToDisk(name string, doc interface{}) {
         tmp := path + ".tmp"
         _ = os.WriteFile(tmp, data, 0644)
         _ = os.Rename(tmp, path)
+}
+
+// buildLastSnapshotMap converts the most recent bucketSnapshot into the
+// JSON "last" object. v0.9.32: now includes ss/bs/ns per alg so the Swap
+// Target Pick table shows correct penalty values when live metric_by_bucket
+// is unavailable (24h+ ranges, or briefly inactive buckets).
+func buildLastSnapshotMap(last bucketSnapshot) map[string]interface{} {
+        reMap := map[string]interface{}{}
+        ssMap := map[string]interface{}{}
+        bsMap := map[string]interface{}{}
+        nsMap := map[string]interface{}{}
+        for i, alg := range CONGS {
+                if i >= 16 {
+                        break
+                }
+                if last.Re[i] != 0 {
+                        reMap[alg] = last.Re[i]
+                }
+                if last.Ss[i] != 0 {
+                        ssMap[alg] = last.Ss[i]
+                }
+                if last.Bs[i] != 0 {
+                        bsMap[alg] = last.Bs[i]
+                }
+                if last.Ns[i] != 0 {
+                        nsMap[alg] = last.Ns[i]
+                }
+        }
+        return map[string]interface{}{
+                "collected_ts": last.Ts,
+                "best_alg":     last.BestAlg,
+                "best_i":       last.BestI,
+                "instances":    last.Instances,
+                "ref_rate":     last.RefRate,
+                "min_rtt":      last.MinRtt,
+                "rate_best_i":  last.RateBestI,
+                "rate_best_v":  last.RateBestV,
+                "tcp_rmem_max": last.TcpRmemMax,
+                "re":           reMap,
+                "ss":           ssMap,
+                "bs":           bsMap,
+                "ns":           nsMap,
+        }
 }
 
 // countSwapsPerBin counts swap events per time bin for a specific bucket.

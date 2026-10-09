@@ -1512,6 +1512,9 @@
 
   var state  = { meta: null, bucketDoc: null, swaps: null, fleet: null, metricByBucket: null, bucketLive: {}, recentSwapsByBucket: null };
   var charts = {};
+  // v0.9.32: cache for /data/swaps_per_bin.json responses
+  var swapsPerBinCache = {};
+  var swapsPerBinInflight = {};
 
   function mk(id, cfg) {
     var cv = $(id);
@@ -1567,6 +1570,39 @@
       if (!r.ok) { throw new Error(url + ": " + r.status); }
       return r.json();
     });
+  }
+
+  // v0.9.32: fetch swaps-per-bin data from the dynamic endpoint.
+  // Returns cached data immediately if fresh (<30s), kicks off async refresh.
+  function fetchSwapsPerBin(rng, bucket, cb) {
+    var key = rng + "|" + (bucket || "all");
+    var now = Date.now();
+    var cached = swapsPerBinCache[key];
+    var fresh = cached && (now - cached.fetchedAt) < 30000;
+    if (swapsPerBinInflight[key]) {
+      if (cached) cb(cached, false);
+      swapsPerBinInflight[key].push(cb);
+      return;
+    }
+    if (fresh) { cb(cached, true); return; }
+    if (cached) cb(cached, false);
+    swapsPerBinInflight[key] = [cb];
+    fetch("/data/swaps_per_bin.json?range=" + encodeURIComponent(rng) +
+          "&bucket=" + encodeURIComponent(bucket || "all"),
+          {cache: "no-store"})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(doc) {
+        if (!doc || !doc.ts) return;
+        doc.fetchedAt = Date.now();
+        swapsPerBinCache[key] = doc;
+        var waiters = swapsPerBinInflight[key] || [];
+        delete swapsPerBinInflight[key];
+        waiters.forEach(function(w) { w(doc, true); });
+      })
+      .catch(function() {
+        var waiters = swapsPerBinInflight[key] || [];
+        delete swapsPerBinInflight[key];
+      });
   }
 
   function lineData(cols, series, ts, colors, scale, pointRadius) {
@@ -1646,6 +1682,7 @@
       "1h":  {rSec: 3600,    interval: 60},
       "24h": {rSec: 86400,   interval: 1800},
       "7d":  {rSec: 604800,  interval: 7200},
+      "30d": {rSec: 2592000, interval: 21600},
     };
     var c = cfg[rng];
     if (!c) return null;
@@ -2129,6 +2166,50 @@
         });
         d = {ts: fixedAxis.ts, swaps: swapCounts};
       }
+    }
+    // v0.9.32: fetch from dynamic /data/swaps_per_bin.json endpoint for 24h+
+    // This reads swaps.csv directly, always fresh, handles labeled buckets.
+    if (!d && rng !== "1h") {
+      var bk = _currentBucketLabel();
+      var bucketForFetch = (bk.bid === "all") ? "all" : (bk.label || bk.bid);
+      var key = rng + "|" + bucketForFetch;
+      var cached = swapsPerBinCache[key];
+      if (cached && cached.ts && cached.swaps) {
+        var __now = (window.__current_doc && window.__current_doc.generated_ts) || (Date.now() / 1000);
+        var __fa = buildFixedAxis(rng, __now);
+        if (__fa) {
+          var rebinned = __fa.ts.map(function(){return 0;});
+          var maxDist = __fa.interval * 1.5;
+          for (var si = 0; si < cached.ts.length; si++) {
+            var t = cached.ts[si];
+            if (t < __fa.ts[0] - maxDist || t > __fa.ts[__fa.ts.length - 1] + maxDist) continue;
+            if (t <= __fa.ts[0]) { rebinned[0] += (cached.swaps[si] || 0); continue; }
+            var hi = __fa.ts.length - 1;
+            if (t >= __fa.ts[hi]) { rebinned[hi] += (cached.swaps[si] || 0); continue; }
+            var lo = 0;
+            while (lo < hi - 1) {
+              var mid = (lo + hi) >> 1;
+              if (__fa.ts[mid] <= t) lo = mid; else hi = mid;
+            }
+            if (Math.abs(t - __fa.ts[lo]) <= Math.abs(t - __fa.ts[hi])) {
+              rebinned[lo] += (cached.swaps[si] || 0);
+            } else {
+              rebinned[hi] += (cached.swaps[si] || 0);
+            }
+          }
+          d = {ts: __fa.ts, swaps: rebinned};
+          window.__chart_axis_min = __fa.ts[0] * 1000;
+          window.__chart_axis_max = __fa.ts[__fa.ts.length - 1] * 1000;
+        } else {
+          d = {ts: cached.ts, swaps: cached.swaps};
+          window.__chart_axis_min = undefined;
+          window.__chart_axis_max = undefined;
+        }
+      }
+      // Kick off async refresh; re-render when fresh data arrives
+      fetchSwapsPerBin(rng, bucketForFetch, function(doc, fresh) {
+        if (fresh) _safeRender('swaps', function() { renderSwaps(); });
+      });
     }
     if (!d && state.bucketDoc && state.bucketDoc.series && state.bucketDoc.series[rng] && state.bucketDoc.series[rng].swaps) {
       var s2 = state.bucketDoc.series[rng];

@@ -240,6 +240,10 @@ func (c *Collector) handleIndex(w http.ResponseWriter, r *http.Request) {
                         }
                         return
                 }
+                if sub == "swaps_per_bin.json" {
+                        hist.handleSwapsPerBinJSON(w, r)
+                        return
+                }
                 c.serveStatic(w, r, staticPath, "")
                 return
         }
