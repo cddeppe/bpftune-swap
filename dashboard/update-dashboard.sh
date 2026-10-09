@@ -176,8 +176,26 @@ echo "  Done: $(stat -c%s "$INSTALL_DIR/dashboard.js" 2>/dev/null || stat -f%z "
 echo ""
 
 # Download other static assets (from the dashboard branch, not releases)
+# v0.9.32: always download dashboard.css and index.html (they may have
+# changed). Only skip the large vendor files (chart.umd, chartjs-adapter)
+# and labels-api.py if they already exist.
 echo "[5/6] Checking static assets..."
-for ASSET in index.html dashboard.css chart.umd.min.js chartjs-adapter-date-fns.bundle.min.js labels-api.py; do
+for ASSET in index.html dashboard.css; do
+    echo "  Downloading $ASSET..."
+    curl -sL -f -o "$INSTALL_DIR/$ASSET" \
+        "https://github.com/$REPO/releases/download/$VERSION/$ASSET" 2>/dev/null
+    if [ ! -s "$INSTALL_DIR/$ASSET" ]; then
+        # Fallback to raw.githubusercontent if not in release
+        curl -sL -f -o "$INSTALL_DIR/$ASSET" \
+            "https://raw.githubusercontent.com/$REPO/dashboard/dashboard/bin/$ASSET" 2>/dev/null || true
+    fi
+    if [ -s "$INSTALL_DIR/$ASSET" ]; then
+        echo "    ✓ Downloaded"
+    else
+        echo "    ✗ Failed (non-critical)"
+    fi
+done
+for ASSET in chart.umd.min.js chartjs-adapter-date-fns.bundle.min.js labels-api.py; do
     if [ ! -f "$INSTALL_DIR/$ASSET" ]; then
         echo "  Downloading $ASSET..."
         curl -sL -f -o "$INSTALL_DIR/$ASSET" \
