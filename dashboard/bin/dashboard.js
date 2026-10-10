@@ -1304,6 +1304,7 @@
     _safeRender('swaps', function() { renderSwaps(); });
     _safeRender('score-now', function() { renderScoreNow(); });
     renderRouteHealth(doc);
+    renderOriginHealth(doc);
     _safeRender('div', function() { renderDivChart("div", ""); });
     _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
     state.lastLiveSwaps = doc.recent_swaps || [];
@@ -2221,6 +2222,94 @@
     });
     html += '</div>';
     setHTML("lv-route-health", html);
+  }
+
+  // v0.9.33: Origin Health panel — shows ALL route_monitor destinations
+  // (not filtered by bucket). Displays top incoming traffic destinations
+  // with their IPv4/IPv6 health comparison.
+  function renderOriginHealth(doc) {
+    var el = $("lv-origin-health");
+    if (!el) return;
+    if (!doc) return;
+
+    var rm = doc.route_monitor;
+    if (!rm || !rm.length) {
+      setHTML("lv-origin-health", '<div class="placeholder">(discovering destinations&hellip;)</div>');
+      return;
+    }
+
+    // Sort: dual-stack first (most interesting), then by label
+    var sorted = rm.slice().sort(function(a, b) {
+      var aDual = (a.has_ipv4 && a.has_ipv6) ? 0 : 1;
+      var bDual = (b.has_ipv4 && b.has_ipv6) ? 0 : 1;
+      if (aDual !== bDual) return aDual - bDual;
+      return (a.label || "").localeCompare(b.label || "");
+    });
+
+    // Show up to 10
+    var shown = sorted.slice(0, 10);
+
+    var html = '<div class="route-health">';
+    shown.forEach(function(r) {
+      var label = r.label || "?";
+      var hasV4 = r.has_ipv4;
+      var hasV6 = r.has_ipv6;
+      var preferred = r.preferred || "";
+
+      // Build compact row showing both protocols side by side
+      var v4Rtt = r.v4_rtt_ms != null ? r.v4_rtt_ms.toFixed(1) : "—";
+      var v4Loss = r.v4_loss_pct != null ? r.v4_loss_pct.toFixed(1) : "—";
+      var v6Rtt = r.v6_rtt_ms != null ? r.v6_rtt_ms.toFixed(1) : "—";
+      var v6Loss = r.v6_loss_pct != null ? r.v6_loss_pct.toFixed(1) : "—";
+
+      // Determine which protocol is better (lower RTT + loss wins)
+      var betterProto = "";
+      if (hasV4 && hasV6) {
+        var v4Score = (r.v4_loss_pct || 0) * 10 + (r.v4_rtt_ms || 999);
+        var v6Score = (r.v6_loss_pct || 0) * 10 + (r.v6_rtt_ms || 999);
+        if (v4Score < v6Score) betterProto = "v4";
+        else if (v6Score < v4Score) betterProto = "v6";
+      }
+
+      // Highlight the preferred/better protocol
+      var v4Class = betterProto === "v4" ? "good" : "";
+      var v6Class = betterProto === "v6" ? "good" : "";
+
+      var protoBadge = hasV4 && hasV6 ? 'dual' : (hasV6 ? 'ipv6' : 'ipv4');
+
+      var preferredBadge = "";
+      if (preferred === "ipv4") preferredBadge = ' <span style="color:#4285f4;font-size:9px">◄ pref</span>';
+      if (preferred === "ipv6") preferredBadge = ' <span style="color:#34a853;font-size:9px">◄ pref</span>';
+
+      html += '<div class="route-row" style="flex-wrap:wrap;">' +
+        '<span class="route-proto ' + protoBadge + '">' + esc(protoBadge) + '</span>' +
+        '<span style="min-width:80px;color:var(--fg);font-weight:600;">' + esc(label) + preferredBadge + '</span>';
+
+      if (hasV4) {
+        var v4HealthClass = (r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good";
+        html += '<span class="route-metric' + (v4HealthClass === 'good' ? '' : '') + '" style="' +
+          (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
+          'v4: <b>' + v4Rtt + '</b>ms <b>' + v4Loss + '%</b></span>';
+      }
+      if (hasV6) {
+        var v6HealthClass = (r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good";
+        html += '<span class="route-metric" style="' +
+          (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
+          'v6: <b>' + v6Rtt + '</b>ms <b>' + v6Loss + '%</b></span>';
+      }
+      if (!hasV4 && !hasV6) {
+        html += '<span class="route-metric">(no data)</span>';
+      }
+
+      // Show last switch reason if any
+      if (r.last_switch_reason) {
+        html += '<span style="font-size:9px;color:var(--muted-2);width:100%;">' + esc(r.last_switch_reason) + '</span>';
+      }
+
+      html += '</div>';
+    });
+    html += '</div>';
+    setHTML("lv-origin-health", html);
   }
 
   function renderSwaps() {
