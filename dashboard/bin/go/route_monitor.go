@@ -317,12 +317,19 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         }
 
         // Update streaks (hysteresis: 3 consecutive readings needed)
+        // v0.9.34: treat "100% loss + 0ms RTT" as "ping failed" (no data),
+        // NOT as "path is degraded". Only count as bad if we have a real
+        // RTT measurement with actual loss.
         const badLossThreshold = 5.0   // 5% loss = bad
         const badRTTThreshold = 100.0   // 100ms = degraded
         const goodLossThreshold = 1.0   // <1% loss = good
         const goodRTTThreshold = 50.0    // <50ms = good
 
-        if state.HasIPv4 {
+        // v0.9.34: isDataValid returns false for "ping failed" (100% loss, 0ms RTT)
+        v4DataValid := v4RTT > 0 || v4Loss < 100
+        v6DataValid := v6RTT > 0 || v6Loss < 100
+
+        if state.HasIPv4 && v4DataValid {
                 if v4Loss >= badLossThreshold || v4RTT >= badRTTThreshold {
                         state.v4BadStreak++
                         state.v4GoodStreak = 0
@@ -330,8 +337,12 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                         state.v4GoodStreak++
                         state.v4BadStreak = 0
                 }
+        } else if state.HasIPv4 {
+                // Ping failed — reset streaks (don't count as good or bad)
+                state.v4BadStreak = 0
+                state.v4GoodStreak = 0
         }
-        if state.HasIPv6 {
+        if state.HasIPv6 && v6DataValid {
                 if v6Loss >= badLossThreshold || v6RTT >= badRTTThreshold {
                         state.v6BadStreak++
                         state.v6GoodStreak = 0
@@ -339,6 +350,9 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                         state.v6GoodStreak++
                         state.v6BadStreak = 0
                 }
+        } else if state.HasIPv6 {
+                state.v6BadStreak = 0
+                state.v6GoodStreak = 0
         }
 
         // Decision logic: only switch if both protocols are available
