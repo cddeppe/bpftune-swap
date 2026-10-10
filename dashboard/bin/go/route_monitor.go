@@ -120,6 +120,8 @@ func (rm *RouteMonitor) cycle() {
 }
 
 // discoverDestinations finds dual-stack destinations from the BPF map.
+// Also resolves DNS for labeled destinations to discover IPv6 addresses
+// that may not appear in the BPF map (if xray only connected via IPv4).
 func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[string]interface{}) {
         // Group by label
         byLabel := map[string][]hostEntry{}
@@ -156,6 +158,22 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                         } else {
                                 hasV4 = true
                                 v4Addr = h.Addr
+                        }
+                }
+
+                // If we only have IPv4 in the BPF map, try DNS resolution
+                // to discover if the destination also has IPv6.
+                if hasV4 && !hasV6 {
+                        // Try to resolve the raw IPv4 address back to a hostname,
+                        // then look up AAAA records. This works for labeled
+                        // destinations in /etc/bpftune/aliases.
+                        if v4Addr != "" && !strings.HasPrefix(v4Addr, "v6:") {
+                                // Try reverse DNS + forward AAAA lookup
+                                v6Resolved := resolveIPv6ForAddr(v4Addr)
+                                if v6Resolved != "" {
+                                        hasV6 = true
+                                        v6Addr = v6Resolved
+                                }
                         }
                 }
 
@@ -217,19 +235,20 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                 }
         }
 
-        // If BPF data is zero (receive-only destination), fall back to pings
+        // If BPF data is zero (receive-only destination OR no metrics yet),
+        // fall back to pings for both protocols.
         if !state.UsingBPF || (state.V4BpfRTT == 0 && state.V6BpfRTT == 0) {
+                // Always ping when BPF metrics are zero
+                state.UsingBPF = false
                 if state.HasIPv4 && state.IPv4Addr != "" {
                         rtt, loss := pingDest(state.IPv4Addr, 5)
                         state.V4PingRTT = rtt
                         state.V4PingLoss = loss
-                        state.UsingBPF = false
                 }
                 if state.HasIPv6 && state.IPv6Addr != "" {
                         rtt, loss := pingDest(state.IPv6Addr, 5)
                         state.V6PingRTT = rtt
                         state.V6PingLoss = loss
-                        state.UsingBPF = false
                 }
         }
 
@@ -479,4 +498,46 @@ func (rm *RouteMonitor) getState() []interface{} {
         })
 
         return out
+}
+
+// resolveIPv6ForAddr tries to find an IPv6 address for a destination
+// that only has IPv4 in the BPF map. Uses reverse DNS to find the
+// hostname, then forward DNS for AAAA records.
+func resolveIPv6ForAddr(v4Addr string) string {
+        // Strip any prefix
+        v4 := strings.TrimPrefix(v4Addr, "v4:")
+        v4 = strings.Split(v4, "/")[0]
+
+        // Parse the IPv4 address
+        ip := net.ParseIP(v4)
+        if ip == nil || ip.To4() == nil {
+                return ""
+        }
+
+        // Try reverse DNS to get the hostname
+        ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+        defer cancel()
+        names, err := net.DefaultResolver.LookupAddr(ctx, ip.String())
+        if err != nil || len(names) == 0 {
+                return ""
+        }
+
+        // For each hostname, try to resolve AAAA records
+        for _, name := range names {
+                name = strings.TrimSuffix(name, ".")
+                ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+                defer cancel2()
+                ips, err := net.DefaultResolver.LookupIPAddr(ctx2, name)
+                if err != nil {
+                        continue
+                }
+                for _, ipa := range ips {
+                        if ipa.IP.To4() == nil && !ipa.IP.IsUnspecified() {
+                                // Found an IPv6 address
+                                return ipa.IP.String()
+                        }
+                }
+        }
+
+        return ""
 }
