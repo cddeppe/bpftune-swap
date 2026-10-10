@@ -1519,20 +1519,13 @@
   function mk(id, cfg) {
     var cv = $(id);
     if (!cv) return;
-    // 0.4.122: guard against Chart not being loaded yet — the very
-    // first liveRefresh fires before boot's _loadCharts() resolves,
-    // so mk() would throw "Chart is not defined". _safeRender catches
-    // it but the noise fills the console. Bail out silently instead.
     if (typeof Chart === "undefined") return;
-    // E1-fix: update an existing chart in place instead of destroy +
-    // recreate. The old code destroyed and re-created the chart on
-    // every 30s SSE push, causing flicker, loss of tooltips/hover
-    // state, and GC churn across 7 charts per push.
-    //
-    // We try to update the existing chart's data + options in place.
-    // Only destroy + recreate if the chart type changed (rare) or the
-    // dataset count changed (e.g. switching bucket ranges).
+    // v0.9.33: prevent "Canvas is already in use" when async callbacks
+    // (fetchSwapsPerBin) trigger a re-render while another render is
+    // already in progress on the same canvas.
     var existing = charts[id];
+    // Also check Chart.js's own registry — our map may be stale
+    var registered = Chart.getChart(cv);
     if (existing) {
       try {
         var sameType = !existing.config || !cfg.type ||
@@ -1543,26 +1536,29 @@
                           cfg.data.datasets &&
                           existing.data.datasets.length === cfg.data.datasets.length;
         if (sameType && sameDSCount) {
-          // In-place update: replace data + scales, keep the chart
-          // instance alive so hover state + animations are preserved.
           existing.data = cfg.data;
           if (cfg.options) {
             existing.options = cfg.options;
           }
-          existing.update('none'); // 'none' = no animation, instant
+          existing.update('none');
           return;
         }
       } catch (e) {
         // fall through to destroy + recreate
       }
       try { existing.destroy(); } catch(e) {}
-    } else {
-      // No existing chart in our map, but Chart.js may still have one
-      // registered for this canvas (e.g. after a tab restore). Clear it.
-      var stale = Chart.getChart(cv);
-      if (stale) { try { stale.destroy(); } catch(e) {} }
+    } else if (registered) {
+      // Our map doesn't have it but Chart.js does — destroy the stale one
+      try { registered.destroy(); } catch(e) {}
     }
-    charts[id] = new Chart(cv, cfg);
+    try {
+      charts[id] = new Chart(cv, cfg);
+    } catch(e) {
+      // Last resort: destroy whatever Chart.js has and retry
+      var stale = Chart.getChart(cv);
+      if (stale) { try { stale.destroy(); } catch(e2) {} }
+      try { charts[id] = new Chart(cv, cfg); } catch(e3) {}
+    }
   }
 
   function j(url) {
