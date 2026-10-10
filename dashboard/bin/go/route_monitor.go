@@ -41,6 +41,7 @@ type RouteMonitor struct {
 }
 
 type destRouteState struct {
+        mu sync.Mutex  // v0.9.34: per-state lock for concurrent access
         Label          string
         IPv4Addr       string  // e.g. "82.43.215.97" or "82.43.0.0"
         IPv6Addr       string  // e.g. "2603:c020::" or "v6:2603c020"
@@ -252,6 +253,9 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
 
 // evaluateDestination checks one destination and switches if needed.
 func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}) {
+        state.mu.Lock()
+        defer state.mu.Unlock()
+
         if !state.HasIPv4 && !state.HasIPv6 {
                 return
         }
@@ -523,12 +527,18 @@ func parsePingOutput(output string) (float64, float64) {
 }
 
 // getRouteMonitorState returns the current route monitor state for the dashboard.
+// Uses per-state locks so it doesn't block on concurrent pings.
 func (rm *RouteMonitor) getState() []interface{} {
         rm.mu.Lock()
-        defer rm.mu.Unlock()
-
-        out := make([]interface{}, 0, len(rm.destinations))
+        states := make([]*destRouteState, 0, len(rm.destinations))
         for _, state := range rm.destinations {
+                states = append(states, state)
+        }
+        rm.mu.Unlock()
+
+        out := make([]interface{}, 0, len(states))
+        for _, state := range states {
+                state.mu.Lock()
                 v4RTT := state.V4BpfRTT
                 v4Loss := state.V4BpfLoss
                 v6RTT := state.V6BpfRTT
@@ -541,18 +551,19 @@ func (rm *RouteMonitor) getState() []interface{} {
                 }
 
                 entry := map[string]interface{}{
-                        "label":          state.Label,
-                        "has_ipv4":       state.HasIPv4,
-                        "has_ipv6":       state.HasIPv6,
-                        "preferred":      state.PreferredProto,
-                        "v4_rtt_ms":      round1(v4RTT),
-                        "v4_loss_pct":    round1(v4Loss),
-                        "v6_rtt_ms":      round1(v6RTT),
-                        "v6_loss_pct":    round1(v6Loss),
-                        "using_bpf":      state.UsingBPF,
-                        "last_switch_ts": state.LastSwitchTs,
+                        "label":              state.Label,
+                        "has_ipv4":           state.HasIPv4,
+                        "has_ipv6":           state.HasIPv6,
+                        "preferred":          state.PreferredProto,
+                        "v4_rtt_ms":          round1(v4RTT),
+                        "v4_loss_pct":        round1(v4Loss),
+                        "v6_rtt_ms":          round1(v6RTT),
+                        "v6_loss_pct":        round1(v6Loss),
+                        "using_bpf":          state.UsingBPF,
+                        "last_switch_ts":     state.LastSwitchTs,
                         "last_switch_reason": state.LastSwitchReason,
                 }
+                state.mu.Unlock()
                 out = append(out, entry)
         }
 
