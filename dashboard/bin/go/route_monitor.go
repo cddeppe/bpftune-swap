@@ -119,15 +119,10 @@ func (rm *RouteMonitor) cycle() {
         rm.discoverDestinations(hosts, bpfHealth)
 }
 
-// discoverDestinations finds dual-stack destinations from the BPF map
-// AND from the aliases file. The BPF map may only have one protocol
-// (if xray only connected via IPv4), so we also check /etc/bpftune/aliases
-// for IPv6 addresses that share the same label.
+// discoverDestinations finds dual-stack destinations from the BPF map,
+// aliases file, AND DNS resolution for external destinations (YouTube, etc.).
 func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[string]interface{}) {
         // Step 1: Build label → IPv4/IPv6 address map from aliases file.
-        // The aliases file format is: "from_ip = to_ip label"
-        // e.g. "82.43.215.97 = 82.43.215.97 home-sco"
-        //       "2603:c020:8012::1 = 2603:c020:8012::1 home-sco"
         aliasLabels := loadAliasesLabelsMap()  // {to_ip: label}
         type protoAddrs struct {
                 v4 string
@@ -147,7 +142,7 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 }
         }
 
-        // Step 2: Also group BPF map entries by label
+        // Step 2: Group BPF map entries by label
         byLabel := map[string][]hostEntry{}
         for _, h := range hosts {
                 if h.Inst < 2 {
@@ -203,6 +198,17 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                         if !hasV6 && pa.v6 != "" {
                                 hasV6 = true
                                 v6Addr = pa.v6
+                        }
+                }
+
+                // v0.9.34: For external IPv4-only destinations (YouTube, etc.),
+                // try to discover IPv6 via DNS. These appear as /16 bucket
+                // addresses like "142.250.0.0" with no label and no aliases.
+                if hasV4 && !hasV6 && v4Addr != "" {
+                        v6Resolved := resolveIPv6ForBucket(v4Addr, label)
+                        if v6Resolved != "" {
+                                hasV6 = true
+                                v6Addr = v6Resolved
                         }
                 }
 
@@ -570,5 +576,66 @@ func resolveIPv6ForAddr(v4Addr string) string {
                 }
         }
 
+        return ""
+}
+
+// resolveIPv6ForBucket tries to discover an IPv6 address for a /16 bucket
+// address (e.g. "142.250.0.0"). Bucket addresses aren't real IPs, so
+// reverse DNS fails on them. Instead, we try the first usable IP in the
+// range (e.g. "142.250.0.1") and resolve that.
+// Also checks known CDN prefixes by /16 range.
+func resolveIPv6ForBucket(v4Bucket string, label string) string {
+        // If this is a labeled destination from aliases, skip — aliases handles it
+        if label != v4Bucket {
+                return ""
+        }
+
+        parts := strings.Split(v4Bucket, ".")
+        if len(parts) != 4 {
+                return ""
+        }
+
+        // Try reverse DNS on .0.1, .1.1, .0.2
+        testIPs := []string{
+                parts[0] + "." + parts[1] + ".0.1",
+                parts[0] + "." + parts[1] + ".1.1",
+                parts[0] + "." + parts[1] + ".0.2",
+        }
+        for _, testIP := range testIPs {
+                v6 := resolveIPv6ForAddr(testIP)
+                if v6 != "" {
+                        return v6
+                }
+        }
+
+        // Known CDN prefixes by /16
+        cdnprefix := parts[0] + "." + parts[1]
+        knownCDNs := map[string]string{
+                "142.250": "youtube.com",
+                "142.251": "youtube.com",
+                "172.217": "google.com",
+                "173.194": "google.com",
+                "192.178": "google.com",
+                "172.64":  "cloudflare.com",
+                "104.16":  "cloudflare.com",
+                "104.17":  "cloudflare.com",
+                "151.101": "fastly.com",
+                "199.232": "fastly.com",
+                "13.107":  "microsoft.com",
+                "20.190":  "microsoft.com",
+                "20.250":  "microsoft.com",
+        }
+        if hostname, ok := knownCDNs[cdnprefix]; ok {
+                ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+                defer cancel()
+                ips, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+                if err == nil {
+                        for _, ipa := range ips {
+                                if ipa.IP.To4() == nil && !ipa.IP.IsUnspecified() {
+                                        return ipa.IP.String()
+                                }
+                        }
+                }
+        }
         return ""
 }
