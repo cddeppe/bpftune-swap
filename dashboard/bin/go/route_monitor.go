@@ -96,27 +96,35 @@ func runRouteMonitor() {
 }
 
 // cycle runs one monitoring pass.
+// Does NOT hold the lock during pings/DNS — those can take 10+ seconds.
 func (rm *RouteMonitor) cycle() {
-        rm.mu.Lock()
-        defer rm.mu.Unlock()
-
-        // Get current BPF map data
+        // Step 1: Get BPF map data (no lock needed)
         hosts, err := readBPFMap()
         if err != nil {
                 fmt.Fprintf(os.Stderr, "[route-monitor] BPF map read failed: %v\n", err)
-                // Continue — we can still ping known destinations
         }
 
-        // Build per-destination health map from BPF data
         bpfHealth := buildRouteHealth(hosts, nil)
 
-        // For each known destination, evaluate and potentially switch
-        for label, state := range rm.destinations {
-                rm.evaluateDestination(label, state, bpfHealth)
-        }
-
-        // Discover new destinations from BPF map (for dual-stack detection)
+        // Step 2: Discover destinations (short lock — just map updates)
+        rm.mu.Lock()
         rm.discoverDestinations(hosts, bpfHealth)
+
+        // Step 3: Build a snapshot of destinations to evaluate (copy under lock)
+        type destEval struct {
+                label string
+                state *destRouteState
+        }
+        toEval := make([]destEval, 0, len(rm.destinations))
+        for label, state := range rm.destinations {
+                toEval = append(toEval, destEval{label, state})
+        }
+        rm.mu.Unlock()
+
+        // Step 4: Run pings/DNS OUTSIDE the lock (this is the slow part)
+        for _, de := range toEval {
+                rm.evaluateDestination(de.label, de.state, bpfHealth)
+        }
 }
 
 // discoverDestinations finds dual-stack destinations from the BPF map,
@@ -274,16 +282,16 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
 
         // If BPF data is zero (receive-only destination OR no metrics yet),
         // fall back to pings for both protocols.
+        // v0.9.33: use 3 pings (was 5) to reduce cycle time.
         if !state.UsingBPF || (state.V4BpfRTT == 0 && state.V6BpfRTT == 0) {
-                // Always ping when BPF metrics are zero
                 state.UsingBPF = false
                 if state.HasIPv4 && state.IPv4Addr != "" {
-                        rtt, loss := pingDest(state.IPv4Addr, 5)
+                        rtt, loss := pingDest(state.IPv4Addr, 3)
                         state.V4PingRTT = rtt
                         state.V4PingLoss = loss
                 }
                 if state.HasIPv6 && state.IPv6Addr != "" {
-                        rtt, loss := pingDest(state.IPv6Addr, 5)
+                        rtt, loss := pingDest(state.IPv6Addr, 3)
                         state.V6PingRTT = rtt
                         state.V6PingLoss = loss
                 }
