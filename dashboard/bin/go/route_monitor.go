@@ -489,13 +489,76 @@ func convertV6ForRoute(addr string) string {
 }
 
 // pingDest pings a destination and returns RTT (ms) and loss (percent).
+// v0.9.34: converts bucket addresses to real IPs before pinging.
+// Bucket addresses are /16 prefixes like "142.250.0.0" — pinging these
+// fails because they're not real hosts. We convert them to real IPs:
+//   - IPv4 /16: "142.250.0.0" → "142.250.0.1"
+//   - IPv4 /32: "82.43.215.97" → unchanged (already a real host)
+//   - IPv6 v6:hex: "v6:2800:3f0" → "2800:3f0::1" (expand hex to full IPv6)
+//   - IPv6 full: "2603:c020::" → unchanged if it has :: (try as-is, then append ::1)
+//   - Labeled aliases: use the actual IP from the aliases file
 func pingDest(addr string, count int) (float64, float64) {
-        // Strip v6: prefix for ping6
-        target := strings.TrimPrefix(addr, "v6:")
-        if strings.HasPrefix(addr, "v6:") || strings.Contains(addr, ":") {
+        target := normalizePingTarget(addr)
+        if target == "" {
+                return 0, 100
+        }
+        if strings.Contains(target, ":") {
                 return ping6(target, count)
         }
         return ping4(target, count)
+}
+
+// normalizePingTarget converts a bucket/prefix address to a pingable IP.
+func normalizePingTarget(addr string) string {
+        // Strip v6: prefix
+        addr = strings.TrimPrefix(addr, "v6:")
+        addr = strings.Split(addr, "/")[0]  // strip any CIDR suffix
+
+        // IPv6 addresses
+        if strings.Contains(addr, ":") {
+                // If it already has "::" and looks complete, try as-is
+                if strings.Contains(addr, "::") {
+                        // If it ends with "::", append "1" to make it a real host
+                        if strings.HasSuffix(addr, "::") {
+                                return addr + "1"
+                        }
+                        return addr  // looks like a real IPv6 address
+                }
+                // v6:hex format — convert to standard IPv6
+                // e.g. "2800:3f0" → "2800:3f0::1"
+                parts := strings.Split(addr, ":")
+                if len(parts) >= 2 {
+                        // Take the first two groups and pad to 4 hex chars each
+                        g1 := parts[0]
+                        g2 := parts[1]
+                        // Pad to 4 chars
+                        for len(g1) < 4 { g1 = "0" + g1 }
+                        for len(g2) < 4 { g2 = "0" + g2 }
+                        return g1 + ":" + g2 + "::1"
+                }
+                return ""
+        }
+
+        // IPv4 addresses
+        parts := strings.Split(addr, ".")
+        if len(parts) != 4 {
+                return ""
+        }
+
+        // If it's a /16 bucket (last two octets are 0), make it pingable
+        // "142.250.0.0" → "142.250.0.1"
+        if parts[2] == "0" && parts[3] == "0" {
+                return parts[0] + "." + parts[1] + ".0.1"
+        }
+
+        // If it's a /24 bucket (last octet is 0), make it pingable
+        // "82.43.215.0" → "82.43.215.1"
+        if parts[3] == "0" {
+                return parts[0] + "." + parts[1] + "." + parts[2] + ".1"
+        }
+
+        // Already a real host IP
+        return addr
 }
 
 func ping4(target string, count int) (float64, float64) {
