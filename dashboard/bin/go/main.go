@@ -604,10 +604,12 @@ func main() {
         // v0.7.3: configurable ring buffer cap.  Default 120 = 1h at 30s.
         // For servers with more buckets, use 60 (30min) to save memory.
         ringCapFlag := flag.Int("ring-cap", 120, "ring buffer entries per bucket (120=1h, 60=30min, 240=2h)")
-        collectorModeFlag := flag.String("collector-mode", "normal", "collector mode: lean|normal|debug")
+        collectorModeFlag := flag.String("collector-mode", "normal", "collector mode: lean|normal|debug|normal-light")
+        routeMonitorFlag := flag.Bool("route-monitor", false, "enable per-destination IPv4/IPv6 route preference switching")
         flag.Parse()
         collectorMode = parseCollectorMode(*collectorModeFlag)
-        fmt.Fprintf(os.Stderr, "collector: mode=%s interval=%s logTail=%dMB\n", collectorMode.Name, collectorMode.CollectInterval, collectorMode.LogTailBytes/1_000_000)
+        routeMonitorEnabled = *routeMonitorFlag
+        fmt.Fprintf(os.Stderr, "collector: mode=%s interval=%s logTail=%dMB routeMonitor=%v\n", collectorMode.Name, collectorMode.CollectInterval, collectorMode.LogTailBytes/1_000_000, routeMonitorEnabled)
 
         // v0.7.3: set ring buffer cap
         ringCap = *ringCapFlag
@@ -651,6 +653,9 @@ func main() {
         initSQLite()
 
         collector := NewCollector()
+
+        // v0.9.33: start route monitor goroutine (if enabled via --route-monitor)
+        go runRouteMonitor()
 
         // Synchronous first collect — current.json populated before HTTP starts.
         collector.collect()
