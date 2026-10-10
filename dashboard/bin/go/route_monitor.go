@@ -360,8 +360,10 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         const goodRTTThreshold = 50.0    // <50ms = good
 
         // v0.9.34: isDataValid returns false for "ping failed" (100% loss, 0ms RTT)
-        v4DataValid := v4RTT > 0 || v4Loss < 100
-        v6DataValid := v6RTT > 0 || v6Loss < 100
+        // AND for "no measurement" (0ms RTT with any loss).
+        // A real ping always returns RTT > 0. RTT = 0 means no data.
+        v4DataValid := v4RTT > 0
+        v6DataValid := v6RTT > 0
 
         if state.HasIPv4 && v4DataValid {
                 if v4Loss >= badLossThreshold || v4RTT >= badRTTThreshold {
