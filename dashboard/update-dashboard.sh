@@ -182,17 +182,19 @@ echo ""
 echo "[5/6] Checking static assets..."
 for ASSET in index.html dashboard.css; do
     echo "  Downloading $ASSET..."
-    curl -sL -f -o "$INSTALL_DIR/$ASSET" \
+    # Try release first, fall back to raw.githubusercontent
+    curl -sL -f -o "$INSTALL_DIR/$ASSET.new" \
         "https://github.com/$REPO/releases/download/$VERSION/$ASSET" 2>/dev/null
-    if [ ! -s "$INSTALL_DIR/$ASSET" ]; then
-        # Fallback to raw.githubusercontent if not in release
-        curl -sL -f -o "$INSTALL_DIR/$ASSET" \
+    if [ ! -s "$INSTALL_DIR/$ASSET.new" ]; then
+        curl -sL -f -o "$INSTALL_DIR/$ASSET.new" \
             "https://raw.githubusercontent.com/$REPO/dashboard/dashboard/bin/$ASSET" 2>/dev/null || true
     fi
-    if [ -s "$INSTALL_DIR/$ASSET" ]; then
+    if [ -s "$INSTALL_DIR/$ASSET.new" ]; then
+        mv "$INSTALL_DIR/$ASSET.new" "$INSTALL_DIR/$ASSET"
         echo "    ✓ Downloaded"
     else
-        echo "    ✗ Failed (non-critical)"
+        rm -f "$INSTALL_DIR/$ASSET.new"
+        echo "    ✓ Keeping existing (not in release)"
     fi
 done
 for ASSET in chart.umd.min.js chartjs-adapter-date-fns.bundle.min.js labels-api.py; do
