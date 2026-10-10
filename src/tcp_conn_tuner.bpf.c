@@ -976,6 +976,20 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 statep->cleaned = 1;
         }
     s = statep->state & (NUM_TCP_CONG_ALGS - 1);
+    /* v0.4.103: Record min_rtt for ALL connections — including
+     * receive-only (YouTube, etc.) — BEFORE the direction gate below.
+     * This gives the route monitor real RTT data from actual connections
+     * for all destinations, not just the ones where the VPS is the sender.
+     * Must run before METRIC_MIN_SEGS check (line 979) and direction gate
+     * (line 1014) which both return early for receive-only connections. */
+    {
+        __u64 rtt_min_val = (__u64)tp->rtt_min.s[0].v;
+        if (rtt_min_val > 0 && (!remote_host->min_rtt || rtt_min_val < remote_host->min_rtt)) {
+            __sync_fetch_and_add(&remote_host->seq, 1);
+            remote_host->min_rtt = rtt_min_val;
+            __sync_fetch_and_add(&remote_host->seq, 1);
+        }
+    }
     if ((__u64)tp->segs_out + tp->segs_in < METRIC_MIN_SEGS)
         return 1;
     /* 0.4.42: skip sockets where we are primarily receiving.  On an
@@ -1044,13 +1058,6 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         return 1;
     min_rtt = (__u64)tp->rtt_min.s[0].v;
     avg_rtt = (__u64)(tp->srtt_us >> 3);
-    /* v0.4.103: Record min_rtt for ALL connections — including
-     * receive-only (YouTube, etc.) — BEFORE the direction gate below.
-     * This gives the route monitor real RTT data from actual connections
-     * for all destinations, not just the ones where the VPS is the sender.
-     * One comparison + one assignment. No swapping, no metric accumulation. */
-    if (min_rtt > 0 && (!remote_host->min_rtt || min_rtt < remote_host->min_rtt))
-        remote_host->min_rtt = min_rtt;
     rate_interval_us = (__u64)tp->rate_interval_us;
     mss = (__u64)tp->mss_cache;
     /* 0.4.71: two distinct signals.
