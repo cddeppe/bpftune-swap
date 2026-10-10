@@ -2592,12 +2592,14 @@ _safeRender("score-now", function() { renderScoreNow(); });
       renderMetricForBucket();
       _safeRender("score-now", function() { renderScoreNow(); });
       renderRouteHealth(window.__current_doc);
+      renderOriginHealth(window.__current_doc);
     }).catch(function (e) {
       state.bucketDoc = null;
       renderNow();
       renderRecentSwapsForBucket();
       renderMetricForBucket();
       renderRouteHealth(window.__current_doc);
+      renderOriginHealth(window.__current_doc);
     });
   }
 
