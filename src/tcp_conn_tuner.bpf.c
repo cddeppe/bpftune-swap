@@ -1044,6 +1044,13 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         return 1;
     min_rtt = (__u64)tp->rtt_min.s[0].v;
     avg_rtt = (__u64)(tp->srtt_us >> 3);
+    /* v0.4.103: Record min_rtt for ALL connections — including
+     * receive-only (YouTube, etc.) — BEFORE the direction gate below.
+     * This gives the route monitor real RTT data from actual connections
+     * for all destinations, not just the ones where the VPS is the sender.
+     * One comparison + one assignment. No swapping, no metric accumulation. */
+    if (min_rtt > 0 && (!remote_host->min_rtt || min_rtt < remote_host->min_rtt))
+        remote_host->min_rtt = min_rtt;
     rate_interval_us = (__u64)tp->rate_interval_us;
     mss = (__u64)tp->mss_cache;
     /* 0.4.71: two distinct signals.

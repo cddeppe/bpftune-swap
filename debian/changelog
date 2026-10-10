@@ -1,3 +1,16 @@
+bpftune (0.4.103) unstable; urgency=medium
+
+  * Record min_rtt for ALL connections (including receive-only).
+    The BPF vote handler direction gate skips receive-only connections
+    (YouTube to VPS) BEFORE tcp_metric_calc runs, so remote_host->min_rtt
+    was never updated for those destinations. The route monitor had no
+    RTT data for YouTube/Google and had to fall back to pings.
+    Fix: record min_rtt BEFORE the direction gate. One comparison +
+    one assignment per connection. No swapping, no metric accumulation,
+    no verifier complexity.
+
+ -- Christophe Deppe <cdeppe@gmail.com>  Wed, 10 Oct 2026 10:00:00 +0200
+
 bpftune (0.4.102) unstable; urgency=medium
 
   * Fix E2BIG BPF load failure introduced in v0.4.99.
