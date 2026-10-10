@@ -119,11 +119,35 @@ func (rm *RouteMonitor) cycle() {
         rm.discoverDestinations(hosts, bpfHealth)
 }
 
-// discoverDestinations finds dual-stack destinations from the BPF map.
-// Also resolves DNS for labeled destinations to discover IPv6 addresses
-// that may not appear in the BPF map (if xray only connected via IPv4).
+// discoverDestinations finds dual-stack destinations from the BPF map
+// AND from the aliases file. The BPF map may only have one protocol
+// (if xray only connected via IPv4), so we also check /etc/bpftune/aliases
+// for IPv6 addresses that share the same label.
 func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[string]interface{}) {
-        // Group by label
+        // Step 1: Build label → IPv4/IPv6 address map from aliases file.
+        // The aliases file format is: "from_ip = to_ip label"
+        // e.g. "82.43.215.97 = 82.43.215.97 home-sco"
+        //       "2603:c020:8012::1 = 2603:c020:8012::1 home-sco"
+        aliasLabels := loadAliasesLabelsMap()  // {to_ip: label}
+        type protoAddrs struct {
+                v4 string
+                v6 string
+        }
+        labelAddrs := map[string]*protoAddrs{}
+        for ip, lbl := range aliasLabels {
+                pa, ok := labelAddrs[lbl]
+                if !ok {
+                        pa = &protoAddrs{}
+                        labelAddrs[lbl] = pa
+                }
+                if strings.Contains(ip, ":") {
+                        pa.v6 = ip
+                } else {
+                        pa.v4 = ip
+                }
+        }
+
+        // Step 2: Also group BPF map entries by label
         byLabel := map[string][]hostEntry{}
         for _, h := range hosts {
                 if h.Inst < 2 {
@@ -138,42 +162,47 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 }
                 lbl := labelFor(addr)
                 if lbl == "" {
-                        lbl = addr  // no label, use raw addr
+                        lbl = addr
                 }
                 byLabel[lbl] = append(byLabel[lbl], h)
         }
 
-        // For each label, check if we have both IPv4 and IPv6
-        for label, entries := range byLabel {
-                if len(entries) < 1 {
-                        continue
-                }
+        // Step 3: Merge BPF + aliases data
+        allLabels := map[string]bool{}
+        for lbl := range byLabel {
+                allLabels[lbl] = true
+        }
+        for lbl := range labelAddrs {
+                allLabels[lbl] = true
+        }
+
+        for label := range allLabels {
                 hasV4 := false
                 hasV6 := false
                 var v4Addr, v6Addr string
-                for _, h := range entries {
-                        if strings.Contains(h.Addr, ":") || strings.HasPrefix(h.Addr, "v6:") {
-                                hasV6 = true
-                                v6Addr = h.Addr
-                        } else {
-                                hasV4 = true
-                                v4Addr = h.Addr
+
+                // From BPF map
+                if entries, ok := byLabel[label]; ok {
+                        for _, h := range entries {
+                                if strings.Contains(h.Addr, ":") || strings.HasPrefix(h.Addr, "v6:") {
+                                        hasV6 = true
+                                        v6Addr = h.Addr
+                                } else {
+                                        hasV4 = true
+                                        v4Addr = h.Addr
+                                }
                         }
                 }
 
-                // If we only have IPv4 in the BPF map, try DNS resolution
-                // to discover if the destination also has IPv6.
-                if hasV4 && !hasV6 {
-                        // Try to resolve the raw IPv4 address back to a hostname,
-                        // then look up AAAA records. This works for labeled
-                        // destinations in /etc/bpftune/aliases.
-                        if v4Addr != "" && !strings.HasPrefix(v4Addr, "v6:") {
-                                // Try reverse DNS + forward AAAA lookup
-                                v6Resolved := resolveIPv6ForAddr(v4Addr)
-                                if v6Resolved != "" {
-                                        hasV6 = true
-                                        v6Addr = v6Resolved
-                                }
+                // From aliases file (fills in the missing protocol)
+                if pa, ok := labelAddrs[label]; ok {
+                        if !hasV4 && pa.v4 != "" {
+                                hasV4 = true
+                                v4Addr = pa.v4
+                        }
+                        if !hasV6 && pa.v6 != "" {
+                                hasV6 = true
+                                v6Addr = pa.v6
                         }
                 }
 
@@ -186,6 +215,8 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 if !ok {
                         state = &destRouteState{Label: label}
                         rm.destinations[label] = state
+                        fmt.Fprintf(os.Stderr, "[route-monitor] discovered %s: v4=%v(%s) v6=%v(%s)\n",
+                                label, hasV4, v4Addr, hasV6, v6Addr)
                 }
                 state.HasIPv4 = hasV4
                 state.HasIPv6 = hasV6
