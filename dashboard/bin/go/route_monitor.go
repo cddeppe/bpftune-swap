@@ -265,73 +265,90 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
 }
 
 // evaluateDestination checks one destination and switches if needed.
+// v0.9.34: does NOT hold state.mu during pings — only locks briefly
+// to read/write fields. This prevents getState() from blocking.
 func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}) {
+        // Step 1: Read state under lock (fast — no I/O)
         state.mu.Lock()
-        defer state.mu.Unlock()
+        hasV4 := state.HasIPv4
+        hasV6 := state.HasIPv6
+        v4Addr := state.IPv4Addr
+        v6Addr := state.IPv6Addr
+        _ = state.PreferredProto  // read but not used yet (for future switch-back logic)
+        state.mu.Unlock()
 
-        if !state.HasIPv4 && !state.HasIPv6 {
+        if !hasV4 && !hasV6 {
                 return
         }
 
-        // Try to get BPF-based metrics for this destination
-        state.UsingBPF = false
+        // Step 2: Look up BPF metrics (no lock — bpfHealth is read-only)
+        usingBPF := false
+        var v4BpfRTT, v4BpfLoss, v6BpfRTT, v6BpfLoss float64
         if bpfHealth != nil {
-                // Look for IPv4 entry
-                if state.HasIPv4 {
+                if hasV4 {
                         for addr, raw := range bpfHealth {
                                 if entry, ok := raw.(routeHealthEntry); ok {
                                         lbl := labelFor(addr)
                                         if lbl == label && entry.Protocol != "ipv6" {
-                                                state.V4BpfRTT = entry.RTTMs
-                                                state.V4BpfLoss = entry.LossPct
-                                                state.UsingBPF = true
+                                                v4BpfRTT = entry.RTTMs
+                                                v4BpfLoss = entry.LossPct
+                                                usingBPF = true
                                         }
                                 }
                         }
                 }
-                // Look for IPv6 entry
-                if state.HasIPv6 {
+                if hasV6 {
                         for addr, raw := range bpfHealth {
                                 if entry, ok := raw.(routeHealthEntry); ok {
                                         lbl := labelFor(addr)
                                         if lbl == label && (entry.Protocol == "ipv6" || entry.Protocol == "dual") {
-                                                state.V6BpfRTT = entry.RTTMs
-                                                state.V6BpfLoss = entry.LossPct
-                                                state.UsingBPF = true
+                                                v6BpfRTT = entry.RTTMs
+                                                v6BpfLoss = entry.LossPct
+                                                usingBPF = true
                                         }
                                 }
                         }
                 }
         }
 
-        // If BPF data is zero (receive-only destination OR no metrics yet),
-        // fall back to pings for both protocols.
-        // v0.9.33: use 3 pings (was 5) to reduce cycle time.
-        if !state.UsingBPF || (state.V4BpfRTT == 0 && state.V6BpfRTT == 0) {
-                state.UsingBPF = false
-                if state.HasIPv4 && state.IPv4Addr != "" {
-                        rtt, loss := pingDest(state.IPv4Addr, 3)
-                        state.V4PingRTT = rtt
-                        state.V4PingLoss = loss
+        // Step 3: Run pings OUTSIDE any lock (this is the slow part — 3s each)
+        var v4PingRTT, v4PingLoss, v6PingRTT, v6PingLoss float64
+        needPings := !usingBPF || (v4BpfRTT == 0 && v6BpfRTT == 0)
+        if needPings {
+                usingBPF = false
+                if hasV4 && v4Addr != "" {
+                        v4PingRTT, v4PingLoss = pingDest(v4Addr, 3)
                 }
-                if state.HasIPv6 && state.IPv6Addr != "" {
-                        rtt, loss := pingDest(state.IPv6Addr, 3)
-                        state.V6PingRTT = rtt
-                        state.V6PingLoss = loss
+                if hasV6 && v6Addr != "" {
+                        v6PingRTT, v6PingLoss = pingDest(v6Addr, 3)
                 }
         }
 
-        // Use whichever data we have (BPF or ping)
-        v4RTT := state.V4BpfRTT
-        v4Loss := state.V4BpfLoss
-        v6RTT := state.V6BpfRTT
-        v6Loss := state.V6BpfLoss
-        if !state.UsingBPF {
-                v4RTT = state.V4PingRTT
-                v4Loss = state.V4PingLoss
-                v6RTT = state.V6PingRTT
-                v6Loss = state.V6PingLoss
+        // Use whichever data we have
+        v4RTT := v4BpfRTT
+        v4Loss := v4BpfLoss
+        v6RTT := v6BpfRTT
+        v6Loss := v6BpfLoss
+        if !usingBPF {
+                v4RTT = v4PingRTT
+                v4Loss = v4PingLoss
+                v6RTT = v6PingRTT
+                v6Loss = v6PingLoss
         }
+
+        // Step 4: Update streaks + write results under lock (fast — no I/O)
+        state.mu.Lock()
+        defer state.mu.Unlock()
+
+        state.UsingBPF = usingBPF
+        state.V4BpfRTT = v4BpfRTT
+        state.V4BpfLoss = v4BpfLoss
+        state.V6BpfRTT = v6BpfRTT
+        state.V6BpfLoss = v6BpfLoss
+        state.V4PingRTT = v4PingRTT
+        state.V4PingLoss = v4PingLoss
+        state.V6PingRTT = v6PingRTT
+        state.V6PingLoss = v6PingLoss
 
         // Update streaks (hysteresis: 3 consecutive readings needed)
         // v0.9.34: treat "100% loss + 0ms RTT" as "ping failed" (no data),
