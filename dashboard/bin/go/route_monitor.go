@@ -81,6 +81,14 @@ var routeMonitor = &RouteMonitor{
         destinations: map[string]*destRouteState{},
 }
 
+// v0.9.34: snapshots from the last collect() cycle — the route monitor
+// reuses these instead of calling readBPFMap() itself (which would
+// fork a second bpftool process and compete with the collector).
+var (
+        lastHostsSnapshot    []hostEntry
+        lastBpfHealthSnapshot map[string]interface{}
+)
+
 // routeMonitorEnabled is set by --route-monitor flag
 var routeMonitorEnabled = false
 
@@ -97,15 +105,20 @@ func runRouteMonitor() {
 }
 
 // cycle runs one monitoring pass.
-// Does NOT hold the lock during pings/DNS — those can take 10+ seconds.
+// v0.9.34: does NOT call readBPFMap() — reuses the hosts data from
+// the last collect() cycle via lastHostsSnapshot. This avoids running
+// a second bpftool process that competes with the collector.
 func (rm *RouteMonitor) cycle() {
-        // Step 1: Get BPF map data (no lock needed)
-        hosts, err := readBPFMap()
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "[route-monitor] BPF map read failed: %v\n", err)
-        }
+        // Step 1: Get BPF map data from the last collect cycle (no fork!)
+        rm.mu.Lock()
+        hosts := lastHostsSnapshot
+        bpfHealth := lastBpfHealthSnapshot
+        rm.mu.Unlock()
 
-        bpfHealth := buildRouteHealth(hosts, nil)
+        if hosts == nil {
+                // No data yet — skip this cycle
+                return
+        }
 
         // Step 2: Discover destinations (short lock — just map updates)
         rm.mu.Lock()

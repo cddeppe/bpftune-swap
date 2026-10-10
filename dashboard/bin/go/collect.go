@@ -98,6 +98,14 @@ func (c *Collector) collect() {
                 "route_monitor":    routeMonitor.getState(),
         }
 
+        // v0.9.34: save snapshots for the route monitor goroutine to reuse.
+        // This avoids the route monitor calling readBPFMap() itself.
+        if routeMonitorEnabled {
+                rh := buildRouteHealth(hosts, metricByBucket)
+                lastHostsSnapshot = hosts
+                lastBpfHealthSnapshot = rh
+        }
+
         // ----- Log-derived panels (single parse, multiple consumers) --------
         // v0.9.9: set currentParsedLog so buildLogPanels uses the single-pass
         // parsed data instead of re-scanning text 4 more times.
