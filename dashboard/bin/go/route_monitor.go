@@ -509,29 +509,26 @@ func pingDest(addr string, count int) (float64, float64) {
 }
 
 // normalizePingTarget converts a bucket/prefix address to a pingable IP.
+// v0.9.35: use well-known test IPs for known CDNs instead of guessing .0.1
 func normalizePingTarget(addr string) string {
         // Strip v6: prefix
         addr = strings.TrimPrefix(addr, "v6:")
-        addr = strings.Split(addr, "/")[0]  // strip any CIDR suffix
+        addr = strings.Split(addr, "/")[0]
 
         // IPv6 addresses
         if strings.Contains(addr, ":") {
                 // If it already has "::" and looks complete, try as-is
                 if strings.Contains(addr, "::") {
-                        // If it ends with "::", append "1" to make it a real host
                         if strings.HasSuffix(addr, "::") {
                                 return addr + "1"
                         }
-                        return addr  // looks like a real IPv6 address
+                        return addr
                 }
                 // v6:hex format — convert to standard IPv6
-                // e.g. "2800:3f0" → "2800:3f0::1"
                 parts := strings.Split(addr, ":")
                 if len(parts) >= 2 {
-                        // Take the first two groups and pad to 4 hex chars each
                         g1 := parts[0]
                         g2 := parts[1]
-                        // Pad to 4 chars
                         for len(g1) < 4 { g1 = "0" + g1 }
                         for len(g2) < 4 { g2 = "0" + g2 }
                         return g1 + ":" + g2 + "::1"
@@ -539,20 +536,37 @@ func normalizePingTarget(addr string) string {
                 return ""
         }
 
-        // IPv4 addresses
+        // IPv4 — use well-known pingable IPs for known CDN /16 prefixes
         parts := strings.Split(addr, ".")
         if len(parts) != 4 {
                 return ""
         }
 
-        // If it's a /16 bucket (last two octets are 0), make it pingable
-        // "142.250.0.0" → "142.250.0.1"
+        // Known CDN prefixes with guaranteed-pingable IPs
+        // (Google uses 8.8.8.8, Cloudflare uses 1.1.1.1, etc.)
+        knownPingable := map[string]string{
+                "142.250": "8.8.8.8",      // Google/YouTube → Google DNS
+                "142.251": "8.8.8.8",      // Google/YouTube
+                "172.217": "8.8.8.8",      // Google
+                "173.194": "8.8.8.8",      // Google
+                "192.178": "8.8.8.8",      // Google
+                "172.64":  "1.1.1.1",     // Cloudflare
+                "104.16":  "1.1.1.1",     // Cloudflare
+                "104.17":  "1.1.1.1",     // Cloudflare
+                "151.101": "151.101.1.1",  // Fastly
+                "199.232": "199.232.1.1",  // Fastly
+                "185.199": "185.199.108.1", // GitHub Pages
+        }
+
+        prefix := parts[0] + "." + parts[1]
+        if known, ok := knownPingable[prefix]; ok {
+                return known
+        }
+
+        // For other /16 buckets, try .0.1 then .1.1
         if parts[2] == "0" && parts[3] == "0" {
                 return parts[0] + "." + parts[1] + ".0.1"
         }
-
-        // If it's a /24 bucket (last octet is 0), make it pingable
-        // "82.43.215.0" → "82.43.215.1"
         if parts[3] == "0" {
                 return parts[0] + "." + parts[1] + "." + parts[2] + ".1"
         }
