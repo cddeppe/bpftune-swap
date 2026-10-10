@@ -1317,11 +1317,36 @@
       if (!r.ok) throw new Error("current.json: " + r.status);
       return r.json();
     }).then(function (doc) {
-      renderLiveState(doc);
+      throttledRender(doc);
     }).catch(function (e) {
       setHTML("lv-build",
               '<div class="placeholder">current.json unavailable: ' +
               esc(e.message) + '</div>');
+    });
+  }
+
+  // v0.9.34: throttled render — uses requestAnimationFrame so the
+  // browser can handle scroll/touch events between renders.
+  // If a render is already pending, just update the pending doc.
+  function throttledRender(doc) {
+    _pendingDoc = doc;
+    if (_renderPending) return;
+    _renderPending = true;
+    requestAnimationFrame(function() {
+      _renderPending = false;
+      var now = Date.now();
+      // Minimum 500ms between renders to prevent rapid-fire
+      if (now - _lastRenderTs < 500) {
+        setTimeout(function() {
+          _lastRenderTs = Date.now();
+          renderLiveState(_pendingDoc);
+          _pendingDoc = null;
+        }, 500 - (now - _lastRenderTs));
+      } else {
+        _lastRenderTs = now;
+        renderLiveState(_pendingDoc);
+        _pendingDoc = null;
+      }
     });
   }
 
@@ -1358,7 +1383,8 @@
           } else {
             window.__current_doc = msg;
           }
-          renderLiveState(window.__current_doc);
+          // v0.9.34: throttled render via requestAnimationFrame
+          throttledRender(window.__current_doc);
           refreshNowCardAndChart();
         } catch (err) {
           console.error("SSE parse error:", err);
@@ -1514,9 +1540,16 @@
 
   var state  = { meta: null, bucketDoc: null, swaps: null, fleet: null, metricByBucket: null, bucketLive: {}, recentSwapsByBucket: null };
   var charts = {};
-  // v0.9.32: cache for /data/swaps_per_bin.json responses
+  // v0.9.33: cache for /data/swaps_per_bin.json responses
   var swapsPerBinCache = {};
   var swapsPerBinInflight = {};
+  // v0.9.34: throttle heavy renders to prevent UI freeze.
+  // renderLiveState runs on every SSE push (every 30s). It rebuilds
+  // ALL charts and panels synchronously, blocking scroll/touch.
+  // Throttle: skip if last render was <2s ago, queue the latest.
+  var _renderPending = false;
+  var _lastRenderTs = 0;
+  var _pendingDoc = null;
 
   function mk(id, cfg) {
     var cv = $(id);
