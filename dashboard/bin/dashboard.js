@@ -2249,7 +2249,7 @@
     // Show up to 10
     var shown = sorted.slice(0, 10);
 
-    var html = '<div class="route-health">';
+    var html = '<div class="route-health origin-grid">';
     shown.forEach(function(r) {
       var label = r.label || "?";
       var hasV4 = r.has_ipv4;

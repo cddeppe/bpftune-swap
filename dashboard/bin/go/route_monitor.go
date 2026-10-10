@@ -121,10 +121,17 @@ func (rm *RouteMonitor) cycle() {
         }
         rm.mu.Unlock()
 
-        // Step 4: Run pings/DNS OUTSIDE the lock (this is the slow part)
+        // Step 4: Run pings/DNS OUTSIDE the lock (this is the slow part).
+        // v0.9.34: run all destinations concurrently to avoid blocking.
+        var wg sync.WaitGroup
         for _, de := range toEval {
-                rm.evaluateDestination(de.label, de.state, bpfHealth)
+                wg.Add(1)
+                go func(de destEval) {
+                        defer wg.Done()
+                        rm.evaluateDestination(de.label, de.state, bpfHealth)
+                }(de)
         }
+        wg.Wait()
 }
 
 // discoverDestinations finds dual-stack destinations from the BPF map,

@@ -630,6 +630,22 @@
 
   /* v0.9.33: Route Health panel */
   .route-health { display: flex; flex-direction: column; gap: 4px; }
+  /* v0.9.34: Origin Health — 3 columns on desktop, 1 on mobile */
+  .route-health.origin-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  @media (min-width: 700px) {
+    .route-health.origin-grid {
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+  }
+  @media (min-width: 1000px) {
+    .route-health.origin-grid {
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+  }
   .route-row {
     display: flex; align-items: center; gap: 8px;
     padding: 4px 8px; border-radius: 4px;
