@@ -1303,6 +1303,7 @@
     // very first liveRefresh call (fires before boot's _loadCharts resolves).
     _safeRender('swaps', function() { renderSwaps(); });
     _safeRender('score-now', function() { renderScoreNow(); });
+    renderRouteHealth(doc);
     _safeRender('div', function() { renderDivChart("div", ""); });
     _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
     state.lastLiveSwaps = doc.recent_swaps || [];
@@ -2127,6 +2128,101 @@
     });
   }
 
+  // v0.9.33: Route Health panel — compact health bars under Swap Target Pick.
+  // Follows the same bucket selector and range selector.
+  function renderRouteHealth(doc) {
+    var el = $("lv-route-health");
+    if (!el) return;
+    if (!doc) return;
+
+    var rh = doc.route_health;
+    if (!rh) {
+      setHTML("lv-route-health", '<div class="placeholder">(no route health data)</div>');
+      return;
+    }
+
+    // Determine which bucket to show
+    var bk = _currentBucketLabel();
+    var bid = bk.bid;
+    if (!bid || bid === "all") {
+      var hb = _heaviestBucketWithCoverage();
+      if (hb) bid = hb.bid;
+    }
+    if (!bid || bid === "all") {
+      setHTML("lv-route-health", '<div class="placeholder">(select a bucket)</div>');
+      return;
+    }
+
+    // Update bucket tag
+    var tagEl = $("bucket-tag-route");
+    if (tagEl) tagEl.textContent = bk.label || bid;
+
+    // Find health entries for this bucket.
+    // route_health is keyed by raw address. We need to find entries
+    // that resolve to the selected bucket (by label or exact match).
+    var entries = [];
+    for (var addr in rh) {
+      if (!rh.hasOwnProperty(addr)) continue;
+      var e = rh[addr];
+      var lbl = _labelForBucketAddr(addr);
+      // Match by label, or by exact address
+      if ((lbl && lbl === (bk.label || bid)) || addr === bid) {
+        entries.push({addr: addr, label: lbl || addr, data: e});
+      }
+    }
+
+    if (!entries.length) {
+      // Try exact match on the bucket ID
+      if (rh[bid]) {
+        entries.push({addr: bid, label: bk.label || bid, data: rh[bid]});
+      }
+    }
+
+    if (!entries.length) {
+      setHTML("lv-route-health", '<div class="placeholder">(no health data for this bucket)</div>');
+      return;
+    }
+
+    // Build HTML
+    var html = '<div class="route-health">';
+    entries.forEach(function(entry) {
+      var e = entry.data;
+      if (!e) return;
+
+      var proto = e.protocol || "ipv4";
+      var protoClass = proto === "ipv6" ? "ipv6" : (proto === "dual" ? "dual" : "ipv4");
+      var health = e.health || "good";
+      var rtt = e.rtt_ms != null ? e.rtt_ms.toFixed(1) : "?";
+      var loss = e.loss_pct != null ? e.loss_pct.toFixed(1) : "?";
+      var rate = e.rate_mbps != null ? e.rate_mbps.toFixed(1) : "?";
+      var bestAlg = e.best_alg || "?";
+      var inst = e.inst || 0;
+
+      // Health bar width: 100% = perfect, 0% = terrible
+      // Based on inverse of loss + RTT penalty
+      var healthPct = 100;
+      if (e.loss_pct != null) healthPct -= Math.min(e.loss_pct * 3, 80);
+      if (e.rtt_ms != null && e.rtt_ms > 50) healthPct -= Math.min((e.rtt_ms - 50) / 5, 20);
+      if (healthPct < 5) healthPct = 5;
+
+      var statusIcon = health === "good" ? "✓" : (health === "degraded" ? "⚠" : "✗");
+
+      html += '<div class="route-row">' +
+        '<span class="route-proto ' + protoClass + '">' + esc(proto) + '</span>' +
+        '<div class="route-bar"><div class="route-bar-fill ' + health + '" style="width:' + healthPct.toFixed(0) + '%"></div></div>' +
+        '<div class="route-metrics">' +
+          '<span class="route-metric"><b>' + rtt + '</b>ms</span>' +
+          '<span class="route-metric"><b>' + loss + '%</b> loss</span>' +
+          '<span class="route-metric"><b>' + rate + '</b>Mb/s</span>' +
+          '<span class="route-metric">' + esc(bestAlg) + '</span>' +
+        '</div>' +
+        '<span class="route-status ' + health + '">' + statusIcon + '</span>' +
+      '</div>';
+    });
+    html += '</div>';
+    setHTML("lv-route-health", html);
+  }
+
   function renderSwaps() {
     // v0.8.7: guard $("range") — SSE can fire before boot populates
     // the <select>, so $("range") is null briefly.  Treat as "1h".
@@ -2406,11 +2502,13 @@ _safeRender("score-now", function() { renderScoreNow(); });
       renderRecentSwapsForBucket();
       renderMetricForBucket();
       _safeRender("score-now", function() { renderScoreNow(); });
+      renderRouteHealth(window.__current_doc);
     }).catch(function (e) {
       state.bucketDoc = null;
       renderNow();
       renderRecentSwapsForBucket();
       renderMetricForBucket();
+      renderRouteHealth(window.__current_doc);
     });
   }
 

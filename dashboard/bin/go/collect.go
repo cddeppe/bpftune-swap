@@ -94,6 +94,7 @@ func (c *Collector) collect() {
                 "live_leaders":     liveLeaders,
                 "hostname":         readProc("/proc/sys/kernel/hostname"),
                 "now_mono":         nowMono(pl.MaxTs),
+                "route_health":     buildRouteHealth(hosts, metricByBucket),
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------
