@@ -117,7 +117,11 @@ func (c *Collector) collect() {
         // v0.7.6: streak writeback — patch BPF map bad_streak/null_streak from
         // sustained outcomes (60-300s after swap). Mirrors deleted Python
         // streak_writeback.py. Async to avoid blocking the 30s collect cycle.
-        go c.writebackStreaks(allSwaps, allMets, allSrates)
+        // v0.9.34: throttle to every 4th cycle (2 min) — writeback doesn't
+        // need to run every 30s, the streaks are slow-changing.
+        if cycleCount % 4 == 0 {
+                go c.writebackStreaks(allSwaps, allMets, allSrates)
+        }
         doc["recent_swaps"] = topSwaps
         doc["recent_proofs"] = topProofs
         doc["swap_outcomes"] = swapOutcomes
