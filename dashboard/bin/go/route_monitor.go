@@ -97,7 +97,8 @@ func runRouteMonitor() {
         if !routeMonitorEnabled {
                 return
         }
-        ticker := time.NewTicker(60 * time.Second)
+        // v0.9.34: 120s interval (was 60s) to reduce CPU usage
+        ticker := time.NewTicker(120 * time.Second)
         defer ticker.Stop()
         for range ticker.C {
                 routeMonitor.cycle()
@@ -311,16 +312,20 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                 }
         }
 
-        // Step 3: Run pings OUTSIDE any lock (this is the slow part — 3s each)
+        // Step 3: Run pings OUTSIDE any lock (this is the slow part)
+        // v0.9.34: only ping DUAL-STACK destinations that don't have BPF data.
+        // Single-stack destinations can't switch, so don't waste CPU pinging them.
+        // Only ping the protocol that BPF doesn't have data for.
         var v4PingRTT, v4PingLoss, v6PingRTT, v6PingLoss float64
-        needPings := !usingBPF || (v4BpfRTT == 0 && v6BpfRTT == 0)
-        if needPings {
+        needV4Ping := hasV4 && hasV6 && v4BpfRTT == 0 && v4Addr != ""
+        needV6Ping := hasV4 && hasV6 && v6BpfRTT == 0 && v6Addr != ""
+        if needV4Ping || needV6Ping {
                 usingBPF = false
-                if hasV4 && v4Addr != "" {
-                        v4PingRTT, v4PingLoss = pingDest(v4Addr, 3)
+                if needV4Ping {
+                        v4PingRTT, v4PingLoss = pingDest(v4Addr, 2)
                 }
-                if hasV6 && v6Addr != "" {
-                        v6PingRTT, v6PingLoss = pingDest(v6Addr, 3)
+                if needV6Ping {
+                        v6PingRTT, v6PingLoss = pingDest(v6Addr, 2)
                 }
         }
 
@@ -578,7 +583,8 @@ func normalizePingTarget(addr string) string {
 }
 
 func ping4(target string, count int) (float64, float64) {
-        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        // v0.9.34: 5s timeout (was 10s) to reduce CPU usage
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
         out, err := exec.CommandContext(ctx, "ping", "-c", strconv.Itoa(count),
                 "-W", "1", "-q", target).Output()
@@ -589,7 +595,8 @@ func ping4(target string, count int) (float64, float64) {
 }
 
 func ping6(target string, count int) (float64, float64) {
-        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        // v0.9.34: 5s timeout (was 10s) to reduce CPU usage
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
         out, err := exec.CommandContext(ctx, "ping6", "-c", strconv.Itoa(count),
                 "-W", "1", "-q", target).Output()
