@@ -27,6 +27,8 @@ import (
         "path/filepath"
         "strings"
         "sync"
+        "syscall"
+        "runtime/debug"
         "time"
 )
 
@@ -651,6 +653,15 @@ func main() {
 
         // v0.9.10: initialize SQLite backend (migrates CSV on first run)
         initSQLite()
+
+        // v0.9.34: set CPU priority and GC tuning from inside the binary.
+        // This ensures it works on all hosts without service file changes.
+        // Nice=10: lower CPU priority so xray/ctrld/SSH always preempt us.
+        // GOGC=50: more frequent, smaller GC runs (prevents 91% spikes).
+        syscall.Setpriority(syscall.PRIO_PROCESS, 0, 10)
+        os.Setenv("GOGC", "50")
+        debug.SetGCPercent(50)
+        fmt.Fprintf(os.Stderr, "collector: CPU priority=nice(10) GOGC=50\n")
 
         collector := NewCollector()
 
