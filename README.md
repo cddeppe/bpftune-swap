@@ -27,8 +27,8 @@ Instead of picking one congestion control algorithm globally, this fork learns w
                     │   ▼                                      │
                     │  remote_host_map (LRU_HASH, 4096)        │
                     │  ┌────────────────────────────────────┐  │
-                    │  │ 203.0.0.0  inst=820  best=cubic  │  │
-                    │  │ 198.0.0.0 inst=300  best=htcp   │  │
+                    │  │ 203.0.0.0  inst=820  best=cubic    │  │
+                    │  │ 198.0.0.0 inst=300  best=htcp      │  │
                     │  │ 2001:db8::   inst=229  best=dctcp  │  │
                     │  │ 2001:db8:1:: inst=12K   best=bbr   │  │
                     │  │ ...                                │  │
