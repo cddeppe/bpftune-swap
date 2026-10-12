@@ -295,9 +295,9 @@ Group IPs by label. The `labels-api` (served by Go collector on port 8080) manag
 │                                                                 │
 │  bpftune-collector-go.service (Go binary, port 8080)            │
 │    30s: BPF map dump + log parse → current.json + SSE push      │
-│    5min: renderToDisk (read 8MB CSV tail → static JSON files)  │
+│    5min: renderToDisk (read 8MB CSV tail → static JSON files)   │
 │    daily: renderSlowToDisk (stream full CSV → 7d/30d/all)       │
-│    streaming CSV reader: 3-5MB memory (not 680MB)              │
+│    streaming CSV reader: 3-5MB memory (not 680MB)               │
 │    SSE + /api/labels + /data/* all on port 8080 (no nginx)      │
 │                                                                 │
 │  labels-api.py (called by Go collector for /api/labels)         │
