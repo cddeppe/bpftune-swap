@@ -1267,18 +1267,14 @@
       window.__latest_doc_ts = _ts;
     }
     window.__current_doc = doc;
-    _safeRender('log_window', function() { renderLogWindow(doc); });
+
+    // v0.9.35: split render into micro-tasks so the browser can
+    // handle clicks/toggles between each chunk. This prevents the
+    // UI from freezing during the 30s SSE update.
+    
+    // Phase 1: lightweight state updates (no DOM/chart work)
     if (doc.now_mono) SERVER_NOW_MONO = doc.now_mono;
-    _safeRender('build', function() { renderBuild(doc.build || {}); });
-    _safeRender('system', function() { renderSystem(doc.system || {}); });
-    _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
-    _syncBucketDropdown(doc);
-    _updateBucketTags();
     state.metricByBucket = doc.metric_by_bucket || {};
-    // A2-fix: MERGE per-bucket instead of wholesale-replacing. The old
-    // `state.bucketLive = doc.bucket_live || {}` wiped any accumulated
-    // points from _appendLiveMetrics on every SSE push, causing 1h live
-    // charts to show stale/single-point data.
     if (!state.bucketLive) state.bucketLive = {};
     var _newBL = doc.bucket_live || {};
     for (var _bk in _newBL) {
@@ -1286,30 +1282,42 @@
     }
     _appendLiveMetrics(doc);
     state.recentSwapsByBucket = doc.recent_swaps_by_bucket || null;
+    state.lastLiveSwaps = doc.recent_swaps || [];
+    _syncBucketDropdown(doc);
+    _updateBucketTags();
+    _fetchAndApplyLabels();
+
+    // Phase 2: simple HTML panels (fast, no charts)
+    _safeRender('log_window', function() { renderLogWindow(doc); });
+    _safeRender('build', function() { renderBuild(doc.build || {}); });
+    _safeRender('system', function() { renderSystem(doc.system || {}); });
+    _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
     _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
     _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
-    // 0.4.87: always call renderBucket on every SSE push — even when
-    // "All Buckets" is selected (state.bucketDoc === null).  The new
-    // All-Buckets path aggregates state.bucketLive so the rate/sscore/
-    // streaks charts refresh on every 30s tick instead of every 5 min.
-    if ($("range")) {
-      _safeRender('bucket_chart', function() { renderBucket(); });
-    }
-    _renderFilteredPanels(doc);
-    // Ensure swaps-per-bin also refreshes on every SSE push, regardless of
-    // whether _renderFilteredPanels happened to call it.  Harmless no-op if
-    // already called (Chart.js mk() destroys + re-creates the chart).
-    // 0.4.122: wrap in _safeRender — Chart may not be loaded yet on the
-    // very first liveRefresh call (fires before boot's _loadCharts resolves).
-    _safeRender('swaps', function() { renderSwaps(); });
-    _safeRender('score-now', function() { renderScoreNow(); });
     renderRouteHealth(doc);
     renderOriginHealth(doc);
-    _safeRender('div', function() { renderDivChart("div", ""); });
-    _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
-    state.lastLiveSwaps = doc.recent_swaps || [];
-    _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
-    _fetchAndApplyLabels();
+
+    // Phase 3: heavy chart renders — use setTimeout(0) to yield
+    // to the browser between each chart, preventing UI freeze.
+    setTimeout(function() {
+      if (doc !== window.__current_doc) return; // stale
+      _renderFilteredPanels(doc);
+      _safeRender('swaps', function() { renderSwaps(); });
+    }, 0);
+
+    setTimeout(function() {
+      if (doc !== window.__current_doc) return; // stale
+      _safeRender('score-now', function() { renderScoreNow(); });
+      if ($("range")) {
+        _safeRender('bucket_chart', function() { renderBucket(); });
+      }
+    }, 0);
+
+    setTimeout(function() {
+      if (doc !== window.__current_doc) return; // stale
+      _safeRender('div', function() { renderDivChart("div", ""); });
+      _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
+    }, 0);
   }
 
   function liveRefresh() {
