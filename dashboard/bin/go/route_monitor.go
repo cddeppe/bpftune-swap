@@ -239,16 +239,29 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         state.V4RTT = v4RTT; state.V4Loss = v4Loss
         state.V6RTT = v6RTT; state.V6Loss = v6Loss
 
-        // Update streaks
-        if v4Loss >= badLossThreshold || v4RTT >= badRTTThreshold {
-                state.v4BadStreak++; state.v4GoodStreak = 0
-        } else if v4Loss <= goodLossThreshold && v4RTT <= goodRTTThreshold {
-                state.v4GoodStreak++; state.v4BadStreak = 0
+        // v0.9.35: RTT=0 means no data (ping failed or BPF has no metrics).
+        // A real RTT is always > 0. If RTT=0, skip — don't count as good or bad.
+        v4DataValid := v4RTT > 0
+        v6DataValid := v6RTT > 0
+
+        // Update streaks — only when we have real data
+        if v4DataValid {
+                if v4Loss >= badLossThreshold || v4RTT >= badRTTThreshold {
+                        state.v4BadStreak++; state.v4GoodStreak = 0
+                } else if v4Loss <= goodLossThreshold && v4RTT <= goodRTTThreshold {
+                        state.v4GoodStreak++; state.v4BadStreak = 0
+                }
+        } else {
+                state.v4BadStreak = 0; state.v4GoodStreak = 0
         }
-        if v6Loss >= badLossThreshold || v6RTT >= badRTTThreshold {
-                state.v6BadStreak++; state.v6GoodStreak = 0
-        } else if v6Loss <= goodLossThreshold && v6RTT <= goodRTTThreshold {
-                state.v6GoodStreak++; state.v6BadStreak = 0
+        if v6DataValid {
+                if v6Loss >= badLossThreshold || v6RTT >= badRTTThreshold {
+                        state.v6BadStreak++; state.v6GoodStreak = 0
+                } else if v6Loss <= goodLossThreshold && v6RTT <= goodRTTThreshold {
+                        state.v6GoodStreak++; state.v6BadStreak = 0
+                }
+        } else {
+                state.v6BadStreak = 0; state.v6GoodStreak = 0
         }
 
         // Switch logic
