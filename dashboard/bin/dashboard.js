@@ -1872,14 +1872,18 @@
       if (hb2) bid = hb2.bid;
     }
     var s, ts;
-    if (s == null && rng === "1h" && bid && state.bucketLive && state.bucketLive[bid]) {
+    // v0.9.35: for 1h, use live bucket data (30s SSE) — freshest.
+    // For 24h+, ALWAYS use static bucketDoc data (accumulated history).
+    // This prevents the charts from "wiping" when switching ranges —
+    // each range shows data from its actual time window.
+    if (rng === "1h" && bid && state.bucketLive && state.bucketLive[bid]) {
       var lb = state.bucketLive[bid];
       if (lb.ts && lb.ts.length) {
         s = {};
         for (var k in (lb.cols || {})) s[k] = lb.cols[k];
         ts = lb.ts;
       }
-    } else if (s == null && rng === "1h" && bid && state.bucketLive) {
+    } else if (rng === "1h" && bid && state.bucketLive) {
       // 0.4.87: bucket_live is keyed by _label_for(addr) on the python
       // side (bpftune_data.py:385), so for labeled buckets the dropdown's
       // raw addr (b.id from meta.json) doesn't match.  Try the label
@@ -1894,14 +1898,16 @@
         }
       }
     }
-    // Fall back to the renderer's 15-min bucket_<id>.json output for
-    // longer ranges, or for 1h if bucket_live didn't have the entry.
+    // v0.9.35: For 24h+, always use static bucketDoc (accumulated history).
+    // Also fall back here for 1h if bucket_live didn't have the entry.
     if (s == null) {
       if (!doc) return;   // "All Buckets" + range > 1h: no historical aggregate
-      var sDoc = doc.series[rng];
+      // v0.9.32: fall back to 24h if the requested range isn't available.
+      var sDoc = doc.series[rng] || doc.series["24h"];
       if (!sDoc) return;
       s = sDoc;
       ts = sDoc.ts;
+      if (!ts || !ts.length) return;
     }
     // Build a fixed-axis ts anchored to NOW so all four charts (rate, score,
     // streak, swaps-per-bin) share the exact same x-axis: [now-rSec, now] at
