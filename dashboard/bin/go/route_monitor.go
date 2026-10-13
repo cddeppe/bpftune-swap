@@ -12,6 +12,8 @@ package main
 // Dual-stack discovery uses the aliases file only — no DNS.
 
 import (
+        "context"
+        "encoding/binary"
         "fmt"
         "net"
         "os"
@@ -66,7 +68,8 @@ func runRouteMonitor() {
         if !routeMonitorEnabled {
                 return
         }
-        ticker := time.NewTicker(180 * time.Second)
+        // v0.9.35: 5 minute interval — minimal ICMP footprint
+        ticker := time.NewTicker(300 * time.Second)
         defer ticker.Stop()
         for range ticker.C {
                 routeMonitor.cycle()
@@ -165,19 +168,21 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
         }
 }
 
-// evaluateDestination uses ONLY BPF data — no pings.
+// evaluateDestination uses BPF data with minimal ICMP fallback.
 func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}) {
         state.mu.Lock()
         hasV4 := state.HasIPv4
         hasV6 := state.HasIPv6
+        v4Addr := state.IPv4Addr
+        v6Addr := state.IPv6Addr
         state.mu.Unlock()
 
         if !hasV4 || !hasV6 {
                 return // single-stack, can't switch
         }
 
-        // Read BPF metrics only
-        var v4RTT, v4Loss, v6RTT, v6Loss float64
+        // Read BPF metrics
+        var v4BpfRTT, v4BpfLoss, v6BpfRTT, v6BpfLoss float64
         usingBPF := false
         if bpfHealth != nil {
                 for addr, raw := range bpfHealth {
@@ -186,31 +191,39 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                         lbl := labelFor(addr)
                         if lbl != label { continue }
                         if entry.Protocol != "ipv6" && entry.Protocol != "dual" {
-                                v4RTT = entry.RTTMs
-                                v4Loss = entry.LossPct
+                                v4BpfRTT = entry.RTTMs
+                                v4BpfLoss = entry.LossPct
                                 usingBPF = true
                         }
                         if entry.Protocol == "ipv6" || entry.Protocol == "dual" {
-                                v6RTT = entry.RTTMs
-                                v6Loss = entry.LossPct
+                                v6BpfRTT = entry.RTTMs
+                                v6BpfLoss = entry.LossPct
                                 usingBPF = true
                         }
                 }
         }
 
-        // Only evaluate if we have real BPF data for BOTH protocols
-        v4DataValid := v4RTT > 0
-        v6DataValid := v6RTT > 0
-        if !v4DataValid || !v6DataValid {
-                // Can't compare — skip this destination
-                state.mu.Lock()
-                state.V4RTT = v4RTT; state.V4Loss = v4Loss
-                state.V6RTT = v6RTT; state.V6Loss = v6Loss
-                state.UsingBPF = usingBPF
-                state.v4BadStreak = 0; state.v4GoodStreak = 0
-                state.v6BadStreak = 0; state.v6GoodStreak = 0
-                state.mu.Unlock()
-                return
+        // v0.9.35: minimal ICMP — only 1 ping, only dual-stack, only when BPF has no data
+        var v4PingRTT, v4PingLoss, v6PingRTT, v6PingLoss float64
+        needV4Ping := hasV4 && hasV6 && v4BpfRTT == 0 && v4Addr != ""
+        needV6Ping := hasV4 && hasV6 && v6BpfRTT == 0 && v6Addr != ""
+        if needV4Ping || needV6Ping {
+                usingBPF = false
+                if needV4Ping {
+                        v4PingRTT, v4PingLoss = icmpPing(v4Addr)
+                }
+                if needV6Ping {
+                        v6PingRTT, v6PingLoss = icmpPing(v6Addr)
+                }
+        }
+
+        // Use BPF data if available, otherwise ping data
+        v4RTT := v4BpfRTT; v4Loss := v4BpfLoss
+        v6RTT := v6BpfRTT; v6Loss := v6BpfLoss
+        if needV4Ping || needV6Ping {
+                if needV4Ping { v4RTT = v4PingRTT; v4Loss = v4PingLoss }
+                if needV6Ping { v6RTT = v6PingRTT; v6Loss = v6PingLoss }
+                usingBPF = false
         }
 
         const badLossThreshold = 5.0
@@ -222,7 +235,7 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         state.mu.Lock()
         defer state.mu.Unlock()
 
-        state.UsingBPF = true
+        state.UsingBPF = usingBPF
         state.V4RTT = v4RTT; state.V4Loss = v4Loss
         state.V6RTT = v6RTT; state.V6Loss = v6Loss
 
@@ -340,4 +353,101 @@ func (rm *RouteMonitor) getState() []interface{} {
                 return ci < cj
         })
         return out
+}
+
+// ============================================================================
+// Minimal ICMP — 1 echo per destination, Go raw sockets, no process fork
+// ============================================================================
+
+func icmpPing(addr string) (float64, float64) {
+        target := normalizePingTarget(addr)
+        if target == "" { return 0, 100 }
+        if strings.Contains(target, ":") {
+                return icmpPing6(target)
+        }
+        return icmpPing4(target)
+}
+
+func icmpPing4(target string) (float64, float64) {
+        ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+        defer cancel()
+        conn, err := (&net.Dialer{}).DialContext(ctx, "ip4:icmp", target)
+        if err != nil { return 0, 100 }
+        defer conn.Close()
+        conn.SetDeadline(time.Now().Add(2 * time.Second))
+        msg := make([]byte, 16)
+        binary.BigEndian.PutUint16(msg[0:], 8)
+        binary.BigEndian.PutUint16(msg[4:], 1)
+        binary.BigEndian.PutUint16(msg[6:], 1)
+        binary.BigEndian.PutUint16(msg[2:], icmpChecksum(msg))
+        start := time.Now()
+        if _, err := conn.Write(msg); err != nil { return 0, 100 }
+        buf := make([]byte, 1500)
+        if _, err := conn.Read(buf); err != nil { return 0, 100 }
+        return float64(time.Since(start).Microseconds()) / 1000.0, 0
+}
+
+func icmpPing6(target string) (float64, float64) {
+        ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+        defer cancel()
+        conn, err := (&net.Dialer{}).DialContext(ctx, "ip6:ipv6-icmp", target)
+        if err != nil { return 0, 100 }
+        defer conn.Close()
+        conn.SetDeadline(time.Now().Add(2 * time.Second))
+        msg := make([]byte, 16)
+        binary.BigEndian.PutUint16(msg[0:], 128)
+        binary.BigEndian.PutUint16(msg[4:], 1)
+        binary.BigEndian.PutUint16(msg[6:], 1)
+        binary.BigEndian.PutUint16(msg[2:], icmpChecksum(msg))
+        start := time.Now()
+        if _, err := conn.Write(msg); err != nil { return 0, 100 }
+        buf := make([]byte, 1500)
+        if _, err := conn.Read(buf); err != nil { return 0, 100 }
+        return float64(time.Since(start).Microseconds()) / 1000.0, 0
+}
+
+func icmpChecksum(data []byte) uint16 {
+        var sum uint32
+        for i := 0; i < len(data)-1; i += 2 {
+                sum += uint32(binary.BigEndian.Uint16(data[i:]))
+        }
+        if len(data)%2 == 1 {
+                sum += uint32(data[len(data)-1]) << 8
+        }
+        for sum>>16 > 0 { sum = (sum & 0xFFFF) + (sum >> 16) }
+        return ^uint16(sum)
+}
+
+func normalizePingTarget(addr string) string {
+        addr = strings.TrimPrefix(addr, "v6:")
+        addr = strings.Split(addr, "/")[0]
+        if strings.Contains(addr, ":") {
+                if strings.Contains(addr, "::") {
+                        if strings.HasSuffix(addr, "::") { return addr + "1" }
+                        return addr
+                }
+                parts := strings.Split(addr, ":")
+                if len(parts) >= 2 {
+                        g1, g2 := parts[0], parts[1]
+                        for len(g1) < 4 { g1 = "0" + g1 }
+                        for len(g2) < 4 { g2 = "0" + g2 }
+                        return g1 + ":" + g2 + "::1"
+                }
+                return ""
+        }
+        parts := strings.Split(addr, ".")
+        if len(parts) != 4 { return "" }
+        knownPingable := map[string]string{
+                "142.250": "8.8.8.8", "142.251": "8.8.8.8",
+                "172.217": "8.8.8.8", "173.194": "8.8.8.8", "192.178": "8.8.8.8",
+                "172.64": "1.1.1.1", "104.16": "1.1.1.1", "104.17": "1.1.1.1",
+                "104.18": "1.1.1.1",
+                "151.101": "151.101.1.1", "199.232": "199.232.1.1",
+                "185.199": "185.199.108.1",
+        }
+        prefix := parts[0] + "." + parts[1]
+        if known, ok := knownPingable[prefix]; ok { return known }
+        if parts[2] == "0" && parts[3] == "0" { return parts[0] + "." + parts[1] + ".0.1" }
+        if parts[3] == "0" { return parts[0] + "." + parts[1] + "." + parts[2] + ".1" }
+        return addr
 }
