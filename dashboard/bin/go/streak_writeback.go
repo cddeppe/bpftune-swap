@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // BPF remote_host_map value layout (must match kernel struct exactly).
@@ -61,6 +62,15 @@ var (
 	lastMaskV4 = -1
 	lastMaskV6 = -1
 	v6Warned   = false
+	// v0.9.36: cache for resolveRemoteHostMapID + detectMask.
+	// mapIDCache: caches the BPF map ID for 5 min (changes only on tuner reload).
+	// maskCache: caches the mask detection for 30 min (changes only on tunable edit).
+	maskCacheMu      sync.Mutex
+	mapIDCacheAt     time.Time
+	mapIDCacheTTL    = 5 * time.Minute
+	maskCacheAt      time.Time
+	maskCacheTTL     = 30 * time.Minute
+	cachedMapID      = -1
 )
 
 // prefixFields is the ordered list of u64 fields at the start of the
@@ -87,7 +97,17 @@ var (
 // resolveRemoteHostMapID finds the remote_host_map by name via
 // `bpftool map show`.  Returns the numeric id, or -1 if not found.
 // Mirrors Python _resolve_remote_host_map_id.
+// v0.9.36: cached for 5 min — the map ID only changes when the BPF
+// program is reloaded (tuner restart). Was forking bpftool every 2 min.
 func resolveRemoteHostMapID() (int, error) {
+	maskCacheMu.Lock()
+	if cachedMapID > 0 && time.Since(mapIDCacheAt) < mapIDCacheTTL {
+		id := cachedMapID
+		maskCacheMu.Unlock()
+		return id, nil
+	}
+	maskCacheMu.Unlock()
+
 	out, err := exec.Command("bpftool", "--json", "map", "show").Output()
 	if err != nil {
 		return -1, fmt.Errorf("bpftool map show: %w", err)
@@ -99,7 +119,12 @@ func resolveRemoteHostMapID() (int, error) {
 	for _, m := range maps {
 		name, _ := m["name"].(string)
 		if strings.Contains(name, "remote_host") {
-			return int(toInt(m["id"])), nil
+			id := int(toInt(m["id"]))
+			maskCacheMu.Lock()
+			cachedMapID = id
+			mapIDCacheAt = time.Now()
+			maskCacheMu.Unlock()
+			return id, nil
 		}
 	}
 	return -1, fmt.Errorf("remote_host_map not found")
@@ -109,7 +134,26 @@ func resolveRemoteHostMapID() (int, error) {
 // map keys.  Finds the smallest mask (8/16/24/32 for v4, 32/48/64/128 for
 // v6) where the trailing bytes are all zero across all entries.
 // Mirrors Python _detect_mask.
+// v0.9.36: cached for 30 min — the mask only changes when prefix4/prefix6
+// tunables change. Was doing a full `bpftool map dump` every 2 min.
 func detectMask(mapID int) {
+	maskCacheMu.Lock()
+	if mapID == cachedMapID && time.Since(maskCacheAt) < maskCacheTTL {
+		maskCacheMu.Unlock()
+		return // cache hit — mask unchanged
+	}
+	maskCacheMu.Unlock()
+
+	detectMaskUncached(mapID)
+
+	maskCacheMu.Lock()
+	cachedMapID = mapID
+	maskCacheAt = time.Now()
+	maskCacheMu.Unlock()
+}
+
+// detectMaskUncached does the actual bpftool dump + mask detection.
+func detectMaskUncached(mapID int) {
 	out, err := exec.Command("bpftool", "--json", "map", "dump", "id", strconv.Itoa(mapID)).Output()
 	if err != nil {
 		return

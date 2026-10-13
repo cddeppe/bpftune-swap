@@ -70,6 +70,10 @@ func (c *Collector) collect() {
         // ----- Build live buckets + metric_by_bucket + bucket_live ---------
         buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
 
+        // v0.9.36: build route health ONCE — was called twice (line 97 + line 104).
+        // This halves the work for the route health panel which iterates all hosts.
+        routeHealth := buildRouteHealth(hosts, metricByBucket)
+
         // ----- Build current.json document -----------------------------------
         doc := map[string]interface{}{
                 "generated_ts": now,
@@ -94,16 +98,16 @@ func (c *Collector) collect() {
                 "live_leaders":     liveLeaders,
                 "hostname":         readProc("/proc/sys/kernel/hostname"),
                 "now_mono":         nowMono(pl.MaxTs),
-                "route_health":     buildRouteHealth(hosts, metricByBucket),
+                "route_health":     routeHealth,
                 "route_monitor":    routeMonitor.getState(),
         }
 
         // v0.9.34: save snapshots for the route monitor goroutine to reuse.
         // This avoids the route monitor calling readBPFMap() itself.
+        // v0.9.36: reuse the routeHealth we already built above (was building it again).
         if routeMonitorEnabled {
-                rh := buildRouteHealth(hosts, metricByBucket)
                 lastHostsSnapshot = hosts
-                lastBpfHealthSnapshot = rh
+                lastBpfHealthSnapshot = routeHealth
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------

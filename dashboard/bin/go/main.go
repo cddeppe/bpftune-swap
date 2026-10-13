@@ -23,6 +23,7 @@ import (
         "flag"
         "fmt"
         "net/http"
+        _ "net/http/pprof" // v0.9.36: register /debug/pprof/* handlers
         "os"
         "path/filepath"
         "strings"
@@ -735,11 +736,15 @@ func main() {
 
         // ============================================================================
         // HTTP server
-        mux := http.NewServeMux()
+        // v0.9.36: use http.DefaultServeMux so net/http/pprof handlers
+        // (auto-registered via blank import) are available at /debug/pprof/*.
+        // Access: curl http://localhost:PORT/debug/pprof/heap > heap.pb.gz
+        //         go tool pprof heap.pb.gz
+        mux := http.DefaultServeMux
         mux.HandleFunc("/", collector.handleIndex)
 
         addr := fmt.Sprintf("%s:%d", *bind, *port)
-        fmt.Fprintf(os.Stderr, "collector: HTTP server on %s (serves /, /sse, /current.json, /api/labels, /data/*)\n", addr)
+        fmt.Fprintf(os.Stderr, "collector: HTTP server on %s (serves /, /sse, /current.json, /api/labels, /data/*, /debug/pprof/*)\n", addr)
 
         srv := &http.Server{
                 Addr:    addr,

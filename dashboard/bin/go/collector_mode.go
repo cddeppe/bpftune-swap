@@ -21,10 +21,10 @@ type CollectorMode struct {
 }
 
 var collectorMode = CollectorMode{
-        Name: "normal", CollectInterval: 30 * time.Second, LogTailBytes: 16_000_000,
+        Name: "normal", CollectInterval: 30 * time.Second, LogTailBytes: 8_000_000,
         CSVFallback: true, ProofMergeCSV: true, BackfillOnStart: true,
         CookieDestSave: 5, SinglePassLog: true,
-        CSVWriteEveryN: 1, SkipRenderWhenIdle: false, CacheBPFMap: false,
+        CSVWriteEveryN: 1, SkipRenderWhenIdle: false, CacheBPFMap: true,
 }
 
 var cycleCount int
@@ -48,10 +48,14 @@ func parseCollectorMode(mode string) CollectorMode {
                         2, true, true,
                 }
         default:
+                // v0.9.36: normal mode now uses 8MB log tail (was 16MB) and
+                // enables BPF map caching. The 16MB tail was causing high
+                // iowait on 1GB RAM hosts. 8MB still covers ~5min of events
+                // which is enough for the 1h chart + proof enrichment.
                 return CollectorMode{
-                        "normal", 30 * time.Second, 16_000_000,
+                        "normal", 30 * time.Second, 8_000_000,
                         true, true, true, 5, true,
-                        1, false, false,
+                        1, false, true,
                 }
         }
 }

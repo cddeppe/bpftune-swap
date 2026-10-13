@@ -74,19 +74,29 @@ func bpftuneVersion() string {
 
 var dashVersionStr = ""
 
+// v0.9.36: dashVersion() was forking `git tag` + `git rev-parse` on EVERY
+// collect cycle (every 30s). The value only changes on redeploy. Now we
+// check the cache FIRST and only fork git if the cache is cold/empty.
 func dashVersion() string {
 	// 1. If set at build time (ldflags), use that
 	if dashVersionStr != "" {
 		return strings.TrimPrefix(dashVersionStr, "v")
 	}
-	// 2. Try latest git tag (works from any branch)
+	// 2. Check cache first — avoids forking git every 30s
+	shellCacheMu.Lock()
+	if entry, ok := shellCache["dash_version"]; ok && entry.val != "" && time.Since(entry.at) < 1*time.Hour {
+		shellCacheMu.Unlock()
+		return entry.val
+	}
+	shellCacheMu.Unlock()
+	// 3. Cache miss — fork git tag (works from any branch)
 	for _, repo := range []string{"/root/bpftune", "/opt/bpftune", "/usr/src/bpftune"} {
 		cmd := exec.Command("git", "-C", repo, "tag", "--sort=-creatordate")
 		output, err := cmd.Output()
 		if err == nil {
 			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 			if len(lines) > 0 && lines[0] != "" {
-				v := strings.TrimPrefix(lines[0], "v")  // strip v prefix
+				v := strings.TrimPrefix(lines[0], "v")
 				shellCacheMu.Lock()
 				shellCache["dash_version"] = shellCacheEntry{v, time.Now()}
 				shellCacheMu.Unlock()
@@ -94,13 +104,16 @@ func dashVersion() string {
 			}
 		}
 	}
-	// 3. Fall back to commit hash
+	// 4. Fall back to commit hash
 	for _, repo := range []string{"/root/bpftune", "/opt/bpftune", "/usr/src/bpftune"} {
 		cmd := exec.Command("git", "-C", repo, "rev-parse", "--short", "HEAD")
 		output, err := cmd.Output()
 		if err == nil {
 			v := strings.TrimSpace(string(output))
 			if v != "" {
+				shellCacheMu.Lock()
+				shellCache["dash_version"] = shellCacheEntry{v, time.Now()}
+				shellCacheMu.Unlock()
 				return v
 			}
 		}
