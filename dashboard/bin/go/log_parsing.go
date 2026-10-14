@@ -685,6 +685,8 @@ func fieldValue(s swapOutRow, field string) string {
 }
 
 func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
+        // v0.9.56: use wall-clock epoch time instead of BPF ktime
+        nowEpoch := time.Now().Unix()
         out := make([]interface{}, 0, len(swaps))
         for _, s := range swaps {
                 // BUG 14 fix: use nil for unmeasured outcomes (dashboard expects null, not "")
@@ -697,7 +699,8 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
                 }
                 out = append(out, map[string]interface{}{
                         "ts":                s.Ts,
-                        "boot_ts":           s.Ts, // v0.9.14: add boot_ts for merge sort
+                        "epoch_ts":          nowEpoch, // v0.9.56: wall-clock read time
+                        "boot_ts":           s.Ts,
                         "cookie":            s.Cookie,
                         "dest":              s.Dest,
                         "outcome":           oc,

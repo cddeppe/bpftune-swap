@@ -2532,7 +2532,9 @@
         window.__chart_axis_max = fixedAxis.ts[fixedAxis.ts.length - 1] * 1000;
         var swapCounts = fixedAxis.ts.map(function(){return 0;});
         sw.forEach(function(s) {
-          var t = (s.ts || 0) + monoOffset;
+          // v0.9.56: use epoch_ts (wall-clock) instead of s.ts + monoOffset
+          // (BPF ktime conversion that breaks on reboot/migration)
+          var t = s.epoch_ts || (s.ts || 0) + monoOffset;
           var fa = fixedAxis.ts;
           if (t < fa[0] || t > fa[fa.length - 1]) return;
           if (t <= fa[0]) { swapCounts[0]++; return; }
@@ -2666,7 +2668,7 @@
         // to its nearest bin via binary search.  Empty bins -> 0 bars.
         var swapCounts = fixedAxis.ts.map(function(){return 0;});
         sw.forEach(function(s) {
-          var t = (s.ts || 0) + monoOffset;   // monotonic -> epoch
+          var t = s.epoch_ts || (s.ts || 0) + monoOffset;   // v0.9.56: prefer epoch_ts (wall-clock)
           var fa = fixedAxis.ts;
           if (t < fa[0] || t > fa[fa.length - 1]) return;
           if (t <= fa[0]) { swapCounts[0]++; return; }
