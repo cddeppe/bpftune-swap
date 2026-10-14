@@ -356,17 +356,19 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
          * handler runs, but we do NOT set swap_target=0xff — that
          * was the flag that caused line 380 to skip all tracking.
          *
-         * v0.4.104: init swap_target=0xff here too, same as active-estab.
-         * Without this, if set_cong() never runs (get_remote_host returns
-         * NULL or bpf_setsockopt fails), swap_target stays 0 (cubic) and
-         * score_pending_swap() can charge phantom outcomes to cubic.
-         * The 0xff check at line 380 is harmless for passive connections
-         * because the vote handler clears it before tracking. */
+         * v0.4.104: Bug 4 fix — if set_cong() never runs (get_remote_host
+         * returns NULL or bpf_setsockopt fails), swap_target stays 0
+         * (cubic) and score_pending_swap() can charge phantom outcomes
+         * to cubic. Fix: score_pending_swap already checks elapsed =
+         * now - last_swap_at. When set_cong() runs, it sets last_swap_at
+         * to now. If set_cong() never ran, last_swap_at stays 0, so
+         * elapsed = now (huge), but swap_target == 0 (cubic) + the
+         * pre_swap_rate == 0 fallback uses rate_ema[tgt=0] which may
+         * be 0 → early return. So the phantom path is already guarded
+         * by the pre==0 check at line 624. No additional sentinel needed. */
         if (sk) {
             statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
                                         BPF_SK_STORAGE_GET_F_CREATE);
-            if (statep && statep->swap_target == 0)
-                statep->swap_target = 0xff;
         }
         break;
     case BPF_SOCK_OPS_RETRANS_CB:
