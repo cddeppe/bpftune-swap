@@ -45,6 +45,12 @@ func (c *Collector) collect() {
         cycleCount++  // v0.9.25: increment cycle counter (was never incremented — throttle was dead)
         now := time.Now().Unix()
 
+        // v0.9.41: ensure cookie_dest map is loaded BEFORE readBPFMap()
+        // so v6ToV4Label() can cross-reference v6 entries to v4 labels.
+        // Without this, the first readBPFMap() call has a nil cookieDestDiskMap
+        // and all v6 entries stay as "v6:xxxx" instead of merging with v4.
+        ensureCookieDestLoaded()
+
         hosts, err := readBPFMap()
         if err != nil {
                 fmt.Fprintf(os.Stderr, "collector: BPF map read failed (degraded mode): %v\n", err)

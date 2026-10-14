@@ -144,6 +144,19 @@ func saveCookieDestToDisk(m map[string]cdestEntry) error {
         return nil
 }
 
+// ensureCookieDestLoaded loads the cookie_dest map from disk if it hasn't
+// been loaded yet. Called at the start of each collect cycle before
+// readBPFMap() so v6ToV4Label() has data to work with.
+// v0.9.41: Without this, the first readBPFMap() call has a nil
+// cookieDestDiskMap and all v6 entries stay as "v6:xxxx".
+func ensureCookieDestLoaded() {
+        cookieDestMu.Lock()
+        defer cookieDestMu.Unlock()
+        if cookieDestDiskMap == nil {
+                cookieDestDiskMap = loadCookieDestFromDisk()
+        }
+}
+
 // persistCookieDest merges the fresh map (just built from the log tail)
 // with the on-disk map (loaded at startup) and persists the result.
 //
