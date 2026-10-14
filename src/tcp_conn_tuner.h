@@ -156,12 +156,10 @@ struct tcp_conn_metric {
          * socket ever touched.  sockets_good / sockets_proved count the
          * subset that crossed each tier at some point while on this alg.
          *
-         * v0.4.104: The 0.4.89 comment claimed these were widened to
-         * __u32, but they were still __u16. Widening would change the
-         * metric struct size (48→56 bytes) and break all hardcoded
-         * offsets in streak_writeback.go. These are display-only fields
-         * that wrap at 65535 — low impact. Left as __u16 for now;
-         * the comment is fixed to reflect reality. */
+         * 0.4.89: widened from __u16 to __u32.  High-churn CDN buckets
+         * hit 65k sockets per alg in days, at which point __u16 wraps
+         * to 0 and the guarded decrement pins it there forever.
+         * STATE_LAYOUT bumped to 2; old state files refuse to load. */
         __u16 sockets_alive;
         __u16 sockets_good;
         __u16 sockets_proved;
@@ -233,10 +231,6 @@ struct remote_host {
      * reads the BPF map with hardcoded offsets from the pre-0.4.89
      * layout.  Position within struct is irrelevant to the race fix. */
     __u64 seq;
-    /* v0.4.104: route_min_rtt was moved here but BPF can't write to
-     * fields beyond offset 1024 (__builtin_memset limit). Removed.
-     * Route RTT is now logged via bpf_printk and parsed by the
-     * collector from the trace log, same as proofs/swaps. */
 };
 
 #define REMOTE_HOST_MIN_INSTANCES 4

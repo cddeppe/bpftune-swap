@@ -21,8 +21,6 @@
 
 _Static_assert(sizeof(struct remote_host) <= 1024,
                "remote_host too large for BPF memset");
-/* v0.4.104: route_min_rtt field removed — BPF can't write to fields beyond
- * offset 1024 (memset limit). Route RTT is logged via bpf_printk instead. */
 
 #define TCP_THIN_LINEAR_TIMEOUTS        16
 
@@ -356,18 +354,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
          *
          * We still create statep here so it exists when the vote
          * handler runs, but we do NOT set swap_target=0xff — that
-         * was the flag that caused line 380 to skip all tracking.
-         *
-         * v0.4.104: Bug 4 fix — if set_cong() never runs (get_remote_host
-         * returns NULL or bpf_setsockopt fails), swap_target stays 0
-         * (cubic) and score_pending_swap() can charge phantom outcomes
-         * to cubic. Fix: score_pending_swap already checks elapsed =
-         * now - last_swap_at. When set_cong() runs, it sets last_swap_at
-         * to now. If set_cong() never ran, last_swap_at stays 0, so
-         * elapsed = now (huge), but swap_target == 0 (cubic) + the
-         * pre_swap_rate == 0 fallback uses rate_ema[tgt=0] which may
-         * be 0 → early return. So the phantom path is already guarded
-         * by the pre==0 check at line 624. No additional sentinel needed. */
+         * was the flag that caused line 380 to skip all tracking. */
         if (sk) {
             statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
                                         BPF_SK_STORAGE_GET_F_CREATE);
@@ -989,29 +976,6 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 statep->cleaned = 1;
         }
     s = statep->state & (NUM_TCP_CONG_ALGS - 1);
-    /* v0.4.104: Record route RTT for ALL connections — including
-     * receive-only (YouTube, etc.) — BEFORE the direction gate below.
-     * This gives the route monitor real RTT data from actual connections.
-     *
-     * v0.4.104 FIX: The v0.4.103 code wrote to min_rtt (the scoring
-     * reference), bypassing the outlier/heal protection in
-     * tcp_metric_calc() and poisoning the reference. We can't add a
-     * separate route_min_rtt field because the struct is already at
-     * the 1024-byte BPF memset limit. Instead, we LOG the RTT via
-     * bpf_printk and the collector parses it from the trace log.
-     *
-     * Must run before METRIC_MIN_SEGS check and direction gate which
-     * both return early for receive-only connections. */
-    {
-        __u64 rtt_min_val = (__u64)tp->rtt_min.s[0].v;
-        if (rtt_min_val > 0) {
-            bpf_printk("rtt cookie=%llu rtt=%llu dest=%u dest6=%u dest6b=%u",
-                       bpf_get_socket_cookie(ops), rtt_min_val,
-                       is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
-                       (__u32)bpf_ntohl(ops->remote_ip6[0]),
-                       (__u32)bpf_ntohl(ops->remote_ip6[1]));
-        }
-    }
     if ((__u64)tp->segs_out + tp->segs_in < METRIC_MIN_SEGS)
         return 1;
     /* 0.4.42: skip sockets where we are primarily receiving.  On an
@@ -1304,12 +1268,7 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         if (best_alt != ~((__u64)0) && best_alt < m->metric_value)
             greedy = false;
         mt_alt_i = best_alt_i;
-        /* v0.4.104: only set swap_tgt if we actually found a valid leader.
-         * The old code unconditionally did swap_tgt = best_alt_i, which
-         * defaulted to 0 (cubic) when no leader existed — defeating the
-         * 0xff "no target" init above. */
-        if (best_alt != ~((__u64)0))
-            swap_tgt = best_alt_i;
+        swap_tgt = best_alt_i;
         /* 0.4.56: score-weighted target is picked by userspace in the
          * reanchor (rate_best_i).  BPF just reads it.  Keeping the
          * multiply/select out of the vote path; the 16-way loop with
