@@ -19,11 +19,12 @@
 
 #include "tcp_conn_tuner.h"
 
+/* v0.4.104: raised from 1024 to 2048 — struct is now 1032 bytes due to
+ * the new route_min_rtt field. The 1024 limit existed because __builtin_memset
+ * on the whole struct failed above 1024 bytes. Now that we zero in chunks
+ * (line 101-103), the limit is just a sanity bound. */
 _Static_assert(sizeof(struct remote_host) <= 2048,
-               "remote_host too large for BPF memset");
-// v0.4.104: raised from 1024 to 2048 — route_min_rtt field added (+8 bytes),
-// struct is now 1032 bytes. The 1024 limit was conservative; remote_host
-// lives in a BPF map (not on stack), so the 512-byte stack limit doesn't apply.
+               "remote_host too large for BPF");
 
 #define TCP_THIN_LINEAR_TIMEOUTS        16
 
@@ -95,7 +96,12 @@ static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
                 scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
                 if (!scratch)
                         return NULL;
-                __builtin_memset(scratch, 0, sizeof(*scratch));
+                /* v0.4.104: struct is now 1032 bytes — too large for a single
+                 * __builtin_memset (BPF backend supports max 1024). Zero in
+                 * two chunks instead. */
+                __builtin_memset(scratch, 0, 512);
+                __builtin_memset((char *)scratch + 512, 0, 512);
+                __builtin_memset((char *)scratch + 1024, 0, 8);
                 scratch->instances = 1;
                 bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
                 return NULL;
