@@ -191,10 +191,22 @@ func checkBPFPrograms() {
 // v0.9.46: This is the #1 cause of "dashboard shows no swaps".
 // The service can die from OOM, kernel updates, or manual stop.
 // The collector now auto-restarts it.
+//
+// v0.9.54: Also clears stale log entries from previous boots.
+// When bpftune restarts, the log file still has events from the previous
+// boot. These old events have BPF timestamps from the old boot, causing
+// the dashboard to show wrong ages (e.g. "1 hour ago" when swaps are
+// actually happening now). The collector now clears the log on startup
+// and when it detects events from a previous boot.
 func ensureTraceCaptureService() {
         const serviceName = "bpftune-met-trace"
         const serviceFilePath = "/etc/systemd/system/bpftune-met-trace.service"
         const logPath = "/var/log/bpftune-met-live.log"
+
+        // v0.9.54: Clear the log on collector startup to remove events
+        // from previous boots. This prevents stale swap events from
+        // showing in the dashboard with wrong ages.
+        clearStaleLogEntries(logPath)
 
         // Check if the service file exists; create it if missing
         if _, err := os.Stat(serviceFilePath); os.IsNotExist(err) {
@@ -352,4 +364,84 @@ func getServiceHealth() map[string]interface{} {
         health["all_ok"] = allOk
 
         return health
+}
+
+// clearStaleLogEntries checks if the log file contains events from a
+// previous boot. If the last event's BPF timestamp is significantly
+// lower than the current uptime, the events are stale (from before a
+// reboot) and the log should be cleared.
+//
+// v0.9.54: This fixes "dashboard shows swaps from an hour ago" when
+// swaps are actually happening now. The old log file persists across
+// reboots and contains events with BPF timestamps from the previous
+// boot, which the collector misinterprets as current-boot events.
+func clearStaleLogEntries(logPath string) {
+        // Read the current uptime
+        uptime := readProcUptime()
+        if uptime <= 0 {
+                return // can't determine, skip
+        }
+
+        // Read the last few lines of the log file
+        f, err := os.Open(logPath)
+        if err != nil {
+                return // file doesn't exist yet, nothing to clear
+        }
+        defer f.Close()
+
+        // Seek to the last 4KB of the file
+        fi, _ := f.Stat()
+        if fi.Size() == 0 {
+                return // empty file, nothing to clear
+        }
+
+        seekPos := fi.Size() - 4096
+        if seekPos < 0 {
+                seekPos = 0
+        }
+        f.Seek(seekPos, 0)
+
+        buf := make([]byte, 4096)
+        n, _ := f.Read(buf)
+        lines := strings.Split(string(buf[:n]), "\n")
+
+        // Find the last line with a BPF timestamp
+        var lastBpfTs float64
+        for i := len(lines) - 1; i >= 0; i-- {
+                line := lines[i]
+                // BPF trace lines look like:
+                //   <comm>-pid [cpu] flags TIMESTAMP: bpf_trace_printk: ...
+                // Extract the timestamp (the number before ": bpf_trace_printk")
+                idx := strings.Index(line, ": bpf_trace_printk")
+                if idx < 0 {
+                        continue
+                }
+                // Walk backwards from idx to find the start of the timestamp
+                start := idx
+                for start > 0 && (line[start-1] >= '0' && line[start-1] <= '9' || line[start-1] == '.') {
+                        start--
+                }
+                tsStr := line[start:idx]
+                if ts, err := strconv.ParseFloat(tsStr, 64); err == nil && ts > 0 {
+                        lastBpfTs = ts
+                        break
+                }
+        }
+
+        if lastBpfTs <= 0 {
+                return // can't find a timestamp, skip
+        }
+
+        // If the last BPF timestamp in the log is more than 60 seconds
+        // behind the current uptime, the log contains events from a
+        // previous boot. Clear it.
+        if uptime-lastBpfTs > 60 {
+                fmt.Fprintf(os.Stderr, "  trace log: clearing stale entries (last BPF ts=%.1f, uptime=%.1f, diff=%.0fs)\n",
+                        lastBpfTs, uptime, uptime-lastBpfTs)
+
+                // Stop the trace service, clear the log, restart
+                exec.Command("systemctl", "stop", "bpftune-met-trace").Run()
+                os.WriteFile(logPath, []byte{}, 0644)
+                exec.Command("systemctl", "start", "bpftune-met-trace").Run()
+        }
 }
