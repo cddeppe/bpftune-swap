@@ -2443,7 +2443,8 @@
   // v0.9.46: Service Health panel — shows the health of all system
   // components the tuner depends on: BPF programs, bpftune service,
   // trace capture service, log file freshness, explore_pct, trace buffer.
-  // Renders as compact health bars with green/red indicators.
+  // v0.9.48: Collapsible — shows just the overall banner by default,
+  // click the arrow to expand the per-component details.
   function renderServiceHealth(doc) {
     var el = $("lv-service-health");
     if (!el) return;
@@ -2464,27 +2465,47 @@
       { label: "Trace Buffer", value: (sh.trace_buffer_kb >= 1024 ? Math.round(sh.trace_buffer_kb/1024) + "MB" : sh.trace_buffer_kb + "KB"), ok: sh.trace_buffer_ok },
     ];
 
-    var html = '<div class="route-health origin-grid">';
-    checks.forEach(function(c) {
-      var color = c.ok ? "#34a853" : "#e5484d";
-      var bg = c.ok ? "rgba(52,168,83,0.1)" : "rgba(229,72,77,0.1)";
-      html += '<div class="route-row" style="padding:4px 8px;border-radius:4px;background:' + bg + ';">';
-      html += '<span style="width:10px;height:10px;border-radius:50%;background:' + color + ';display:inline-block;flex-shrink:0;"></span>';
-      html += '<span style="min-width:100px;color:var(--fg);font-weight:600;font-size:11px;">' + esc(c.label) + '</span>';
-      html += '<span style="color:var(--muted-2);font-size:11px;font-family:var(--mono);">' + esc(c.value) + '</span>';
-      html += '</div>';
-    });
-
-    // Overall status banner
     var allOk = sh.all_ok;
     var bannerColor = allOk ? "#34a853" : "#e5484d";
     var bannerBg = allOk ? "rgba(52,168,83,0.08)" : "rgba(229,72,77,0.08)";
-    var bannerText = allOk ? "All systems healthy" : "Issues detected — see above";
-    html += '<div style="margin-top:6px;padding:6px 10px;border-radius:4px;background:' + bannerBg + ';border-left:3px solid ' + bannerColor + ';font-size:11px;color:' + bannerColor + ';font-weight:600;">' + bannerText + '</div>';
+    var bannerText = allOk ? "All systems healthy" : "Issues detected — click for details";
+    var arrow = allOk ? "▸" : "▾"; // collapsed arrow when OK, expanded when problems
+
+    // v0.9.48: Preserve expand/collapse state across renders
+    var expanded = !allOk || window.__serviceHealthExpanded;
+
+    var html = '<div class="route-health">';
+    // Compact banner with toggle arrow — always visible
+    html += '<div onclick="window.__toggleServiceHealth()" style="cursor:pointer;padding:6px 10px;border-radius:4px;background:' + bannerBg + ';border-left:3px solid ' + bannerColor + ';font-size:11px;color:' + bannerColor + ';font-weight:600;display:flex;align-items:center;gap:6px;">';
+    html += '<span style="width:8px;height:8px;border-radius:50%;background:' + bannerColor + ';display:inline-block;flex-shrink:0;"></span>';
+    html += '<span>' + bannerText + '</span>';
+    html += '<span style="margin-left:auto;font-size:10px;opacity:0.7;" id="sh-arrow">' + (expanded ? "▾" : "▸") + '</span>';
+    html += '</div>';
+
+    // Collapsible details — hidden when collapsed
+    if (expanded) {
+      html += '<div class="origin-grid" style="margin-top:4px;">';
+      checks.forEach(function(c) {
+        var color = c.ok ? "#34a853" : "#e5484d";
+        var bg = c.ok ? "rgba(52,168,83,0.06)" : "rgba(229,72,77,0.06)";
+        html += '<div class="route-row" style="padding:3px 8px;border-radius:4px;background:' + bg + ';">';
+        html += '<span style="width:8px;height:8px;border-radius:50%;background:' + color + ';display:inline-block;flex-shrink:0;"></span>';
+        html += '<span style="min-width:90px;color:var(--fg);font-weight:600;font-size:10px;">' + esc(c.label) + '</span>';
+        html += '<span style="color:var(--muted-2);font-size:10px;font-family:var(--mono);">' + esc(c.value) + '</span>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
 
     html += '</div>';
     setHTML("lv-service-health", html);
   }
+
+  // v0.9.48: Toggle function for the Service Health panel
+  window.__toggleServiceHealth = function() {
+    window.__serviceHealthExpanded = !window.__serviceHealthExpanded;
+    if (window.__current_doc) renderServiceHealth(window.__current_doc);
+  };
 
   function renderSwaps() {
     // v0.8.7: guard $("range") — SSE can fire before boot populates
