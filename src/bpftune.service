@@ -9,11 +9,6 @@ After=systemd-sysctl.service network.target
 ExecStart=/usr/sbin/bpftune
 Restart=always
 RestartSec=3
-# v0.4.104: kernel 6.12+ needs CAP_BPF + CAP_NET_ADMIN when
-# kernel.unprivileged_bpf_disabled=2
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN
-LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
