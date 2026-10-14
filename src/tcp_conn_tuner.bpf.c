@@ -96,12 +96,10 @@ static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
                 scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
                 if (!scratch)
                         return NULL;
-                /* v0.4.104: struct is now 1032 bytes — too large for a single
-                 * __builtin_memset (BPF backend supports max 1024). Zero in
-                 * two chunks instead. */
-                __builtin_memset(scratch, 0, 512);
-                __builtin_memset((char *)scratch + 512, 0, 512);
-                __builtin_memset((char *)scratch + 1024, 0, 8);
+                __builtin_memset(scratch, 0, 1024);
+                /* v0.4.104: route_min_rtt is at offset 1024, beyond the
+                 * __builtin_memset 1024-byte limit. Zero it manually. */
+                scratch->route_min_rtt = 0;
                 scratch->instances = 1;
                 bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
                 return NULL;
