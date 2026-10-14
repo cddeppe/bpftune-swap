@@ -702,12 +702,14 @@ func main() {
         // v0.9.45: Periodic system health re-sync (every 5 min).
         // If bpftune restarts or the BPF map is reset, this re-applies
         // the saved explore_pct and ensures the trace buffer stays large.
+        // v0.9.46: Also restarts the trace capture service if it dies.
         go func() {
                 ticker := time.NewTicker(5 * time.Minute)
                 defer ticker.Stop()
                 for range ticker.C {
                         ensureTraceBufferSize()
                         syncExplorePctToBPF()
+                        ensureTraceCaptureService()
                 }
         }()
 
