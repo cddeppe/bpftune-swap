@@ -19,8 +19,11 @@
 
 #include "tcp_conn_tuner.h"
 
-_Static_assert(sizeof(struct remote_host) <= 1024,
+_Static_assert(sizeof(struct remote_host) <= 2048,
                "remote_host too large for BPF memset");
+// v0.4.104: raised from 1024 to 2048 — route_min_rtt field added (+8 bytes),
+// struct is now 1032 bytes. The 1024 limit was conservative; remote_host
+// lives in a BPF map (not on stack), so the 512-byte stack limit doesn't apply.
 
 #define TCP_THIN_LINEAR_TIMEOUTS        16
 
