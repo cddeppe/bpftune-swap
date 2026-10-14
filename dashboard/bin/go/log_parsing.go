@@ -40,7 +40,13 @@ var (
 
         rxMet = regexp.MustCompile(
                 `(\d+\.\d+): bpf_trace_printk: met cookie=(\d+) ` +
-                        `rport=(\d+) alg=(\d+) segs=(\d+) val=(\d+)`)
+                        `rport=(\d+) alg=(\d+) segs=(\d+) val=(\d+)` +
+                        `(?: rtt=(\d+))?` +
+                        `(?: rate=(\d+))?` +
+                        `(?: loss=(\d+))?` +
+                        `(?: smrtt=(\d+))?` +
+                        `(?: bmrtt=(\d+))?` +
+                        `(?: avgrtt=(\d+))?`)
 
         rxSrate = regexp.MustCompile(
                 `(\d+\.\d+): bpf_trace_printk: srate cookie=(\d+) ` +
@@ -56,10 +62,6 @@ var (
 
         rxMidsamp = regexp.MustCompile(
                 `(\d+\.\d+): .*midsamp cookie=(\d+) .*srate=(\d+)`)
-
-        // v0.4.104: RTT logging for route monitor (replaces struct field)
-        rxRtt = regexp.MustCompile(
-                `(\d+\.\d+): .*rtt cookie=(\d+) rtt=(\d+) dest=(\d+) dest6=(\d+) dest6b=(\d+)`)
 
         rxDestInt = regexp.MustCompile(`dest=(\d+)`)
         rxDest6   = regexp.MustCompile(`dest6=(\d+)`)

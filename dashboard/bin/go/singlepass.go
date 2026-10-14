@@ -162,6 +162,24 @@ func parseLogSinglePass(text string) *parsedLog {
                         if alg != 0 {
                                 pl.CookieAlg[m[2]] = alg
                         }
+                        // v0.4.105: extract RTT from met lines for route health
+                        // (no BPF changes needed — met lines already have rtt=)
+                        if len(m) > 7 && m[7] != "" {
+                                rttUs, _ := strconv.ParseFloat(m[7], 64)
+                                if rttUs > 0 {
+                                        cookieStr := m[2]
+                                        if d, ok := pl.Cdest[cookieStr]; ok {
+                                                ds := destStr(d[0], d[1], d[2])
+                                                destLabel := labelFor(ds)
+                                                if destLabel == "" {
+                                                        destLabel = ds
+                                                }
+                                                if existing, ok := pl.RttByDest[destLabel]; !ok || rttUs < existing {
+                                                        pl.RttByDest[destLabel] = rttUs
+                                                }
+                                        }
+                                }
+                        }
                         continue
                 }
 
@@ -308,24 +326,6 @@ func parseLogSinglePass(text string) *parsedLog {
 
                         // buildBucketIPs: midsamp lines may carry dest=
                         pl.extractBucketIPs(line, p4, p6)
-                        continue
-                }
-
-                // v0.4.104: RTT logging for route monitor
-                if m := rxRtt.FindStringSubmatch(line); m != nil {
-                        rttUs, _ := strconv.ParseFloat(m[3], 64)
-                        if rttUs > 0 {
-                                // Resolve dest from the dest=/dest6=/dest6b= fields
-                                ds := destStr(m[4], m[5], m[6])
-                                destLabel := labelFor(ds)
-                                if destLabel == "" {
-                                        destLabel = ds
-                                }
-                                // Keep the minimum RTT per dest
-                                if existing, ok := pl.RttByDest[destLabel]; !ok || rttUs < existing {
-                                        pl.RttByDest[destLabel] = rttUs
-                                }
-                        }
                         continue
                 }
 
