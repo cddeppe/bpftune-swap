@@ -2304,14 +2304,25 @@
       var preferred = r.preferred || "";
 
       // Build compact row showing both protocols side by side
-      var v4Rtt = r.v4_rtt_ms != null ? r.v4_rtt_ms.toFixed(1) : "—";
-      var v4Loss = r.v4_loss_pct != null ? r.v4_loss_pct.toFixed(1) : "—";
-      var v6Rtt = r.v6_rtt_ms != null ? r.v6_rtt_ms.toFixed(1) : "—";
-      var v6Loss = r.v6_loss_pct != null ? r.v6_loss_pct.toFixed(1) : "—";
+      // v0.9.37: use has_data flags to show "no data" instead of "0.0ms 100%"
+      var v4Rtt, v4Loss, v6Rtt, v6Loss;
+      if (r.v4_has_data === false) {
+        v4Rtt = "—"; v4Loss = "—";
+      } else {
+        v4Rtt = r.v4_rtt_ms != null ? r.v4_rtt_ms.toFixed(1) : "—";
+        v4Loss = r.v4_loss_pct != null ? r.v4_loss_pct.toFixed(1) : "—";
+      }
+      if (r.v6_has_data === false) {
+        v6Rtt = "—"; v6Loss = "—";
+      } else {
+        v6Rtt = r.v6_rtt_ms != null ? r.v6_rtt_ms.toFixed(1) : "—";
+        v6Loss = r.v6_loss_pct != null ? r.v6_loss_pct.toFixed(1) : "—";
+      }
 
       // Determine which protocol is better (lower RTT + loss wins)
+      // v0.9.37: skip comparison if either has no data
       var betterProto = "";
-      if (hasV4 && hasV6) {
+      if (hasV4 && hasV6 && r.v4_has_data !== false && r.v6_has_data !== false) {
         var v4Score = (r.v4_loss_pct || 0) * 10 + (r.v4_rtt_ms || 999);
         var v6Score = (r.v6_loss_pct || 0) * 10 + (r.v6_rtt_ms || 999);
         if (v4Score < v6Score) betterProto = "v4";
@@ -2333,16 +2344,18 @@
         '<span style="min-width:80px;color:var(--fg);font-weight:600;">' + esc(label) + preferredBadge + '</span>';
 
       if (hasV4) {
-        var v4HealthClass = (r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good";
+        var v4NoData = r.v4_has_data === false;
+        var v4HealthClass = v4NoData ? "" : ((r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good");
         html += '<span class="route-metric' + (v4HealthClass === 'good' ? '' : '') + '" style="' +
           (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
-          'v4: <b>' + v4Rtt + '</b>ms <b>' + v4Loss + '%</b></span>';
+          (v4NoData ? 'v4: <i style="opacity:0.5">no data</i>' : 'v4: <b>' + v4Rtt + '</b>ms <b>' + v4Loss + '%</b>') + '</span>';
       }
       if (hasV6) {
-        var v6HealthClass = (r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good";
+        var v6NoData = r.v6_has_data === false;
+        var v6HealthClass = v6NoData ? "" : ((r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good");
         html += '<span class="route-metric" style="' +
           (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
-          'v6: <b>' + v6Rtt + '</b>ms <b>' + v6Loss + '%</b></span>';
+          (v6NoData ? 'v6: <i style="opacity:0.5">no data</i>' : 'v6: <b>' + v6Rtt + '</b>ms <b>' + v6Loss + '%</b>') + '</span>';
       }
       if (!hasV4 && !hasV6) {
         html += '<span class="route-metric">(no data)</span>';

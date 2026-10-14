@@ -204,6 +204,8 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         }
 
         // v0.9.35: minimal ICMP — only 1 ping, only dual-stack, only when BPF has no data
+        // v0.9.37: ICMP returns -1,-1 when it can't get data (blocked, no route).
+        // Don't overwrite BPF data with -1; only use ICMP result if it's > 0.
         var v4PingRTT, v4PingLoss, v6PingRTT, v6PingLoss float64
         needV4Ping := hasV4 && hasV6 && v4BpfRTT == 0 && v4Addr != ""
         needV6Ping := hasV4 && hasV6 && v6BpfRTT == 0 && v6Addr != ""
@@ -217,12 +219,12 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                 }
         }
 
-        // Use BPF data if available, otherwise ping data
+        // Use BPF data if available, otherwise ping data (if ping succeeded)
         v4RTT := v4BpfRTT; v4Loss := v4BpfLoss
         v6RTT := v6BpfRTT; v6Loss := v6BpfLoss
+        if needV4Ping && v4PingRTT > 0 { v4RTT = v4PingRTT; v4Loss = v4PingLoss }
+        if needV6Ping && v6PingRTT > 0 { v6RTT = v6PingRTT; v6Loss = v6PingLoss }
         if needV4Ping || needV6Ping {
-                if needV4Ping { v4RTT = v4PingRTT; v4Loss = v4PingLoss }
-                if needV6Ping { v6RTT = v6PingRTT; v6Loss = v6PingLoss }
                 usingBPF = false
         }
 
@@ -343,6 +345,10 @@ func (rm *RouteMonitor) getState() []interface{} {
         out := make([]interface{}, 0, len(states))
         for _, state := range states {
                 state.mu.Lock()
+                // v0.9.37: has_data flags so frontend can show "no data"
+                // instead of misleading "0.0ms 100% loss"
+                v4HasData := state.V4RTT > 0
+                v6HasData := state.V6RTT > 0
                 entry := map[string]interface{}{
                         "label": state.Label,
                         "has_ipv4": state.HasIPv4,
@@ -350,8 +356,10 @@ func (rm *RouteMonitor) getState() []interface{} {
                         "preferred": state.PreferredProto,
                         "v4_rtt_ms": round1(state.V4RTT),
                         "v4_loss_pct": round1(state.V4Loss),
+                        "v4_has_data": v4HasData,
                         "v6_rtt_ms": round1(state.V6RTT),
                         "v6_loss_pct": round1(state.V6Loss),
+                        "v6_has_data": v6HasData,
                         "using_bpf": state.UsingBPF,
                         "last_switch_ts": state.LastSwitchTs,
                         "last_switch_reason": state.LastSwitchReason,
@@ -372,9 +380,12 @@ func (rm *RouteMonitor) getState() []interface{} {
 // Minimal ICMP — 1 echo per destination, Go raw sockets, no process fork
 // ============================================================================
 
+// v0.9.37: return -1, -1 (no data) instead of 0, 100 on failure.
+// 0, 100 was misleading the dashboard into showing "100% loss" when
+// really we just couldn't get any data (ICMP blocked, no route, etc).
 func icmpPing(addr string) (float64, float64) {
         target := normalizePingTarget(addr)
-        if target == "" { return 0, 100 }
+        if target == "" { return -1, -1 }
         if strings.Contains(target, ":") {
                 return icmpPing6(target)
         }
@@ -385,7 +396,7 @@ func icmpPing4(target string) (float64, float64) {
         ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
         defer cancel()
         conn, err := (&net.Dialer{}).DialContext(ctx, "ip4:icmp", target)
-        if err != nil { return 0, 100 }
+        if err != nil { return -1, -1 }
         defer conn.Close()
         conn.SetDeadline(time.Now().Add(2 * time.Second))
         msg := make([]byte, 16)
@@ -394,9 +405,9 @@ func icmpPing4(target string) (float64, float64) {
         binary.BigEndian.PutUint16(msg[6:], 1)
         binary.BigEndian.PutUint16(msg[2:], icmpChecksum(msg))
         start := time.Now()
-        if _, err := conn.Write(msg); err != nil { return 0, 100 }
+        if _, err := conn.Write(msg); err != nil { return -1, -1 }
         buf := make([]byte, 1500)
-        if _, err := conn.Read(buf); err != nil { return 0, 100 }
+        if _, err := conn.Read(buf); err != nil { return -1, -1 }
         return float64(time.Since(start).Microseconds()) / 1000.0, 0
 }
 
@@ -404,7 +415,7 @@ func icmpPing6(target string) (float64, float64) {
         ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
         defer cancel()
         conn, err := (&net.Dialer{}).DialContext(ctx, "ip6:ipv6-icmp", target)
-        if err != nil { return 0, 100 }
+        if err != nil { return -1, -1 }
         defer conn.Close()
         conn.SetDeadline(time.Now().Add(2 * time.Second))
         msg := make([]byte, 16)
@@ -413,9 +424,9 @@ func icmpPing6(target string) (float64, float64) {
         binary.BigEndian.PutUint16(msg[6:], 1)
         binary.BigEndian.PutUint16(msg[2:], icmpChecksum(msg))
         start := time.Now()
-        if _, err := conn.Write(msg); err != nil { return 0, 100 }
+        if _, err := conn.Write(msg); err != nil { return -1, -1 }
         buf := make([]byte, 1500)
-        if _, err := conn.Read(buf); err != nil { return 0, 100 }
+        if _, err := conn.Read(buf); err != nil { return -1, -1 }
         return float64(time.Since(start).Microseconds()) / 1000.0, 0
 }
 
