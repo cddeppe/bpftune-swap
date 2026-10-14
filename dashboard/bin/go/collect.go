@@ -106,6 +106,7 @@ func (c *Collector) collect() {
                 "now_mono":         nowMono(pl.MaxTs),
                 "route_health":     routeHealth,
                 "route_monitor":    routeMonitor.getState(),
+                "service_health":   getServiceHealth(),
         }
 
         // v0.9.34: save snapshots for the route monitor goroutine to reuse.

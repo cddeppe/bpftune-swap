@@ -1337,6 +1337,7 @@
       _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
       renderRouteHealth(doc);
       renderOriginHealth(doc);
+      renderServiceHealth(doc);
       // v0.9.40: hide the loading overlay after Phase 2 (HTML panels visible)
       _hideLoadingOverlay();
     });
@@ -2439,6 +2440,52 @@
     setHTML("lv-origin-health", html);
   }
 
+  // v0.9.46: Service Health panel — shows the health of all system
+  // components the tuner depends on: BPF programs, bpftune service,
+  // trace capture service, log file freshness, explore_pct, trace buffer.
+  // Renders as compact health bars with green/red indicators.
+  function renderServiceHealth(doc) {
+    var el = $("lv-service-health");
+    if (!el) return;
+    if (!doc) return;
+
+    var sh = doc.service_health;
+    if (!sh) {
+      setHTML("lv-service-health", '<div class="placeholder">(collecting health data&hellip;)</div>');
+      return;
+    }
+
+    var checks = [
+      { label: "BPF Programs", value: sh.bpf_programs + " loaded", ok: sh.bpf_programs_ok },
+      { label: "bpftune Service", value: sh.bpftune_service, ok: sh.bpftune_service_ok },
+      { label: "Trace Capture", value: sh.trace_service, ok: sh.trace_service_ok },
+      { label: "Log Freshness", value: sh.log_age + " old", ok: sh.log_fresh_ok },
+      { label: "Explore %", value: sh.explore_pct + "%", ok: sh.explore_pct_ok },
+      { label: "Trace Buffer", value: (sh.trace_buffer_kb >= 1024 ? Math.round(sh.trace_buffer_kb/1024) + "MB" : sh.trace_buffer_kb + "KB"), ok: sh.trace_buffer_ok },
+    ];
+
+    var html = '<div class="route-health origin-grid">';
+    checks.forEach(function(c) {
+      var color = c.ok ? "#34a853" : "#e5484d";
+      var bg = c.ok ? "rgba(52,168,83,0.1)" : "rgba(229,72,77,0.1)";
+      html += '<div class="route-row" style="padding:4px 8px;border-radius:4px;background:' + bg + ';">';
+      html += '<span style="width:10px;height:10px;border-radius:50%;background:' + color + ';display:inline-block;flex-shrink:0;"></span>';
+      html += '<span style="min-width:100px;color:var(--fg);font-weight:600;font-size:11px;">' + esc(c.label) + '</span>';
+      html += '<span style="color:var(--muted-2);font-size:11px;font-family:var(--mono);">' + esc(c.value) + '</span>';
+      html += '</div>';
+    });
+
+    // Overall status banner
+    var allOk = sh.all_ok;
+    var bannerColor = allOk ? "#34a853" : "#e5484d";
+    var bannerBg = allOk ? "rgba(52,168,83,0.08)" : "rgba(229,72,77,0.08)";
+    var bannerText = allOk ? "All systems healthy" : "Issues detected — see above";
+    html += '<div style="margin-top:6px;padding:6px 10px;border-radius:4px;background:' + bannerBg + ';border-left:3px solid ' + bannerColor + ';font-size:11px;color:' + bannerColor + ';font-weight:600;">' + bannerText + '</div>';
+
+    html += '</div>';
+    setHTML("lv-service-health", html);
+  }
+
   function renderSwaps() {
     // v0.8.7: guard $("range") — SSE can fire before boot populates
     // the <select>, so $("range") is null briefly.  Treat as "1h".
@@ -2720,6 +2767,7 @@ _safeRender("score-now", function() { renderScoreNow(); });
       _safeRender("score-now", function() { renderScoreNow(); });
       renderRouteHealth(window.__current_doc);
       renderOriginHealth(window.__current_doc);
+      renderServiceHealth(window.__current_doc);
     }).catch(function (e) {
       state.bucketDoc = null;
       renderNow();
@@ -2727,6 +2775,7 @@ _safeRender("score-now", function() { renderScoreNow(); });
       renderMetricForBucket();
       renderRouteHealth(window.__current_doc);
       renderOriginHealth(window.__current_doc);
+      renderServiceHealth(window.__current_doc);
     });
   }
 

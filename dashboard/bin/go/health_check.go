@@ -278,3 +278,78 @@ WantedBy=multi-user.target
                 f.Close()
         }
 }
+
+// getServiceHealth collects the current health status of all system
+// components the tuner depends on. Called on every collect cycle and
+// included in current.json as "service_health".
+//
+// v0.9.46: The dashboard renders this as a visual health panel so users
+// can immediately see if something is wrong.
+func getServiceHealth() map[string]interface{} {
+        health := map[string]interface{}{}
+
+        // 1. BPF programs loaded?
+        bpfCount := 0
+        if out, err := exec.Command("bpftool", "prog", "show").Output(); err == nil {
+                bpfCount = strings.Count(string(out), "bpftune")
+        }
+        health["bpf_programs"] = bpfCount
+        health["bpf_programs_ok"] = bpfCount > 0
+
+        // 2. bpftune service active?
+        bpftuneActive := "unknown"
+        if out, err := exec.Command("systemctl", "is-active", "bpftune").Output(); err == nil {
+                bpftuneActive = strings.TrimSpace(string(out))
+        }
+        health["bpftune_service"] = bpftuneActive
+        health["bpftune_service_ok"] = bpftuneActive == "active"
+
+        // 3. Trace capture service active?
+        traceActive := "unknown"
+        if out, err := exec.Command("systemctl", "is-active", "bpftune-met-trace").Output(); err == nil {
+                traceActive = strings.TrimSpace(string(out))
+        }
+        health["trace_service"] = traceActive
+        health["trace_service_ok"] = traceActive == "active"
+
+        // 4. Log file freshness
+        logAge := "unknown"
+        logAgeSec := int64(0)
+        if fi, err := os.Stat("/var/log/bpftune-met-live.log"); err == nil {
+                ageSec := int64(time.Since(fi.ModTime()).Seconds())
+                logAgeSec = ageSec
+                if ageSec < 60 {
+                        logAge = fmt.Sprintf("%ds", ageSec)
+                } else if ageSec < 3600 {
+                        logAge = fmt.Sprintf("%dm", ageSec/60)
+                } else {
+                        logAge = fmt.Sprintf("%dh", ageSec/3600)
+                }
+        }
+        health["log_age"] = logAge
+        health["log_age_sec"] = logAgeSec
+        health["log_fresh_ok"] = logAgeSec >= 0 && logAgeSec < 120 // fresh if <2 min old
+
+        // 5. Explore_pct
+        expPct := explorePctValue()
+        health["explore_pct"] = expPct
+        health["explore_pct_ok"] = expPct > 0
+
+        // 6. Trace buffer size
+        bufSize := 0
+        if data, err := os.ReadFile("/sys/kernel/debug/tracing/buffer_size_kb"); err == nil {
+                bufSize, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+        }
+        health["trace_buffer_kb"] = bufSize
+        health["trace_buffer_ok"] = bufSize >= 65536 // 64MB minimum
+
+        // Overall health
+        allOk := health["bpf_programs_ok"].(bool) &&
+                health["bpftune_service_ok"].(bool) &&
+                health["trace_service_ok"].(bool) &&
+                health["log_fresh_ok"].(bool) &&
+                health["explore_pct_ok"].(bool)
+        health["all_ok"] = allOk
+
+        return health
+}
