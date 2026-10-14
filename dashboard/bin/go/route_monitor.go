@@ -182,6 +182,9 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         }
 
         // Read BPF metrics
+        // v0.9.38: read per-protocol min_rtt directly from the hosts snapshot.
+        // Before this, the route monitor read from bpfHealth which only had
+        // one merged RTT (usually v4). Now we get both v4 and v6 RTT separately.
         var v4BpfRTT, v4BpfLoss, v6BpfRTT, v6BpfLoss float64
         usingBPF := false
         if bpfHealth != nil {
@@ -190,7 +193,11 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                         if !ok { continue }
                         lbl := labelFor(addr)
                         if lbl != label { continue }
-                        if entry.Protocol != "ipv6" && entry.Protocol != "dual" {
+                        // v0.9.38: the routeHealthEntry now has per-protocol data
+                        // via the V4MinRTT/V6MinRTT fields in hostEntry.
+                        // But routeHealthEntry itself doesn't carry those — we need
+                        // to read from the hosts snapshot instead.
+                        if entry.Protocol != "ipv6" {
                                 v4BpfRTT = entry.RTTMs
                                 v4BpfLoss = entry.LossPct
                                 usingBPF = true
@@ -200,6 +207,27 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                                 v6BpfLoss = entry.LossPct
                                 usingBPF = true
                         }
+                }
+        }
+
+        // v0.9.38: also check hosts snapshot for per-protocol min_rtt.
+        // This is the real fix — the merged BPF map entry has V4MinRTT and
+        // V6MinRTT tracked separately, so v6 gets real data.
+        if lastHostsSnapshot != nil {
+                for _, h := range lastHostsSnapshot {
+                        if h.Inst < 2 { continue }
+                        lbl := labelFor(h.Addr)
+                        if lbl == "" { lbl = h.Addr }
+                        if lbl != label { continue }
+                        if h.V4MinRTT > 0 {
+                                v4BpfRTT = h.V4MinRTT / 1000.0
+                                usingBPF = true
+                        }
+                        if h.V6MinRTT > 0 {
+                                v6BpfRTT = h.V6MinRTT / 1000.0
+                                usingBPF = true
+                        }
+                        break // found this label
                 }
         }
 

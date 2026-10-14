@@ -48,13 +48,31 @@ func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) 
                 }
 
                 v := h.V
-                rttUs := toFloat(v["min_rtt"])
-                rttMs := rttUs / 1000.0
+                // v0.9.38: use per-protocol min_rtt from the merge (V4MinRTT/V6MinRTT).
+                // Before this, only one min_rtt survived the merge (usually v4),
+                // so v6 always showed 0 and the route monitor could never switch.
+                rttMs := 0.0
+                if h.V4MinRTT > 0 && h.V6MinRTT > 0 {
+                        // Both protocols have data — use the better (lower) one
+                        rttMs = h.V4MinRTT / 1000.0
+                        if h.V6MinRTT < h.V4MinRTT {
+                                rttMs = h.V6MinRTT / 1000.0
+                        }
+                } else if h.V4MinRTT > 0 {
+                        rttMs = h.V4MinRTT / 1000.0
+                } else if h.V6MinRTT > 0 {
+                        rttMs = h.V6MinRTT / 1000.0
+                } else {
+                        rttMs = toFloat(v["min_rtt"]) / 1000.0 // fallback to merged value
+                }
 
-                // Determine protocol from address format
+                // Determine protocol from which min_rtt we're using
                 protocol := "ipv4"
-                if strings.HasPrefix(addr, "v6:") || strings.Contains(addr, ":") {
+                if h.V4MinRTT == 0 && h.V6MinRTT > 0 {
                         protocol = "ipv6"
+                }
+                if h.V4MinRTT > 0 && h.V6MinRTT > 0 {
+                        protocol = "dual"
                 }
 
                 // Aggregate loss from metric_by_bucket

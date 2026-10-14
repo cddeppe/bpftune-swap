@@ -21,6 +21,7 @@ import (
         "encoding/json"
         "context"
         "fmt"
+        "strings"
         "time"
         "os/exec"
 )
@@ -32,11 +33,20 @@ import (
 // separate from Inst which is the SUM. Used by the merge logic to decide
 // which entry donates its metrics/best_alg/min_rtt — we want the entry
 // with the most instances, not whichever appeared first.
+//
+// v0.9.38: V4MinRTT and V6MinRTT track per-protocol min_rtt separately.
+// Before this, the merge only kept one min_rtt (from the entry with more
+// instances, usually v4). This meant v6 RTT was always 0, and the route
+// monitor could never switch to v6 because it had no v6 data.
 type hostEntry struct {
-        Inst    int
-        MaxInst int    // B3-fix: largest single inst across folded entries
-        Addr    string // labeled + merged (e.g. "home-sco" or "2606:1a40::")
-        V       map[string]interface{}
+        Inst      int
+        MaxInst   int    // B3-fix: largest single inst across folded entries
+        Addr      string // labeled + merged (e.g. "home-sco" or "2606:1a40::")
+        V         map[string]interface{}
+        V4MinRTT  float64 // v0.9.38: separate v4 min_rtt (microseconds)
+        V6MinRTT  float64 // v0.9.38: separate v6 min_rtt (microseconds)
+        V4Inst    int     // v0.9.38: v4-only instance count
+        V6Inst    int     // v0.9.38: v6-only instance count
 }
 
 // readBPFMap runs bpftool, parses the JSON, applies ResolveBucket + merges
@@ -138,20 +148,40 @@ func readBPFMap() ([]hostEntry, error) {
                         final = addr
                 }
                 inst := toInt(val["instances"])
+                rttUs := toFloat(val["min_rtt"])
+                isV6 := strings.HasPrefix(addr, "v6:")
                 if existing, ok := merged[final]; ok {
                         existing.Inst += inst
                         // B3-fix: keep the entry with the largest single inst as the
                         // representative for non-instance fields (best_alg, min_rtt,
-                        // max_rate_delivered, metrics[]). The old logic compared
-                        // `inst > existing.Inst - inst` (= "is new > sum of previous?")
-                        // which was almost never true, so the first-seen entry
-                        // permanently donated its metrics.
+                        // max_rate_delivered, metrics[]).
                         if inst > existing.MaxInst {
                                 existing.MaxInst = inst
                                 existing.V = val
                         }
+                        // v0.9.38: track v4 and v6 min_rtt separately so the route
+                        // monitor has real v6 data even when v4 has more connections.
+                        if isV6 {
+                                existing.V6Inst += inst
+                                if rttUs > 0 && (existing.V6MinRTT == 0 || rttUs < existing.V6MinRTT) {
+                                        existing.V6MinRTT = rttUs
+                                }
+                        } else {
+                                existing.V4Inst += inst
+                                if rttUs > 0 && (existing.V4MinRTT == 0 || rttUs < existing.V4MinRTT) {
+                                        existing.V4MinRTT = rttUs
+                                }
+                        }
                 } else {
-                        merged[final] = &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val}
+                        he := &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val}
+                        if isV6 {
+                                he.V6Inst = inst
+                                if rttUs > 0 { he.V6MinRTT = rttUs }
+                        } else {
+                                he.V4Inst = inst
+                                if rttUs > 0 { he.V4MinRTT = rttUs }
+                        }
+                        merged[final] = he
                         order = append(order, final)
                 }
         }
