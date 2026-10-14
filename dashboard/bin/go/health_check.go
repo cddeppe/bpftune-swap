@@ -1,0 +1,169 @@
+package main
+
+// health_check.go — v0.9.45: Auto-fix system-level settings that the
+// bpftune tuner needs to function correctly. Runs once on collector
+// startup so the user never has to manually configure these.
+//
+// What this does:
+//   1. Increases /sys/kernel/debug/tracing/buffer_size_kb to 256MB
+//      (default is ~1.4MB which overflows and loses swap events)
+//   2. Syncs saved explore_pct from /var/lib/bpftune/explore_pct to
+//      the BPF tuner_config_map (in case bpftune restarted and reset
+//      the map to default 5%)
+//   3. Verifies BPF programs are loaded
+//   4. Logs warnings if anything is wrong
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+)
+
+// ensureSystemHealth runs on collector startup and fixes system-level
+// settings that the bpftune tuner needs. All idempotent — safe to run
+// every startup, no harm if already correct.
+func ensureSystemHealth() {
+	fmt.Fprintf(os.Stderr, "collector: running system health checks...\n")
+
+	// 1. Increase trace_pipe ring buffer to 256MB (stops event loss)
+	// Default is ~1408 KB (1.4MB) which overflows on busy hosts,
+	// causing "CPU:0 [LOST N EVENTS]" and dropping swap events.
+	ensureTraceBufferSize()
+
+	// 2. Sync saved explore_pct to BPF map
+	// When bpftune restarts, it reads /var/lib/bpftune/explore_pct and
+	// writes it to the BPF map. But if the BPF program was reloaded
+	// (kernel update, manual bpftool reload), the map resets to default
+	// (5%). This re-applies the saved value.
+	syncExplorePctToBPF()
+
+	// 3. Verify BPF programs are loaded
+	checkBPFPrograms()
+
+	fmt.Fprintf(os.Stderr, "collector: system health checks complete\n")
+}
+
+// ensureTraceBufferSize increases the trace_pipe ring buffer.
+// The BPF tuner writes swap/proof/met events to the trace_pipe.
+// With the default ~1.4MB buffer, high-traffic hosts lose events
+// (seen as "CPU:0 [LOST 31486 EVENTS]" in trace output).
+// We set it to 256MB which is enough for even the busiest hosts.
+func ensureTraceBufferSize() {
+	const targetSize = 256 * 1024 // 256MB in KB
+	const bufferSizePath = "/sys/kernel/debug/tracing/buffer_size_kb"
+
+	// Read current size
+	current, err := os.ReadFile(bufferSizePath)
+	if err != nil {
+		// Not mounted or no permission — non-fatal
+		fmt.Fprintf(os.Stderr, "  trace buffer: could not read %s: %v (non-fatal)\n", bufferSizePath, err)
+		return
+	}
+	currentSize, _ := strconv.Atoi(strings.TrimSpace(string(current)))
+
+	if currentSize >= targetSize {
+		fmt.Fprintf(os.Stderr, "  trace buffer: already %dKB (OK)\n", currentSize)
+		return
+	}
+
+	// Write new size
+	err = os.WriteFile(bufferSizePath, []byte(fmt.Sprintf("%d", targetSize)), 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  trace buffer: could not increase to %dKB: %v (non-fatal)\n", targetSize, err)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "  trace buffer: increased %dKB → %dKB (stops event loss)\n", currentSize, targetSize)
+}
+
+// syncExplorePctToBPF reads the saved explore_pct from
+// /var/lib/bpftune/explore_pct and writes it to the BPF tuner_config_map.
+// This ensures the tuner uses the user's saved setting even after
+// bpftune restarts or the BPF map is reset.
+func syncExplorePctToBPF() {
+	saved := explorePctValue()
+	if saved < 0 || saved > 100 {
+		saved = 5 // default
+	}
+
+	// Try to read current BPF map value
+	// The pinned map is at /sys/fs/bpftune/tcp_conn/explore
+	// (pinned by the tuner on startup)
+	pinPath := "/sys/fs/bpftune/tcp_conn/explore"
+
+	// Use bpftool to read current value
+	out, err := exec.Command("bpftool", "map", "lookup", "pinned", pinPath,
+		"key", "hex", "00 00 00 00").Output()
+	if err != nil {
+		// Map not pinned or bpftool not available — non-fatal
+		// The tuner itself reads EXPLORE_STATE on startup, so this is
+		// just a safety net.
+		fmt.Fprintf(os.Stderr, "  explore_pct: could not read BPF map (non-fatal): %v\n", err)
+		return
+	}
+
+	// Parse current value from bpftool output
+	// Output looks like: "00 00 00 00\nvalue: 0x05 0x00 0x00 0x00"
+	currentPct := -1
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "value:") {
+			// Extract hex bytes after "value:"
+			parts := strings.SplitN(line, "value:", 2)
+			if len(parts) == 2 {
+				hexStr := strings.TrimSpace(parts[1])
+				hexParts := strings.Fields(hexStr)
+				if len(hexParts) > 0 {
+					// First byte is the value (little-endian, single byte for 0-100)
+					hexVal := hexParts[0]
+					hexVal = strings.TrimPrefix(hexVal, "0x")
+					if v, err := strconv.ParseUint(hexVal, 16, 32); err == nil {
+						currentPct = int(v)
+					}
+				}
+			}
+			break
+		}
+	}
+
+	if currentPct == saved {
+		fmt.Fprintf(os.Stderr, "  explore_pct: BPF map already %d%% (OK)\n", saved)
+		return
+	}
+
+	// Write saved value to BPF map
+	hexVal := fmt.Sprintf("%02x %02x %02x %02x",
+		byte(saved), byte(saved>>8), byte(saved>>16), byte(saved>>24))
+	err = exec.Command("bpftool", "map", "update", "pinned", pinPath,
+		"key", "hex", "00 00 00 00",
+		"value", "hex", hexVal).Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  explore_pct: WARNING could not sync %d%% to BPF map: %v\n", saved, err)
+		return
+	}
+
+	if currentPct >= 0 {
+		fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map %d%% → %d%% (from saved config)\n", currentPct, saved)
+	} else {
+		fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map → %d%% (from saved config)\n", saved)
+	}
+}
+
+// checkBPFPrograms verifies that the bpftune BPF programs are loaded.
+// Logs a warning if not — the collector will still run (degraded mode)
+// but the dashboard won't show live data.
+func checkBPFPrograms() {
+	out, err := exec.Command("bpftool", "prog", "show").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  BPF programs: could not check (bpftool failed): %v\n", err)
+		return
+	}
+	count := strings.Count(string(out), "bpftune")
+	if count == 0 {
+		fmt.Fprintf(os.Stderr, "  BPF programs: WARNING — no bpftune programs loaded! Tuner not running.\n")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  BPF programs: %d bpftune programs loaded (OK)\n", count)
+}

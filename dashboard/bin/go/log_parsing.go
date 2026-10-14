@@ -153,15 +153,15 @@ func buildLogPanels(swaps []swapRow,
         // did topSwapsSlice = csvSwaps which LOST all live swaps when
         // the log had fewer than 18. Now we merge both sources, dedup
         // by boot_ts+cookie, and take the newest 18.
-        // v0.9.44: Only merge CSV swaps from the last 6 hours. The old
+        // v0.9.44: Only merge CSV swaps from the last 24 hours. The old
         // code read the last 18 rows of swaps.csv regardless of age,
         // which showed swaps from 2-3 days ago in the "recent swaps" panel.
         if len(topSwapsSlice) < 18 {
                 csvSwaps := readRecentSwapsFromCSV(50) // read more, then filter by age
                 if len(csvSwaps) > 0 {
-                        // Filter to last 6 hours only
+                        // Filter to last 24 hours only
                         var recentCsvSwaps []interface{}
-                        cutoff := now - 6*3600
+                        cutoff := now - 24*3600
                         for _, s := range csvSwaps {
                                 if m, ok := s.(map[string]interface{}); ok {
                                         if ts, ok := m["epoch_ts"].(int64); ok && ts >= cutoff {
@@ -312,6 +312,12 @@ func buildRecentSwapRows(swaps []swapRow,
         srateByCookie map[int64][]srateEntry,
         cdest map[string]cdestEntry) []interface{} {
 
+        // v0.9.44: compute epoch_ts for live swaps so the frontend can
+        // compute age correctly. boot_ts is BPF ktime (seconds since boot).
+        // epoch_ts = nowEpoch - uptime + boot_ts
+        nowEpoch := time.Now().Unix()
+        uptime := readProcUptime()
+
         rows := make([]interface{}, 0, len(swaps))
         for _, sw := range swaps {
                 o := outcomeComposite(metByCookie, sw.Cookie, sw.Ts)
@@ -353,6 +359,7 @@ func buildRecentSwapRows(swaps []swapRow,
 
                 row := map[string]interface{}{
                         "boot_ts":           sw.Ts,
+                        "epoch_ts":          int64(float64(nowEpoch) - uptime + sw.Ts),
                         "from_alg":          fromAlg,
                         "to_alg":            toAlg,
                         "d":                 d,

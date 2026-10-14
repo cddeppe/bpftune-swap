@@ -664,6 +664,12 @@ func main() {
         debug.SetGCPercent(50)
         fmt.Fprintf(os.Stderr, "collector: CPU priority=nice(10) GOGC=50\n")
 
+        // v0.9.45: Auto-fix trace_pipe ring buffer + sync BPF config on startup.
+        // These are system-level settings that should "just work" without
+        // manual intervention. The collector is the right place to enforce them
+        // because it's always running and knows the tuner's needs.
+        ensureSystemHealth()
+
         collector := NewCollector()
 
         // v0.9.33: start route monitor goroutine (if enabled via --route-monitor)
@@ -690,6 +696,18 @@ func main() {
                         collector.collect()
                         // COL-002: refresh sentinel so Python renderer knows we're alive
                         _ = os.WriteFile("/var/run/bpftune-collector-go.active", []byte("1\n"), 0644)
+                }
+        }()
+
+        // v0.9.45: Periodic system health re-sync (every 5 min).
+        // If bpftune restarts or the BPF map is reset, this re-applies
+        // the saved explore_pct and ensures the trace buffer stays large.
+        go func() {
+                ticker := time.NewTicker(5 * time.Minute)
+                defer ticker.Stop()
+                for range ticker.C {
+                        ensureTraceBufferSize()
+                        syncExplorePctToBPF()
                 }
         }()
 
