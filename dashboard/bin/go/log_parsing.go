@@ -318,11 +318,12 @@ func buildRecentSwapRows(swaps []swapRow,
         srateByCookie map[int64][]srateEntry,
         cdest map[string]cdestEntry) []interface{} {
 
-        // v0.9.44: compute epoch_ts for live swaps so the frontend can
-        // compute age correctly. boot_ts is BPF ktime (seconds since boot).
-        // epoch_ts = nowEpoch - uptime + boot_ts
+        // v0.9.56: Use wall-clock epoch time directly. The old code computed
+        // epoch_ts = nowEpoch - uptime + sw.Ts (BPF ktime → epoch conversion)
+        // which broke on reboot, live migration, and when the log had events
+        // from a previous boot. Now we use the collector's read time as the
+        // epoch_ts, which is always correct regardless of BPF clock state.
         nowEpoch := time.Now().Unix()
-        uptime := readProcUptime()
 
         rows := make([]interface{}, 0, len(swaps))
         for _, sw := range swaps {
@@ -365,7 +366,7 @@ func buildRecentSwapRows(swaps []swapRow,
 
                 row := map[string]interface{}{
                         "boot_ts":           sw.Ts,
-                        "epoch_ts":          int64(float64(nowEpoch) - uptime + sw.Ts),
+                        "epoch_ts":          nowEpoch, // v0.9.56: wall-clock read time (always correct)
                         "from_alg":          fromAlg,
                         "to_alg":            toAlg,
                         "d":                 d,
@@ -711,7 +712,7 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
 // ============================================================================
 
 func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{} {
-        uptime := readProcUptime()
+        // v0.9.56: Use wall-clock epoch time directly (same fix as swaps)
         nowEpoch := float64(time.Now().Unix())
         var lines []string
         for _, l := range strings.Split(text, "\n") {
@@ -761,7 +762,7 @@ func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{
                 }
                 out = append(out, map[string]interface{}{
                         "boot_ts":  ts,
-                        "epoch_ts": int64(nowEpoch - uptime + ts),
+                        "epoch_ts": int64(nowEpoch), // v0.9.56: wall-clock read time (always correct)
                         "alg":      algName(alg),
                         "mbps":     round1(float64(rate) / bpsToMbps),
                         "tier":     tierLabel,
