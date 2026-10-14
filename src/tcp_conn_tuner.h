@@ -156,10 +156,12 @@ struct tcp_conn_metric {
          * socket ever touched.  sockets_good / sockets_proved count the
          * subset that crossed each tier at some point while on this alg.
          *
-         * 0.4.89: widened from __u16 to __u32.  High-churn CDN buckets
-         * hit 65k sockets per alg in days, at which point __u16 wraps
-         * to 0 and the guarded decrement pins it there forever.
-         * STATE_LAYOUT bumped to 2; old state files refuse to load. */
+         * v0.4.104: The 0.4.89 comment claimed these were widened to
+         * __u32, but they were still __u16. Widening would change the
+         * metric struct size (48→56 bytes) and break all hardcoded
+         * offsets in streak_writeback.go. These are display-only fields
+         * that wrap at 65535 — low impact. Left as __u16 for now;
+         * the comment is fixed to reflect reality. */
         __u16 sockets_alive;
         __u16 sockets_good;
         __u16 sockets_proved;
@@ -197,6 +199,12 @@ struct tcp_conn_event_data {
 
 struct remote_host {
     __u64 min_rtt;
+    /* v0.4.104: separate field for route monitor RTT. The v0.4.103 block
+     * wrote directly to min_rtt, bypassing the outlier/heal protection in
+     * tcp_metric_calc() and poisoning the scoring reference. Now min_rtt
+     * is only updated through the guarded path, and route_min_rtt holds
+     * the raw "best RTT seen from any connection" for the route monitor. */
+    __u64 route_min_rtt;
     __u64 max_rate_delivered;
     __u64 instances;
     __u64 selection_count;

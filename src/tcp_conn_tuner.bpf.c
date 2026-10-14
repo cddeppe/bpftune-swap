@@ -354,10 +354,19 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
          *
          * We still create statep here so it exists when the vote
          * handler runs, but we do NOT set swap_target=0xff — that
-         * was the flag that caused line 380 to skip all tracking. */
+         * was the flag that caused line 380 to skip all tracking.
+         *
+         * v0.4.104: init swap_target=0xff here too, same as active-estab.
+         * Without this, if set_cong() never runs (get_remote_host returns
+         * NULL or bpf_setsockopt fails), swap_target stays 0 (cubic) and
+         * score_pending_swap() can charge phantom outcomes to cubic.
+         * The 0xff check at line 380 is harmless for passive connections
+         * because the vote handler clears it before tracking. */
         if (sk) {
             statep = bpf_sk_storage_get(&sk_storage_map, sk, 0,
                                         BPF_SK_STORAGE_GET_F_CREATE);
+            if (statep && statep->swap_target == 0)
+                statep->swap_target = 0xff;
         }
         break;
     case BPF_SOCK_OPS_RETRANS_CB:
@@ -976,17 +985,26 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 statep->cleaned = 1;
         }
     s = statep->state & (NUM_TCP_CONG_ALGS - 1);
-    /* v0.4.103: Record min_rtt for ALL connections — including
+    /* v0.4.104: Record route_min_rtt for ALL connections — including
      * receive-only (YouTube, etc.) — BEFORE the direction gate below.
      * This gives the route monitor real RTT data from actual connections
      * for all destinations, not just the ones where the VPS is the sender.
+     *
+     * v0.4.104 FIX: writes to route_min_rtt (NOT min_rtt). The v0.4.103
+     * code wrote to min_rtt, which is the scoring reference consumed by
+     * tcp_metric_calc(). That bypassed the outlier/heal protection and
+     * poisoned the reference — a single low-RTT connection permanently
+     * lowered min_rtt for the entire bucket. Now route_min_rtt holds the
+     * raw "best RTT seen" for the route monitor, while min_rtt stays
+     * guarded by REF_OUTLIER_FACTOR / rtt_low_streak / REF_HEAL logic.
+     *
      * Must run before METRIC_MIN_SEGS check (line 979) and direction gate
      * (line 1014) which both return early for receive-only connections. */
     {
         __u64 rtt_min_val = (__u64)tp->rtt_min.s[0].v;
-        if (rtt_min_val > 0 && (!remote_host->min_rtt || rtt_min_val < remote_host->min_rtt)) {
+        if (rtt_min_val > 0 && (!remote_host->route_min_rtt || rtt_min_val < remote_host->route_min_rtt)) {
             __sync_fetch_and_add(&remote_host->seq, 1);
-            remote_host->min_rtt = rtt_min_val;
+            remote_host->route_min_rtt = rtt_min_val;
             __sync_fetch_and_add(&remote_host->seq, 1);
         }
     }
@@ -1282,7 +1300,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         if (best_alt != ~((__u64)0) && best_alt < m->metric_value)
             greedy = false;
         mt_alt_i = best_alt_i;
-        swap_tgt = best_alt_i;
+        /* v0.4.104: only set swap_tgt if we actually found a valid leader.
+         * The old code unconditionally did swap_tgt = best_alt_i, which
+         * defaulted to 0 (cubic) when no leader existed — defeating the
+         * 0xff "no target" init above. */
+        if (best_alt != ~((__u64)0))
+            swap_tgt = best_alt_i;
         /* 0.4.56: score-weighted target is picked by userspace in the
          * reanchor (rate_best_i).  BPF just reads it.  Keeping the
          * multiply/select out of the vote path; the 16-way loop with

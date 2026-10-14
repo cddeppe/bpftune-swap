@@ -196,9 +196,15 @@ def report(name, swaps, samples, N):
 if __name__ == "__main__":
     args = sys.argv[1:]
     N = 3
+    # v0.4.104: support both "-N4" and "-N 4" forms
     if args and args[0].startswith("-N"):
         try:
-            N = int(args[0][2:])
+            val = args[0][2:]
+            if not val and len(args) > 1:
+                # "-N 4" form — value is the next arg
+                val = args[1]
+                args = args[1:]
+            N = int(val)
             args = args[1:]
         except ValueError:
             sys.exit("bad -N value: %s" % args[0])

@@ -30,91 +30,91 @@
 
 extern unsigned short learning_rate;
 
-#define SYSCTL_TUNER_BPF	"bpftune_sysctl_write"
+#define SYSCTL_TUNER_BPF        "bpftune_sysctl_write"
 
 int init(struct bpftuner *tuner)
 {
-	int err; 
-	
-	/* first detach any dangling cgroup attachment for our prog; this
-	 * can happen if the bpftune process is killed and we do not get to
-	 * detach from cgroup.
-	 */
-	bpftuner_cgroup_detach(tuner, SYSCTL_TUNER_BPF, BPF_CGROUP_SYSCTL);
+        int err; 
+        
+        /* first detach any dangling cgroup attachment for our prog; this
+         * can happen if the bpftune process is killed and we do not get to
+         * detach from cgroup.
+         */
+        bpftuner_cgroup_detach(tuner, SYSCTL_TUNER_BPF, BPF_CGROUP_SYSCTL);
 
-	err = bpftuner_bpf_init(sysctl, tuner, NULL);
-	if (err)
-		return err;
+        err = bpftuner_bpf_init(sysctl, tuner, NULL);
+        if (err)
+                return err;
 
-	/* attach to root cgroup */
-	if (bpftuner_cgroup_attach(tuner, SYSCTL_TUNER_BPF, BPF_CGROUP_SYSCTL))
-		return 1;
+        /* attach to root cgroup */
+        if (bpftuner_cgroup_attach(tuner, SYSCTL_TUNER_BPF, BPF_CGROUP_SYSCTL))
+                return 1;
 
-	return 0;
+        return 0;
 }
 
 void fini(struct bpftuner *tuner)
 {
-	bpftune_log(LOG_DEBUG, "calling fini for %s\n", tuner->name);
-	bpftuner_cgroup_detach(tuner, SYSCTL_TUNER_BPF, BPF_CGROUP_SYSCTL);
-	bpftuner_bpf_fini(tuner);
+        bpftune_log(LOG_DEBUG, "calling fini for %s\n", tuner->name);
+        bpftuner_cgroup_detach(tuner, SYSCTL_TUNER_BPF, BPF_CGROUP_SYSCTL);
+        bpftuner_bpf_fini(tuner);
 }
 
 static const char *pid2cmd(int pid, char *cmd, size_t cmdsize)
 {
-	char cmdline[64];
-	FILE *fp;
+        char cmdline[64];
+        FILE *fp;
 
-	snprintf(cmdline, sizeof(cmdline) - 1, "/proc/%d/cmdline", pid);
-	fp = fopen(cmdline, "r");
-	if (fp) {
-		fgets(cmd, cmdsize - 1, fp);
-		fclose(fp);
-	}
-	if (strlen(cmd) == 0)
-		strncpy(cmd, "?", 2);
-	return cmd;
+        snprintf(cmdline, sizeof(cmdline) - 1, "/proc/%d/cmdline", pid);
+        fp = fopen(cmdline, "r");
+        if (fp) {
+                fgets(cmd, cmdsize - 1, fp);
+                fclose(fp);
+        }
+        if (strlen(cmd) == 0)
+                strncpy(cmd, "?", 2);
+        return cmd;
 }
 
 void event_handler(struct bpftuner *tuner, struct bpftune_event *event,
-		   __attribute__((unused))void *ctx)
+                   __attribute__((unused))void *ctx)
 {
-	struct bpftuner *t = NULL;
+        struct bpftuner *t = NULL;
 
-	bpftune_log(LOG_DEBUG, "sysctl write for '%s' (scenario %d) for tuner %s\n",
-		    event->str, event->scenario_id, tuner->name);
+        bpftune_log(LOG_DEBUG, "sysctl write for '%s' (scenario %d) for tuner %s\n",
+                    event->str, event->scenario_id, tuner->name);
 
-	if (event->netns_cookie == (unsigned long)-1)
-		return;
+        if (event->netns_cookie == (unsigned long)-1)
+                return;
 
-	bpftune_for_each_tuner(t) {
-		struct bpftunable *tunable;
+        bpftune_for_each_tuner(t) {
+                struct bpftunable *tunable;
 
-		bpftune_log(LOG_DEBUG, "checking tuner %s\n", tuner->name);
-		bpftuner_for_each_tunable(t, tunable) {
-			char path[PATH_MAX];
+                bpftune_log(LOG_DEBUG, "checking tuner %s\n", t->name);
+                bpftuner_for_each_tunable(t, tunable) {
+                        char path[PATH_MAX];
 
-			bpftune_sysctl_name_to_path(tunable->desc.name, path,
-						    sizeof(path));
+                        bpftune_sysctl_name_to_path(tunable->desc.name, path,
+                                                    sizeof(path));
 
-			bpftune_log(LOG_DEBUG, "checking path %s against %s\n",
-				    path, event->str);
-			/* does name match last characters in path? want to
-			 * avoid gc_thresh in routing table tuner matching
-			 * gc_thresh3 in neigh table tuner for example.
-			 */
-			if (strstr(path, event->str)) {
-				char cmd[1024] = {};
+                        bpftune_log(LOG_DEBUG, "checking path %s against %s\n",
+                                    path, event->str);
+                        /* does name match last characters in path? want to
+                         * avoid gc_thresh in routing table tuner matching
+                         * gc_thresh3 in neigh table tuner for example.
+                         */
+                        if (strstr(path, event->str)) {
+                                char cmd[1024] = {};
 
-				bpftune_log(BPFTUNE_LOG_LEVEL,
-					    "pid %ld, cmd '%s' modified sysctl '%s' that tuner '%s' uses; disabling '%s' for namespace cookie %ld\n",
-					    event->pid,
-					    pid2cmd(event->pid, cmd, sizeof(cmd)),
-					    event->str, t->name, t->name,
-					    event->netns_cookie);
-				bpftuner_netns_fini(t, event->netns_cookie, BPFTUNE_MANUAL);
-				break;
-			}
-		}
-	}
+                                bpftune_log(BPFTUNE_LOG_LEVEL,
+                                            "pid %ld, cmd '%s' modified sysctl '%s' that tuner '%s' uses; disabling '%s' for namespace cookie %ld\n",
+                                            event->pid,
+                                            pid2cmd(event->pid, cmd, sizeof(cmd)),
+                                            event->str, t->name, t->name,
+                                            event->netns_cookie);
+                                bpftuner_netns_fini(t, event->netns_cookie, BPFTUNE_MANUAL);
+                                break;
+                        }
+                }
+        }
 }

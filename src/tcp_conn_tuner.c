@@ -715,7 +715,7 @@ static void apply_truth_corrections(int map_fd)
          * and only one of these is alive at a time.  If we ever need
          * more, switch to malloc + free. */
         static struct truth_bucket tb[TRUTH_HASH_SLOTS];
-        unsigned int ntb = 0, dropped = 0;
+        unsigned int dropped = 0;
         char *line = NULL;
         size_t linecap = 0;
         FILE *f;
@@ -747,14 +747,9 @@ static void apply_truth_corrections(int map_fd)
                         dropped++;
                         continue;
                 }
-                if (b->win[0] == 0 && b->loss[0] == 0 && b->nnull[0] == 0 &&
-                    !b->win[0] && !b->loss[0] && !b->nnull[0]) {
-                        /* first touch for this bucket -- count it.  Cheap
-                         * heuristic: count any bucket that gets at least
-                         * one line.  We don't track per-bucket first-touch
-                         * explicitly to avoid scanning used[] later. */
-                        ntb++;
-                }
+                /* v0.4.104: removed dead ntb counter + duplicated condition.
+                 * The old code had `b->win[0] == 0 && !b->win[0]` which
+                 * was always true when the first three were true. */
                 if (strcmp(cls, "win") == 0) b->win[tgt_idx]++;
                 else if (strcmp(cls, "loss") == 0) b->loss[tgt_idx]++;
                 else if (strcmp(cls, "null") == 0) b->nnull[tgt_idx]++;
