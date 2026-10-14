@@ -1402,6 +1402,25 @@
     });
   }
 
+  // v0.9.43: throttled refreshNowCardAndChart — was firing on every SSE
+  // push (every 30s), doing synchronous chart renders (loadBucket →
+  // renderBucket, renderNow, renderScoreNow) that blocked the main
+  // thread and prevented scrolling. Now it goes through a 2s minimum
+  // interval throttle so the browser can handle input between renders.
+  var _refreshNowPending = false;
+  var _lastRefreshNowTs = 0;
+  function throttledRefreshNow() {
+    if (_refreshNowPending) return;
+    var now = Date.now();
+    if (now - _lastRefreshNowTs < 2000) return; // min 2s between refreshes
+    _refreshNowPending = true;
+    requestAnimationFrame(function() {
+      _refreshNowPending = false;
+      _lastRefreshNowTs = Date.now();
+      try { refreshNowCardAndChart(); } catch(e) { console.error('refreshNow:', e); }
+    });
+  }
+
   // SSE real-time updates with polling fallback.
   // SSE pushes data within 1s of collection; polling fallback (30s)
   // ensures the dashboard still works if SSE crashes.
@@ -1437,7 +1456,11 @@
           }
           // v0.9.34: throttled render via requestAnimationFrame
           throttledRender(window.__current_doc);
-          refreshNowCardAndChart();
+          // v0.9.43: throttle refreshNowCardAndChart too — was firing
+          // on every SSE push (every 30s), doing synchronous chart
+          // renders that blocked the main thread and prevented scrolling.
+          // Now it goes through the same rAF throttle as renderLiveState.
+          throttledRefreshNow();
         } catch (err) {
           console.error("SSE parse error:", err);
         }
@@ -2782,11 +2805,18 @@ function _populateBucketSelect(desiredBucket) {
 
       return loadBucket(finalBucket);
     }).then(function () {
-      renderSwaps();
-      _safeRender("div", function() { renderDivChart("div", ""); });
-      _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
-      _safeRender("score-now", function() { renderScoreNow(); });
-      renderFleet();
+      // v0.9.43: yield between chart renders so scroll isn't blocked
+      requestAnimationFrame(function() {
+        renderSwaps();
+      });
+      requestAnimationFrame(function() {
+        _safeRender("div", function() { renderDivChart("div", ""); });
+        _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
+      });
+      requestAnimationFrame(function() {
+        _safeRender("score-now", function() { renderScoreNow(); });
+        renderFleet();
+      });
     }).catch(function (e) {
       err("refresh: " + (e && e.message ? e.message : e), e);
     });
