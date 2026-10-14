@@ -57,6 +57,10 @@ var (
         rxMidsamp = regexp.MustCompile(
                 `(\d+\.\d+): .*midsamp cookie=(\d+) .*srate=(\d+)`)
 
+        // v0.4.104: RTT logging for route monitor (replaces struct field)
+        rxRtt = regexp.MustCompile(
+                `(\d+\.\d+): .*rtt cookie=(\d+) rtt=(\d+) dest=(\d+) dest6=(\d+) dest6b=(\d+)`)
+
         rxDestInt = regexp.MustCompile(`dest=(\d+)`)
         rxDest6   = regexp.MustCompile(`dest6=(\d+)`)
         rxDest6B  = regexp.MustCompile(`dest6b=(\d+)`)

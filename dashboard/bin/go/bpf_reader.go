@@ -160,10 +160,7 @@ func readBPFMap() ([]hostEntry, error) {
                         }
                 }
                 inst := toInt(val["instances"])
-                rttUs := toFloat(val["route_min_rtt"]) // v0.4.104: use route_min_rtt (raw, unguarded) not min_rtt (scoring reference)
-                if rttUs == 0 {
-                        rttUs = toFloat(val["min_rtt"]) // fallback for old BPF programs without route_min_rtt
-                }
+                rttUs := toFloat(val["min_rtt"]) // v0.4.104: route RTT now from log, not BPF map
                 isV6 := strings.HasPrefix(addr, "v6:")
                 if existing, ok := merged[final]; ok {
                         existing.Inst += inst

@@ -49,6 +49,7 @@ type parsedLog struct {
         MidsampRows []midsampRow
         BucketIPs   map[string][]string // masked → []fullIP
         MaxTs       float64              // max bpf_trace_printk timestamp
+        RttByDest   map[string]float64   // v0.4.104: dest→min RTT (microseconds)
 
         // Pre-computed views (built once from the raw data above)
         proofRowsCache     []interface{}
@@ -99,6 +100,7 @@ func parseLogSinglePass(text string) *parsedLog {
                 ProofEvents:  map[int]proofEvent{},
                 ProofSamples: map[int]proofSample{},
                 BucketIPs:    map[string][]string{},
+                RttByDest:    map[string]float64{}, // v0.4.104
         }
 
         p4 := prefix4Value()
@@ -306,6 +308,24 @@ func parseLogSinglePass(text string) *parsedLog {
 
                         // buildBucketIPs: midsamp lines may carry dest=
                         pl.extractBucketIPs(line, p4, p6)
+                        continue
+                }
+
+                // v0.4.104: RTT logging for route monitor
+                if m := rxRtt.FindStringSubmatch(line); m != nil {
+                        rttUs, _ := strconv.ParseFloat(m[3], 64)
+                        if rttUs > 0 {
+                                // Resolve dest from the dest=/dest6=/dest6b= fields
+                                ds := destStr(m[4], m[5], m[6])
+                                destLabel := labelFor(ds)
+                                if destLabel == "" {
+                                        destLabel = ds
+                                }
+                                // Keep the minimum RTT per dest
+                                if existing, ok := pl.RttByDest[destLabel]; !ok || rttUs < existing {
+                                        pl.RttByDest[destLabel] = rttUs
+                                }
+                        }
                         continue
                 }
 

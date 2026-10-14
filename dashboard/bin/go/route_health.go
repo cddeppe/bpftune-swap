@@ -48,22 +48,20 @@ func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) 
                 }
 
                 v := h.V
-                // v0.9.38: use per-protocol min_rtt from the merge (V4MinRTT/V6MinRTT).
-                // Before this, only one min_rtt survived the merge (usually v4),
-                // so v6 always showed 0 and the route monitor could never switch.
+                // v0.4.104: use RTT from the parsed log (rxRtt) instead of
+                // min_rtt from the BPF map. The BPF map's min_rtt is the
+                // scoring reference (guarded by outlier/heal logic), not
+                // suitable for route health display. The rtt log line gives
+                // the raw RTT from actual connections.
                 rttMs := 0.0
-                if h.V4MinRTT > 0 && h.V6MinRTT > 0 {
-                        // Both protocols have data — use the better (lower) one
-                        rttMs = h.V4MinRTT / 1000.0
-                        if h.V6MinRTT < h.V4MinRTT {
-                                rttMs = h.V6MinRTT / 1000.0
+                if currentParsedLog != nil && currentParsedLog.RttByDest != nil {
+                        if rttUs, ok := currentParsedLog.RttByDest[addr]; ok && rttUs > 0 {
+                                rttMs = rttUs / 1000.0
                         }
-                } else if h.V4MinRTT > 0 {
-                        rttMs = h.V4MinRTT / 1000.0
-                } else if h.V6MinRTT > 0 {
-                        rttMs = h.V6MinRTT / 1000.0
-                } else {
-                        rttMs = toFloat(v["min_rtt"]) / 1000.0 // fallback to merged value
+                }
+                // Fallback to BPF map min_rtt if no log RTT available
+                if rttMs == 0 {
+                        rttMs = toFloat(v["min_rtt"]) / 1000.0
                 }
 
                 // Determine protocol from which min_rtt we're using

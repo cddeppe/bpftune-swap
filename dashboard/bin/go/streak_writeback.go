@@ -33,8 +33,8 @@ import (
 
 // BPF remote_host_map value layout (must match kernel struct exactly).
 // Mirrors Python streak_writeback.py constants.
-// v0.4.104: route_min_rtt is at the END of the struct (after seq), so
-// all field offsets below are UNCHANGED from 0.4.103.
+// v0.4.104: route_min_rtt field removed — BPF can't write beyond offset 1024.
+// Route RTT is now logged via bpf_printk and parsed from the trace log.
 const (
         rateHistBins        = 32
         numTCPConnMetrics   = 16
@@ -45,7 +45,7 @@ const (
         sizeofRateHist      = 4*rateHistBins + 8
         offMetricsArray     = offRateHist + sizeofRateHist
         sizeofSeqField      = 8 // 0.4.89: __u64 seq at end of struct (C1 race fix)
-        sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric) + sizeofSeqField + 8 // +8 for route_min_rtt (v0.4.104)
+        sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric) + sizeofSeqField
         writebackWindow     = 8
 )
 
