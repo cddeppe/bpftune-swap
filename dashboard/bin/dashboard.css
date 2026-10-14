@@ -48,12 +48,16 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   html, body { max-width: 100vw; overflow-x: hidden; }
+  /* v0.9.49: smooth scrolling hints — prevents jank during SSE updates */
+  html { scroll-behavior: smooth; -webkit-overflow-scrolling: touch; }
   body {
     background: var(--bg); color: var(--fg);
     font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto,
           "Helvetica Neue", Arial, sans-serif;
     font-feature-settings: "tnum" 1, "cv11" 1, "ss01" 1;
     -webkit-font-smoothing: antialiased;
+    /* v0.9.49: hint to browser that we scroll vertically */
+    overflow-y: scroll;
   }
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
 

@@ -1305,13 +1305,13 @@
     }
     window.__current_doc = doc;
 
-    // v0.9.40: Split render into 4 phases, each yielding via
-    // requestAnimationFrame. This prevents the main thread from
-    // being blocked for 2-3 seconds on initial load and during
-    // SSE updates. The browser can handle scroll/touch/click
-    // between each phase.
+    // v0.9.49: ALL phases now yield via requestAnimationFrame.
+    // Previously Phase 1 ran synchronously (including _syncBucketDropdown
+    // which rebuilds the buckets table + dropdown) and blocked the main
+    // thread for 100-200ms on every SSE push. Now Phase 1 also yields,
+    // so the browser can handle scroll/touch between every phase.
 
-    // Phase 1: lightweight state updates (no DOM/chart work)
+    // Phase 1: lightweight state updates (no DOM work)
     if (doc.now_mono) SERVER_NOW_MONO = doc.now_mono;
     state.metricByBucket = doc.metric_by_bucket || {};
     if (!state.bucketLive) state.bucketLive = {};
@@ -1322,11 +1322,16 @@
     _appendLiveMetrics(doc);
     state.recentSwapsByBucket = doc.recent_swaps_by_bucket || null;
     state.lastLiveSwaps = doc.recent_swaps || [];
-    _syncBucketDropdown(doc);
-    _updateBucketTags();
     _fetchAndApplyLabels();
 
-    // Phase 2: simple HTML panels (fast, no charts) — yield after
+    // Phase 1b: DOM-heavy state updates (bucket dropdown, tags) — yield first
+    requestAnimationFrame(function() {
+      if (doc !== window.__current_doc) return; // stale
+      _syncBucketDropdown(doc);
+      _updateBucketTags();
+    });
+
+    // Phase 2: simple HTML panels (fast, no charts) — yield
     requestAnimationFrame(function() {
       if (doc !== window.__current_doc) return; // stale
       _safeRender('log_window', function() { renderLogWindow(doc); });
