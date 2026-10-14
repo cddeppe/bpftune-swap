@@ -21,6 +21,43 @@
   }
   function err(msg, e) { status(msg, true); if (e) console.error(msg, e); }
 
+  // v0.9.40: Loading overlay — shows immediately on page load and hides
+  // after Phase 2 of renderLiveState completes. Prevents the "frozen"
+  // feeling where the page loads but can't scroll for 2-3 seconds.
+  var _loadingOverlay = null;
+  var _loadingOverlayHidden = false;
+  function _showLoadingOverlay() {
+    if (_loadingOverlayHidden) return; // already past first render
+    if (_loadingOverlay) return; // already created
+    _loadingOverlay = document.createElement('div');
+    _loadingOverlay.id = 'bpftune-loading-overlay';
+    _loadingOverlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;';
+    var spinner = document.createElement('div');
+    spinner.style.cssText = 'width:32px;height:32px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:bpftune-spin 0.8s linear infinite;';
+    var label = document.createElement('div');
+    label.style.cssText = 'color:#fff;font-family:system-ui,sans-serif;font-size:14px;';
+    label.textContent = 'Loading dashboard…';
+    _loadingOverlay.appendChild(spinner);
+    _loadingOverlay.appendChild(label);
+    document.body.appendChild(_loadingOverlay);
+    // Add the keyframe animation if not already present
+    if (!document.getElementById('bpftune-spin-keyframe')) {
+      var style = document.createElement('style');
+      style.id = 'bpftune-spin-keyframe';
+      style.textContent = '@keyframes bpftune-spin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(style);
+    }
+  }
+  function _hideLoadingOverlay() {
+    if (!_loadingOverlay) return;
+    _loadingOverlay.style.opacity = '0';
+    _loadingOverlay.style.transition = 'opacity 0.3s';
+    var ov = _loadingOverlay;
+    setTimeout(function() { if (ov.parentNode) ov.parentNode.removeChild(ov); }, 300);
+    _loadingOverlay = null;
+    _loadingOverlayHidden = true;
+  }
+
   function loadScript(url) {
     return new Promise(function (resolve, reject) {
       var s = document.createElement("script");
@@ -1268,10 +1305,12 @@
     }
     window.__current_doc = doc;
 
-    // v0.9.35: split render into micro-tasks so the browser can
-    // handle clicks/toggles between each chunk. This prevents the
-    // UI from freezing during the 30s SSE update.
-    
+    // v0.9.40: Split render into 4 phases, each yielding via
+    // requestAnimationFrame. This prevents the main thread from
+    // being blocked for 2-3 seconds on initial load and during
+    // SSE updates. The browser can handle scroll/touch/click
+    // between each phase.
+
     // Phase 1: lightweight state updates (no DOM/chart work)
     if (doc.now_mono) SERVER_NOW_MONO = doc.now_mono;
     state.metricByBucket = doc.metric_by_bucket || {};
@@ -1287,37 +1326,42 @@
     _updateBucketTags();
     _fetchAndApplyLabels();
 
-    // Phase 2: simple HTML panels (fast, no charts)
-    _safeRender('log_window', function() { renderLogWindow(doc); });
-    _safeRender('build', function() { renderBuild(doc.build || {}); });
-    _safeRender('system', function() { renderSystem(doc.system || {}); });
-    _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
-    _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
-    _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
-    renderRouteHealth(doc);
-    renderOriginHealth(doc);
+    // Phase 2: simple HTML panels (fast, no charts) — yield after
+    requestAnimationFrame(function() {
+      if (doc !== window.__current_doc) return; // stale
+      _safeRender('log_window', function() { renderLogWindow(doc); });
+      _safeRender('build', function() { renderBuild(doc.build || {}); });
+      _safeRender('system', function() { renderSystem(doc.system || {}); });
+      _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
+      _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
+      _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
+      renderRouteHealth(doc);
+      renderOriginHealth(doc);
+      // v0.9.40: hide the loading overlay after Phase 2 (HTML panels visible)
+      _hideLoadingOverlay();
+    });
 
-    // Phase 3: heavy chart renders — use setTimeout(0) to yield
-    // to the browser between each chart, preventing UI freeze.
-    setTimeout(function() {
+    // Phase 3: heavy chart renders — yield between each chart
+    requestAnimationFrame(function() {
       if (doc !== window.__current_doc) return; // stale
       _renderFilteredPanels(doc);
       _safeRender('swaps', function() { renderSwaps(); });
-    }, 0);
+    });
 
-    setTimeout(function() {
+    // Phase 4: remaining charts
+    requestAnimationFrame(function() {
       if (doc !== window.__current_doc) return; // stale
       _safeRender('score-now', function() { renderScoreNow(); });
       if ($("range")) {
         _safeRender('bucket_chart', function() { renderBucket(); });
       }
-    }, 0);
+    });
 
-    setTimeout(function() {
+    requestAnimationFrame(function() {
       if (doc !== window.__current_doc) return; // stale
       _safeRender('div', function() { renderDivChart("div", ""); });
       _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
-    }, 0);
+    });
   }
 
   function liveRefresh() {
@@ -2749,6 +2793,10 @@ function _populateBucketSelect(desiredBucket) {
   }
 
   function boot() {
+    // v0.9.40: show loading overlay immediately so the user sees
+    // "Loading dashboard…" instead of a frozen page.
+    _showLoadingOverlay();
+
     // v0.7.5h: startLiveUpdates() moved below
     setInterval(refreshAll, 300000);
 
@@ -2873,8 +2921,14 @@ function _populateBucketSelect(desiredBucket) {
       })
       .catch(function (e) {
         err("FAIL: " + (e && e.message ? e.message : e), e);
+        _hideLoadingOverlay(); // v0.9.40: hide on error too
       });
   }  boot();
+
+  // v0.9.40: Safety net — if renderLiveState hasn't fired within 10s
+  // (e.g. current.json is slow or SSE never connects), hide the overlay
+  // anyway so the user isn't stuck looking at a spinner forever.
+  setTimeout(function() { _hideLoadingOverlay(); }, 10000);
 
   // A3-fix: refresh immediately when the tab becomes visible again.
   // Browsers throttle setInterval / setTimeout to ~1/min in background
