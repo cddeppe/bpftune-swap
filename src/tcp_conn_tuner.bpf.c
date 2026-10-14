@@ -19,12 +19,10 @@
 
 #include "tcp_conn_tuner.h"
 
-/* v0.4.104: raised from 1024 to 2048 — struct is now 1032 bytes due to
- * the new route_min_rtt field. The 1024 limit existed because __builtin_memset
- * on the whole struct failed above 1024 bytes. Now that we zero in chunks
- * (line 101-103), the limit is just a sanity bound. */
-_Static_assert(sizeof(struct remote_host) <= 2048,
-               "remote_host too large for BPF");
+_Static_assert(sizeof(struct remote_host) <= 1024,
+               "remote_host too large for BPF memset");
+/* v0.4.104: route_min_rtt field removed — BPF can't write to fields beyond
+ * offset 1024 (memset limit). Route RTT is logged via bpf_printk instead. */
 
 #define TCP_THIN_LINEAR_TIMEOUTS        16
 
@@ -96,10 +94,7 @@ static __always_inline struct remote_host *get_remote_host(struct in6_addr *key,
                 scratch = bpf_map_lookup_elem(&remote_host_scratch, &zero);
                 if (!scratch)
                         return NULL;
-                __builtin_memset(scratch, 0, 1024);
-                /* v0.4.104: route_min_rtt is at offset 1024, beyond the
-                 * __builtin_memset 1024-byte limit. Zero it manually. */
-                scratch->route_min_rtt = 0;
+                __builtin_memset(scratch, 0, sizeof(*scratch));
                 scratch->instances = 1;
                 bpf_map_update_elem(&remote_host_map, key, scratch, BPF_ANY);
                 return NULL;
@@ -994,27 +989,27 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 statep->cleaned = 1;
         }
     s = statep->state & (NUM_TCP_CONG_ALGS - 1);
-    /* v0.4.104: Record route_min_rtt for ALL connections — including
+    /* v0.4.104: Record route RTT for ALL connections — including
      * receive-only (YouTube, etc.) — BEFORE the direction gate below.
-     * This gives the route monitor real RTT data from actual connections
-     * for all destinations, not just the ones where the VPS is the sender.
+     * This gives the route monitor real RTT data from actual connections.
      *
-     * v0.4.104 FIX: writes to route_min_rtt (NOT min_rtt). The v0.4.103
-     * code wrote to min_rtt, which is the scoring reference consumed by
-     * tcp_metric_calc(). That bypassed the outlier/heal protection and
-     * poisoned the reference — a single low-RTT connection permanently
-     * lowered min_rtt for the entire bucket. Now route_min_rtt holds the
-     * raw "best RTT seen" for the route monitor, while min_rtt stays
-     * guarded by REF_OUTLIER_FACTOR / rtt_low_streak / REF_HEAL logic.
+     * v0.4.104 FIX: The v0.4.103 code wrote to min_rtt (the scoring
+     * reference), bypassing the outlier/heal protection in
+     * tcp_metric_calc() and poisoning the reference. We can't add a
+     * separate route_min_rtt field because the struct is already at
+     * the 1024-byte BPF memset limit. Instead, we LOG the RTT via
+     * bpf_printk and the collector parses it from the trace log.
      *
-     * Must run before METRIC_MIN_SEGS check (line 979) and direction gate
-     * (line 1014) which both return early for receive-only connections. */
+     * Must run before METRIC_MIN_SEGS check and direction gate which
+     * both return early for receive-only connections. */
     {
         __u64 rtt_min_val = (__u64)tp->rtt_min.s[0].v;
-        if (rtt_min_val > 0 && (!remote_host->route_min_rtt || rtt_min_val < remote_host->route_min_rtt)) {
-            __sync_fetch_and_add(&remote_host->seq, 1);
-            remote_host->route_min_rtt = rtt_min_val;
-            __sync_fetch_and_add(&remote_host->seq, 1);
+        if (rtt_min_val > 0) {
+            bpf_printk("rtt cookie=%llu rtt=%llu dest=%u dest6=%u dest6b=%u",
+                       bpf_get_socket_cookie(ops), rtt_min_val,
+                       is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                       (__u32)bpf_ntohl(ops->remote_ip6[0]),
+                       (__u32)bpf_ntohl(ops->remote_ip6[1]));
         }
     }
     if ((__u64)tp->segs_out + tp->segs_in < METRIC_MIN_SEGS)

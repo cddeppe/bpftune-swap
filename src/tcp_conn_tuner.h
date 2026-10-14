@@ -233,12 +233,10 @@ struct remote_host {
      * reads the BPF map with hardcoded offsets from the pre-0.4.89
      * layout.  Position within struct is irrelevant to the race fix. */
     __u64 seq;
-    /* v0.4.104: route monitor RTT — raw "best RTT seen from any connection"
-     * for the route monitor. Placed AFTER seq so all existing field offsets
-     * stay unchanged (streak_writeback.go prefixFields list unaffected).
-     * The BPF memset at line 99 covers bytes 0..1023 (seq is the last field
-     * in that range), and route_min_rtt at offset 1024 is zeroed manually. */
-    __u64 route_min_rtt;
+    /* v0.4.104: route_min_rtt was moved here but BPF can't write to
+     * fields beyond offset 1024 (__builtin_memset limit). Removed.
+     * Route RTT is now logged via bpf_printk and parsed by the
+     * collector from the trace log, same as proofs/swaps. */
 };
 
 #define REMOTE_HOST_MIN_INSTANCES 4
