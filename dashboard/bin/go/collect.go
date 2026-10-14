@@ -122,7 +122,7 @@ func (c *Collector) collect() {
         currentParsedLog = pl
         defer func() { currentParsedLog = nil }()
 
-        topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText)
+        topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText, now)
 
         // v0.7.6: streak writeback — patch BPF map bad_streak/null_streak from
         // sustained outcomes (60-300s after swap). Mirrors deleted Python

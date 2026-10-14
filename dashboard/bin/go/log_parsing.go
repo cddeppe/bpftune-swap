@@ -125,7 +125,7 @@ type swapRow struct {
 func buildLogPanels(swaps []swapRow,
         metByCookie map[int64][]metEntry,
         srateByCookie map[int64][]srateEntry,
-        cdest map[string]cdestEntry, text string) (topSwaps, topProofs []interface{},
+        cdest map[string]cdestEntry, text string, now int64) (topSwaps, topProofs []interface{},
         swapOutcomes, bucketIPs, logWindow, proofsRaw interface{}) {
 
         // v0.9.17: don't return early when text is empty — fall through
@@ -153,10 +153,25 @@ func buildLogPanels(swaps []swapRow,
         // did topSwapsSlice = csvSwaps which LOST all live swaps when
         // the log had fewer than 18. Now we merge both sources, dedup
         // by boot_ts+cookie, and take the newest 18.
+        // v0.9.44: Only merge CSV swaps from the last 6 hours. The old
+        // code read the last 18 rows of swaps.csv regardless of age,
+        // which showed swaps from 2-3 days ago in the "recent swaps" panel.
         if len(topSwapsSlice) < 18 {
-                csvSwaps := readRecentSwapsFromCSV(18)
+                csvSwaps := readRecentSwapsFromCSV(50) // read more, then filter by age
                 if len(csvSwaps) > 0 {
-                        topSwapsSlice = mergeSwapsNewestFirst(topSwapsSlice, csvSwaps, 18)
+                        // Filter to last 6 hours only
+                        var recentCsvSwaps []interface{}
+                        cutoff := now - 6*3600
+                        for _, s := range csvSwaps {
+                                if m, ok := s.(map[string]interface{}); ok {
+                                        if ts, ok := m["epoch_ts"].(int64); ok && ts >= cutoff {
+                                                recentCsvSwaps = append(recentCsvSwaps, s)
+                                        }
+                                }
+                        }
+                        if len(recentCsvSwaps) > 0 {
+                                topSwapsSlice = mergeSwapsNewestFirst(topSwapsSlice, recentCsvSwaps, 18)
+                        }
                 }
         }
         topSwaps = topSwapsSlice
