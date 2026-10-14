@@ -172,6 +172,9 @@ func readBPFMap() ([]hostEntry, error) {
                                         existing.V4MinRTT = rttUs
                                 }
                         }
+                        // v0.9.39: merge ALL metrics across v4+v6 so the dashboard
+                        // shows combined dual-stack throughput, not just v4.
+                        existing.V = mergeHostValues(existing.V, val)
                 } else {
                         he := &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val}
                         if isV6 {
@@ -198,4 +201,193 @@ func readBPFMap() ([]hostEntry, error) {
                 }
         }
         return out, nil
+}
+
+// mergeHostValues combines two BPF map values (v4 + v6) into a single
+// value that reflects the combined dual-stack traffic.
+//
+// v0.9.39: Before this, the merge only kept the "winner's" metrics (the
+// entry with more instances, usually v4). This meant v6 throughput,
+// rate_ema, socket counts, and per-algorithm metrics were silently
+// discarded. Now we properly sum/merge all fields:
+//
+//   Summed (v4 + v6):
+//     - instances, selection_count
+//     - metrics[i].rate_ema, metric_count, sockets_alive/good/proved
+//     - rate_hist bins
+//
+//   Min (best of both):
+//     - min_rtt (lower = better)
+//
+//   Max (best of both):
+//     - max_rate_delivered (higher = better)
+//     - metrics[i].swap_score, bad_streak, null_streak (worst case)
+//
+//   Recomputed after merge:
+//     - best_i / best_v (from merged metrics)
+//     - rate_best_i / rate_best_v (from merged rate_ema)
+func mergeHostValues(existing, incoming map[string]interface{}) map[string]interface{} {
+        if existing == nil {
+                return incoming
+        }
+        if incoming == nil {
+                return existing
+        }
+
+        // Start with a copy of existing
+        merged := make(map[string]interface{}, len(existing))
+        for k, v := range existing {
+                merged[k] = v
+        }
+
+        // --- Prefix fields (u64) ---
+        // instances: sum
+        merged["instances"] = toInt(existing["instances"]) + toInt(incoming["instances"])
+
+        // selection_count: sum
+        merged["selection_count"] = toInt(existing["selection_count"]) + toInt(incoming["selection_count"])
+
+        // min_rtt: min (lower = better), but 0 means "no data" so prefer nonzero
+        eRTT := toFloat(existing["min_rtt"])
+        iRTT := toFloat(incoming["min_rtt"])
+        if iRTT > 0 && (eRTT == 0 || iRTT < eRTT) {
+                merged["min_rtt"] = iRTT
+        }
+
+        // max_rate_delivered: max (higher = better)
+        eMaxRate := toFloat(existing["max_rate_delivered"])
+        iMaxRate := toFloat(incoming["max_rate_delivered"])
+        if iMaxRate > eMaxRate {
+                merged["max_rate_delivered"] = iMaxRate
+        }
+
+        // rtt_low_streak: max (worst case)
+        if toInt(incoming["rtt_low_streak"]) > toInt(existing["rtt_low_streak"]) {
+                merged["rtt_low_streak"] = toInt(incoming["rtt_low_streak"])
+        }
+        // rtt_low_min: min (lower = better)
+        eRLM := toFloat(existing["rtt_low_min"])
+        iRLM := toFloat(incoming["rtt_low_min"])
+        if iRLM > 0 && (eRLM == 0 || iRLM < eRLM) {
+                merged["rtt_low_min"] = iRLM
+        }
+
+        // --- metrics[16] array ---
+        eMetrics, _ := existing["metrics"].([]interface{})
+        iMetrics, _ := incoming["metrics"].([]interface{})
+        maxLen := len(eMetrics)
+        if len(iMetrics) > maxLen {
+                maxLen = len(iMetrics)
+        }
+        if maxLen > 0 {
+                outMetrics := make([]interface{}, maxLen)
+                for i := 0; i < maxLen; i++ {
+                        var em, im map[string]interface{}
+                        if i < len(eMetrics) {
+                                em, _ = eMetrics[i].(map[string]interface{})
+                        }
+                        if i < len(iMetrics) {
+                                im, _ = iMetrics[i].(map[string]interface{})
+                        }
+                        if em == nil && im == nil {
+                                outMetrics[i] = map[string]interface{}{}
+                                continue
+                        }
+                        if em == nil {
+                                outMetrics[i] = im
+                                continue
+                        }
+                        if im == nil {
+                                outMetrics[i] = em
+                                continue
+                        }
+                        // Merge: sum rate/count/socket fields, take max for streaks/score
+                        mm := map[string]interface{}{}
+                        for k, v := range em {
+                                mm[k] = v
+                        }
+                        mm["rate_ema"] = toInt(em["rate_ema"]) + toInt(im["rate_ema"])
+                        mm["metric_count"] = toInt(em["metric_count"]) + toInt(im["metric_count"])
+                        mm["sockets_alive"] = toInt(em["sockets_alive"]) + toInt(im["sockets_alive"])
+                        mm["sockets_good"] = toInt(em["sockets_good"]) + toInt(im["sockets_good"])
+                        mm["sockets_proved"] = toInt(em["sockets_proved"]) + toInt(im["sockets_proved"])
+                        if toInt(im["swap_score"]) > toInt(em["swap_score"]) {
+                                mm["swap_score"] = toInt(im["swap_score"])
+                        }
+                        if toInt(im["bad_streak"]) > toInt(em["bad_streak"]) {
+                                mm["bad_streak"] = toInt(im["bad_streak"])
+                        }
+                        if toInt(im["null_streak"]) > toInt(em["null_streak"]) {
+                                mm["null_streak"] = toInt(im["null_streak"])
+                        }
+                        // state_flags, greedy_count, metric_value: take from existing (winner)
+                        outMetrics[i] = mm
+                }
+                merged["metrics"] = outMetrics
+
+                // Recompute best_i / best_v from merged metrics
+                bestI := 0
+                bestV := 0
+                rateBestI := 0
+                rateBestV := 0
+                for i, mraw := range outMetrics {
+                        m, _ := mraw.(map[string]interface{})
+                        if m == nil {
+                                continue
+                        }
+                        if toInt(m["metric_count"]) == 0 {
+                                continue
+                        }
+                        // best_v: weighted score (same formula as BPF kernel)
+                        rv := toInt(m["rate_ema"])
+                        ss := toInt(m["swap_score"])
+                        ssEff := ss
+                        if ssEff == 0 {
+                                ssEff = 256
+                        }
+                        bad := toInt(m["bad_streak"])
+                        weighted := rv * ssEff / 256
+                        if bad > 2 {
+                                weighted = weighted / 4
+                        }
+                        if weighted > bestV {
+                                bestV = weighted
+                                bestI = i
+                        }
+                        // rate_best: just highest rate_ema
+                        if rv > rateBestV {
+                                rateBestV = rv
+                                rateBestI = i
+                        }
+                }
+                merged["best_i"] = bestI
+                merged["best_v"] = bestV
+                merged["rate_best_i"] = rateBestI
+                merged["rate_best_v"] = rateBestV
+        }
+
+        // --- rate_hist[32] ---
+        eHist, _ := existing["rate_hist"].([]interface{})
+        iHist, _ := incoming["rate_hist"].([]interface{})
+        if len(eHist) > 0 || len(iHist) > 0 {
+                histLen := len(eHist)
+                if len(iHist) > histLen {
+                        histLen = len(iHist)
+                }
+                outHist := make([]interface{}, histLen)
+                for i := 0; i < histLen; i++ {
+                        ev := 0
+                        iv := 0
+                        if i < len(eHist) {
+                                ev = toInt(eHist[i])
+                        }
+                        if i < len(iHist) {
+                                iv = toInt(iHist[i])
+                        }
+                        outHist[i] = ev + iv
+                }
+                merged["rate_hist"] = outHist
+        }
+
+        return merged
 }
