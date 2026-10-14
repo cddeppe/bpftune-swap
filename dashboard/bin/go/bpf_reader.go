@@ -21,6 +21,7 @@ import (
         "encoding/json"
         "context"
         "fmt"
+        "strconv"
         "strings"
         "time"
         "os/exec"
@@ -146,6 +147,17 @@ func readBPFMap() ([]hostEntry, error) {
                 final := ResolveBucket(addr)
                 if final == "" {
                         final = addr
+                }
+                // v0.9.41: If this is a v6 entry that didn't get a label
+                // (still starts with "v6:"), try to find its v4 counterpart
+                // via the cookie_dest map. The cookie_dest map tracks
+                // (cookie → v4_dest, v6_dest) from estab log lines. If a
+                // cookie has both v4 and v6 dests, they're the same
+                // destination — so the v6 entry should get the v4's label.
+                if strings.HasPrefix(final, "v6:") {
+                        if v4Label := v6ToV4Label(addr); v4Label != "" {
+                                final = v4Label
+                        }
                 }
                 inst := toInt(val["instances"])
                 rttUs := toFloat(val["min_rtt"])
@@ -390,4 +402,55 @@ func mergeHostValues(existing, incoming map[string]interface{}) map[string]inter
         }
 
         return merged
+}
+
+// v6ToV4Label looks up a v6 address in the cookie_dest map and returns
+// the label of its v4 counterpart (if any).
+//
+// v0.9.41: The BPF map has separate entries for v4 and v6 connections to
+// the same destination (e.g. YouTube). The v4 entry might have a label
+// (from aliases) like "142.250.0.0", but the v6 entry stays as "v6:2606xxxx"
+// because there's no v6 alias. This function uses the cookie_dest map to
+// find the v4 counterpart and returns its label so the v6 entry can be
+// merged with the v4 entry.
+//
+// The cookie_dest map (built from estab log lines) records:
+//   cookie → ["v4_dest", "v6_dest", "v6b_dest"]
+//
+// If a cookie has both v4 and v6 dests, they're the same destination.
+// We look for any cookie where the v6 dest matches the input v6 address,
+// then resolve the v4 dest to its label.
+func v6ToV4Label(v6Addr string) string {
+        if cookieDestDiskMap == nil {
+                return ""
+        }
+        // The v6 addr from the BPF map is "v6:XXXXXXXX" (8 hex chars = first 4 bytes of v6)
+        // The cookie_dest map stores v6 as "dest6=<number>" from the estab log line,
+        // which is also the first 4 bytes as a decimal number.
+        // Convert the hex to the same format used in cdest.
+        hexPart := strings.TrimPrefix(v6Addr, "v6:")
+        v6Num, err := strconv.ParseUint(hexPart, 16, 64)
+        if err != nil {
+                return ""
+        }
+        v6Str := strconv.FormatUint(v6Num, 10)
+
+        // Search cookie_dest map for a cookie that has this v6 dest
+        for _, entry := range cookieDestDiskMap {
+                if len(entry) >= 2 && entry[1] == v6Str {
+                        // Found a cookie with this v6 dest. Get the v4 dest.
+                        v4Dest := entry[0]
+                        if v4Dest == "" || v4Dest == "0" {
+                                continue
+                        }
+                        // Resolve the v4 dest to its label
+                        label := ResolveBucket(v4Dest)
+                        if label != "" && !strings.HasPrefix(label, "v6:") {
+                                return label
+                        }
+                        // If no label, return the raw v4 address (still better than "v6:xxxx")
+                        return v4Dest
+                }
+        }
+        return ""
 }
