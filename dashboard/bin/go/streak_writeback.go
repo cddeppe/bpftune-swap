@@ -33,19 +33,19 @@ import (
 
 // BPF remote_host_map value layout (must match kernel struct exactly).
 // Mirrors Python streak_writeback.py constants.
-// v0.4.104: offRateHist shifted +8 bytes to account for new route_min_rtt
-// field added after min_rtt in struct remote_host.
+// v0.4.104: route_min_rtt is at the END of the struct (after seq), so
+// all field offsets below are UNCHANGED from 0.4.103.
 const (
         rateHistBins        = 32
         numTCPConnMetrics   = 16
         offMetricBadStreak  = 42
         offMetricNullStreak = 43
         sizeofTCPConnMetric = 48
-        offRateHist         = 112 + 8 // v0.4.104: +8 for route_min_rtt field
+        offRateHist         = 112
         sizeofRateHist      = 4*rateHistBins + 8
         offMetricsArray     = offRateHist + sizeofRateHist
         sizeofSeqField      = 8 // 0.4.89: __u64 seq at end of struct (C1 race fix)
-        sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric) + sizeofSeqField
+        sizeofRemoteHost    = offMetricsArray + (numTCPConnMetrics * sizeofTCPConnMetric) + sizeofSeqField + 8 // +8 for route_min_rtt (v0.4.104)
         writebackWindow     = 8
 )
 
@@ -76,11 +76,12 @@ var (
 )
 
 // prefixFields is the ordered list of u64 fields at the start of the
-// remote_host value (offsets 0..119).  Used to re-serialize the JSON
+// remote_host value (offsets 0..111).  Used to re-serialize the JSON
 // value back to bytes.  Mirrors Python _PREFIX_FIELDS.
-// v0.4.104: added "route_min_rtt" after "min_rtt" (new field).
+// v0.4.104: route_min_rtt is at the END of the struct (after seq),
+// so this list is UNCHANGED from 0.4.103.
 var prefixFields = []string{
-        "min_rtt", "route_min_rtt", "max_rate_delivered", "instances", "selection_count",
+        "min_rtt", "max_rate_delivered", "instances", "selection_count",
         "best_i", "best_v", "second_i", "second_v",
         "rate_best_i", "rate_best_v", "rate_second_i", "rate_second_v",
         "rtt_low_streak", "rtt_low_min",
