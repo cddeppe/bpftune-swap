@@ -59,8 +59,3 @@ func parseCollectorMode(mode string) CollectorMode {
                 }
         }
 }
-
-func shouldSaveCookieDest() bool {
-        cycleCount++
-        return cycleCount%collectorMode.CookieDestSave == 0
-}

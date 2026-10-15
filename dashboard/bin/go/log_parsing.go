@@ -273,58 +273,6 @@ func buildLogPanels(swaps []swapRow,
 var currentParsedLog *parsedLog
 
 // ============================================================================
-// parseSwapsMetsSrates — extract swap / met / srate events from text
-// ============================================================================
-
-func parseSwapsMetsSrates(text string) (swaps []swapRow,
-        metByCookie map[int64][]metEntry, srateByCookie map[int64][]srateEntry) {
-
-        metByCookie = map[int64][]metEntry{}
-        srateByCookie = map[int64][]srateEntry{}
-
-        for _, line := range strings.Split(text, "\n") {
-                line = strings.TrimSpace(line)
-                if line == "" {
-                        continue
-                }
-                if m := rxSwap.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        cookie, _ := strconv.ParseInt(m[2], 10, 64)
-                        fa, _ := strconv.Atoi(m[3])
-                        ta, _ := strconv.Atoi(m[4])
-                        bc, _ := strconv.Atoi(m[5])
-                        ac, _ := strconv.Atoi(m[6])
-                        row := swapRow{
-                                Ts: ts, Cookie: cookie, From: fa, To: ta, Bc: bc, Ac: ac,
-                                D: m[7], Mt: m[8], Rb: m[9],
-                                Dest: m[10], Dest6: m[11], Dest6b: m[12],
-                        }
-                        swaps = append(swaps, row)
-                        continue
-                }
-                if m := rxMet.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        cookie, _ := strconv.ParseInt(m[2], 10, 64)
-                        rport := m[3]
-                        alg, _ := strconv.Atoi(m[4])
-                        val, _ := strconv.ParseInt(m[6], 10, 64)
-                        metByCookie[cookie] = append(metByCookie[cookie],
-                                metEntry{Ts: ts, Val: val, Rport: rport, Alg: alg})
-                        continue
-                }
-                if m := rxSrate.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        cookie, _ := strconv.ParseInt(m[2], 10, 64)
-                        alg, _ := strconv.Atoi(m[3])
-                        sr, _ := strconv.ParseInt(m[4], 10, 64)
-                        srateByCookie[cookie] = append(srateByCookie[cookie],
-                                srateEntry{Ts: ts, Srate: sr, Alg: alg})
-                }
-        }
-        return swaps, metByCookie, srateByCookie
-}
-
-// ============================================================================
 // buildRecentSwapRows — derive outcome per swap, return dashboard rows
 // ============================================================================
 
@@ -796,58 +744,6 @@ func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{
         }
         return reverse(out)
 }
-
-// ============================================================================
-// cookieDestMap — cookie → (v4, v6) from estab + swap events
-// ============================================================================
-
-// cookieDestMap builds the cookie→dest map from estab + swap events.
-// v0.9.0: stores cdestEntry [3]string{v4, v6, v6b} — dest6b is now
-// captured from both rxSwap (group 12) and rxEstab (group 6, newly added).
-//
-// Merge rule: existing entries are NOT overwritten by empty dest fields
-// (so a swap event without dest6b doesn't blow away a prior estab's value).
-// This is the same BUG 5 fix that was already in place for the [2]string
-// variant, extended to all three fields.
-func cookieDestMap(text string) map[string]cdestEntry {
-        out := map[string]cdestEntry{}
-        for _, line := range strings.Split(text, "\n") {
-                if m := rxSwap.FindStringSubmatch(line); m != nil {
-                        // swap row: groups 2=cookie, 10=dest, 11=dest6, 12=dest6b
-                        cookie := m[2]
-                        if m[10] != "" || m[11] != "" || m[12] != "" {
-                                cur := out[cookie]
-                                if m[10] != "" {
-                                        cur[0] = m[10]
-                                }
-                                if m[11] != "" {
-                                        cur[1] = m[11]
-                                }
-                                if m[12] != "" {
-                                        cur[2] = m[12]
-                                }
-                                out[cookie] = cur
-                        }
-                        continue
-                }
-                if m := rxEstab.FindStringSubmatch(line); m != nil {
-                        // estab row: groups 2=cookie, 4=dest, 5=dest6, 6=dest6b
-                        cookie := m[2]
-                        cur := out[cookie]
-                        if m[4] != "" {
-                                cur[0] = m[4]
-                        }
-                        if m[5] != "" {
-                                cur[1] = m[5]
-                        }
-                        if m[6] != "" {
-                                cur[2] = m[6]
-                        }
-                        out[cookie] = cur
-                }
-        }
-        return out
-}
 func buildBucketIPs(text string) map[string]interface{} {
         buckets := map[string][]string{}
         p4 := prefix4Value()
@@ -1041,63 +937,6 @@ type proofSample struct {
         sum     int64
         n       int
         sampMax int64
-}
-
-// buildProofsRawEvents builds the proofs_raw list (one entry per proof
-// event, with cookie→dest resolution).  v0.9.0: takes cdest as a
-// parameter instead of re-parsing the log on every cycle — the prior
-// implementation called cookieDestMap(text) a SECOND time per cycle,
-// duplicating the work already done in collect.go.  For a 2 MB log tail
-// with ~10k lines, that was ~5ms of wasted regex per cycle.
-func buildProofsRawEvents(text string, cdest map[string]cdestEntry) []interface{} {
-        var out []interface{}
-        for _, line := range strings.Split(text, "\n") {
-                if !strings.Contains(line, "proof cookie=") {
-                        continue
-                }
-                m := rxProof.FindStringSubmatch(line)
-                if m == nil {
-                        continue
-                }
-                ts, _ := strconv.ParseFloat(m[1], 64)
-                cookie := m[2]
-                alg, _ := strconv.Atoi(m[3])
-                rate, _ := strconv.ParseInt(m[4], 10, 64)
-                tier := m[5]
-                tierLabel := "good"
-                if tier == "2" {
-                        tierLabel = "proved"
-                }
-                dest := ""
-                // v0.9.2: prefer the proof's own dest fields (new in
-                // tuner 0.4.98 — proof printk now carries dest=/dest6=/dest6b=).
-                // This fixes the '(unknown)' issue for passive connections
-                // which fire proofs but never fire estab (so cdest has no
-                // entry for their cookie). Fall back to cdest for older BPF
-                // that doesn't have dest= in the proof line.
-                v4, v6, v6b := m[6], m[7], m[8]
-                if v4 != "" || v6 != "" || v6b != "" {
-                        ds := destStr(v4, v6, v6b)
-                        dest = labelFor(ds)
-                        if dest == "" {
-                                dest = ds
-                        }
-                } else if d, ok := cdest[cookie]; ok {
-                        ds := destStr(d[0], d[1], d[2])
-                        dest = labelFor(ds)
-                        if dest == "" {
-                                dest = ds
-                        }
-                }
-                out = append(out, map[string]interface{}{
-                        "ts":   ts,
-                        "alg":  algName(alg),
-                        "rate": round1(float64(rate) / bpsToMbps),
-                        "tier": tierLabel,
-                        "dest": dest,
-                })
-        }
-        return out
 }
 
 func proofEvents(text string) (map[int]proofEvent, map[int]proofSample) {
@@ -1325,54 +1164,6 @@ func readLogFileMtime() int64 {
                 return time.Now().Unix()
         }
         return fi.ModTime().Unix()
-}
-
-// readBPFClock returns the current BPF clock time (seconds since boot,
-// same scale as bpf_ktime_get_ns / trace_pipe timestamps).
-//
-// We extract this by finding the max timestamp in the log tail. This is
-// more reliable than /proc/uptime on cloud VMs (Oracle Cloud, AWS, etc.)
-// that get live-migrated or suspended/resumed — /proc/uptime resets but
-// the BPF clock keeps counting from the original boot, causing
-// now_mono < boot_ts (massively negative age labels).
-//
-// Falls back to /proc/uptime if the log is empty.
-func readBPFClock(text string) float64 {
-        var maxTs float64
-        for _, line := range strings.Split(text, "\n") {
-                // trace_pipe format: "  <comm>-pid [cpu] flags TIMESTAMP: bpf_trace_printk: ..."
-                // Extract the timestamp (float before the ": bpf_trace_printk:")
-                idx := strings.Index(line, ": bpf_trace_printk:")
-                if idx < 0 {
-                        continue
-                }
-                // Walk backwards from idx to find the start of the timestamp
-                start := idx
-                for start > 0 {
-                        c := line[start-1]
-                        if (c >= '0' && c <= '9') || c == '.' {
-                                start--
-                        } else {
-                                break
-                        }
-                }
-                if start >= idx {
-                        continue
-                }
-                tsStr := line[start:idx]
-                ts, err := strconv.ParseFloat(tsStr, 64)
-                if err != nil {
-                        continue
-                }
-                if ts > maxTs {
-                        maxTs = ts
-                }
-        }
-        if maxTs > 0 {
-                return maxTs
-        }
-        // Fallback: /proc/uptime (correct on non-migrated hosts)
-        return readProcUptime()
 }
 
 // nowMono returns the BPF clock, falling back to /proc/uptime when the

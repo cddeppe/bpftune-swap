@@ -592,19 +592,3 @@ func rebuildBucketLiveFromRing(bucketLive map[string]interface{}, hosts []hostEn
                 }
         }
 }
-
-// voteSum sums metric_count across all algs for one bucket. Used to
-// sort hosts busiest-first (matches Python _vote_sum).
-func voteSum(v map[string]interface{}) int {
-        if v == nil {
-                return 0
-        }
-        metrics, _ := v["metrics"].([]interface{})
-        total := 0
-        for _, m := range metrics {
-                if mi, ok := m.(map[string]interface{}); ok {
-                        total += toInt(mi["metric_count"])
-                }
-        }
-        return total
-}

@@ -50,15 +50,6 @@ type parsedLog struct {
         BucketIPs   map[string][]string // masked → []fullIP
         MaxTs       float64              // max bpf_trace_printk timestamp
         RttByDest   map[string]float64   // v0.4.104: dest→min RTT (microseconds)
-        // v0.9.78: per-direction RTT split for the Origin Health panel.
-        // Incoming = remote peer initiated the connection (rport > 32768,
-        // meaning the remote used an ephemeral source port to connect to
-        // a local service). Outgoing = this host initiated (rport ≤ 32768,
-        // meaning we connected to a remote service on a well-known port).
-        // The heuristic uses Linux's default ip_local_port_range
-        // (32768-60999) as the boundary.
-        IncomingRttByDest map[string]float64
-        OutgoingRttByDest map[string]float64
 
         // Pre-computed views (built once from the raw data above)
         proofRowsCache     []interface{}
@@ -110,8 +101,6 @@ func parseLogSinglePass(text string) *parsedLog {
                 ProofSamples: map[int]proofSample{},
                 BucketIPs:    map[string][]string{},
                 RttByDest:    map[string]float64{}, // v0.4.104
-                IncomingRttByDest: map[string]float64{}, // v0.9.78
-                OutgoingRttByDest: map[string]float64{}, // v0.9.78
         }
 
         p4 := prefix4Value()
@@ -187,21 +176,6 @@ func parseLogSinglePass(text string) *parsedLog {
                                                 }
                                                 if existing, ok := pl.RttByDest[destLabel]; !ok || rttUs < existing {
                                                         pl.RttByDest[destLabel] = rttUs
-                                                }
-                                                // v0.9.78: split RTT by direction using rport
-                                                // heuristic. rport > 32768 = remote peer
-                                                // initiated (incoming); ≤ 32768 = this host
-                                                // initiated (outgoing). Linux's default
-                                                // ip_local_port_range is 32768-60999.
-                                                rportVal, _ := strconv.ParseFloat(m[3], 64)
-                                                if rportVal > 32768 {
-                                                        if ex, ok := pl.IncomingRttByDest[destLabel]; !ok || rttUs < ex {
-                                                                pl.IncomingRttByDest[destLabel] = rttUs
-                                                        }
-                                                } else {
-                                                        if ex, ok := pl.OutgoingRttByDest[destLabel]; !ok || rttUs < ex {
-                                                                pl.OutgoingRttByDest[destLabel] = rttUs
-                                                        }
                                                 }
                                         }
                                 }

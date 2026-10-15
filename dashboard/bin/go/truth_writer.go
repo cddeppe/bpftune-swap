@@ -104,35 +104,3 @@ func writeTruthRow(destStrArg, toAlg, outcome string) {
 	f.Write([]byte("\n"))
 	fmt.Fprintf(os.Stderr, "[truth] OK wrote %d bytes to %s (bucket=%s)\n", len(data)+1, truthFilePath, bucket)
 }
-
-// writeTruthRows writes truth file entries for all swaps with classified
-// outcomes (win/loss/null). v0.8.3 introduced this as a separate function
-// with its own dedup map, but v0.8.7 removed the call from collect.go
-// because writeSwapsCSV already writes truth rows inline (with its own
-// dedup) — calling writeTruthRows separately caused duplicate writes.
-//
-// v0.9.0: this function is kept for backward compat with any external
-// scripts that import it, but is NOT called from the collector.  It now
-// uses sw.DestResolved instead of destIP(sw.Dest) for IPv6 support.
-func writeTruthRows(swaps []swapRow) {
-	dedupMu.Lock()
-	defer dedupMu.Unlock()
-	classified := 0
-	written := 0
-	for _, sw := range swaps {
-		if sw.Outcome != "win" && sw.Outcome != "loss" && sw.Outcome != "null" {
-			continue
-		}
-		if writtenTruth[sw.Cookie] == nil {
-			writtenTruth[sw.Cookie] = map[float64]bool{}
-		}
-		classified++
-		if !writtenTruth[sw.Cookie][sw.Ts] {
-			writeTruthRow(sw.DestResolved, algName(sw.To), sw.Outcome)
-			writtenTruth[sw.Cookie][sw.Ts] = true
-			written++
-			fmt.Fprintf(os.Stderr, "[truth] wrote: dest=%s tgt=%s cls=%s\n", sw.DestResolved, algName(sw.To), sw.Outcome)
-		}
-	}
-	fmt.Fprintf(os.Stderr, "[truth] writeTruthRows: %d swaps, %d classified, %d written\n", len(swaps), classified, written)
-}

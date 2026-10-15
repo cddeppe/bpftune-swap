@@ -158,71 +158,6 @@ var (
         csvReadCacheMu sync.Mutex
 )
 
-func readCSVAll() map[string][]bucketSnapshot {
-        data, err := os.ReadFile(bucketsCSVPath)
-        if err != nil {
-                return nil
-        }
-        lines := strings.Split(string(data), "\n")
-        if len(lines) < 2 {
-                return nil
-        }
-        header := strings.Split(lines[0], ",")
-        colIdx := map[string]int{}
-        for i, col := range header {
-                colIdx[col] = i
-        }
-        result := map[string][]bucketSnapshot{}
-        for i := 1; i < len(lines); i++ {
-                line := strings.TrimSpace(lines[i])
-                if line == "" {
-                        continue
-                }
-                cols := strings.Split(line, ",")
-                if len(cols) < 9 {
-                        continue
-                }
-                addr := cols[1] // B1-fix: trust stored label, no ResolveBucket
-                ts, err := strconv.ParseInt(cols[0], 10, 64)
-                if err != nil {
-                        continue
-                }
-                snap := bucketSnapshot{Ts: ts}
-                snap.Instances, _ = strconv.Atoi(cols[2])
-                snap.MinRtt, _ = strconv.ParseFloat(cols[3], 64)
-                snap.RefRate, _ = strconv.ParseFloat(cols[4], 64)
-                snap.BestI, _ = strconv.Atoi(cols[5])
-                if snap.BestI >= 0 && snap.BestI < len(CONGS) {
-                        snap.BestAlg = CONGS[snap.BestI]
-                }
-                for i, alg := range CONGS {
-                        if i >= 16 {
-                                break
-                        }
-                        if idx, ok := colIdx["mv_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                snap.Mv[i], _ = strconv.ParseFloat(cols[idx], 64)
-                        }
-                        if idx, ok := colIdx["re_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                snap.Re[i], _ = strconv.ParseFloat(cols[idx], 64)
-                        }
-                        if idx, ok := colIdx["ss_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                v, _ := strconv.Atoi(cols[idx])
-                                snap.Ss[i] = v
-                        }
-                        if idx, ok := colIdx["bs_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                v, _ := strconv.Atoi(cols[idx])
-                                snap.Bs[i] = v
-                        }
-                        if idx, ok := colIdx["ns_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                v, _ := strconv.Atoi(cols[idx])
-                                snap.Ns[i] = v
-                        }
-                }
-                result[addr] = append(result[addr], snap)
-        }
-        return result
-}
-
 // readBucketCSVFast returns snapshots for one bucket from a pre-loaded map.
 // Used by renderToDisk (which calls readCSVAll once, then iterates).
 func readBucketCSVFromMap(all map[string][]bucketSnapshot, bucketID string, span int64) []bucketSnapshot {
@@ -636,31 +571,4 @@ func finalizeSeriesFromBins(binMap map[int64]*binAcc) map[string]interface{} {
                 series[k] = v
         }
         return series
-}
-
-// v0.7.5p: validateMetric clamps unreasonable values to 0.
-// Prevents column-mismatch bugs (old Python rows have different column order).
-func validateRe(v float64) float64 {
-        if v > 10000000 {
-                return 0
-        }
-        return v
-}
-func validateSs(v int) int {
-        if v > 1000 {
-                return 0
-        }
-        return v
-}
-func validateBs(v int) int {
-        if v > 1000 {
-                return 0
-        }
-        return v
-}
-func validateNs(v int) int {
-        if v > 1000 {
-                return 0
-        }
-        return v
 }

@@ -99,14 +99,6 @@
     return (row.ts || 0) + monoOffset;
   }
 
-  // v0.9.81: getDomainForBucketDisplay removed (ctrld integration was deleted).
-  // Was used to show domain names from the ctrld DNS cache in the Route Health
-  // and Origin Health panels. Returns "" now — domain resolution via aliases
-  // file (labelFor) still works for manually-labeled destinations.
-  function getDomainForBucketDisplay(bucketAddr) {
-    return "";
-  }
-
   // v0.9.20: ageLabel accepts optional epoch_ts (wall-clock).
   // When boot_ts is from a PREVIOUS boot (age < 0), fall back to
   // epoch_ts so ages display correctly after a reboot.
@@ -687,45 +679,6 @@
         frow('max per cookie', ch.max || 0) +
       '</div>';
     setHTML("lv-swapout", html);
-  }
-
-
-  function renderDivergence(rows) {
-    if (!rows.length) {
-      setHTML("lv-div", '<div class="placeholder">(no swaps)</div>');
-      return;
-    }
-    var html = '<table class="tbl"><thead><tr>' +
-      '<th>category</th><th style="width:32%">composite</th>' +
-      '<th style="width:32%">sustained</th>' +
-      '<th>n</th>' +
-      '</tr></thead><tbody>';
-    rows.forEach(function (r) {
-      function bar(w, n, l) {
-        var out = '<div class="cellbar">';
-        if ((w + n + l) > 0) {
-          if (w > 0) out += '<span class="w" style="width:' + w + '%">' +
-            (w >= 8 ? w.toFixed(0) + '%' : '') + '</span>';
-          if (n > 0) out += '<span class="n" style="width:' + n + '%">' +
-            (n >= 8 ? n.toFixed(0) + '%' : '') + '</span>';
-          if (l > 0) out += '<span class="l" style="width:' + l + '%">' +
-            (l >= 8 ? l.toFixed(0) + '%' : '') + '</span>';
-        } else {
-          out += '<span class="n" style="width:100%">no data</span>';
-        }
-        out += '</div>';
-        return out;
-      }
-      html += '<tr>' +
-        '<td class="name">' + esc(r.category) + '</td>' +
-        '<td>' + bar(r.win_pct, r.null_pct, r.loss_pct) + '</td>' +
-        '<td>' + bar(r.win_pct_sustained, r.null_pct_sustained,
-                     r.loss_pct_sustained) + '</td>' +
-        '<td class="mono dim">' + r.measured + ' / ' +
-          r.measured_sustained + '</td>' +
-        '</tr>';
-    });
-    setHTML("lv-div", html + '</tbody></table>');
   }
 
   function renderRecentProofs(rows) {
@@ -1399,8 +1352,6 @@
     });
 
     _next(function() {
-      _safeRender('div', function() { renderDivChart("div", ""); });
-      _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
     });
   }
 
@@ -1899,61 +1850,6 @@
     return result;
   }
 
-  // 0.4.87: aggregate all state.bucketLive entries into one combined
-  // {ts, cols} for the "All Buckets" 1h view.  Without this, the rate /
-  // swap-score / streaks charts only refreshed every 5 min via refreshAll
-  // when "All Buckets" was selected (because state.bucketDoc is null in
-  // that case and renderBucket was gated on it).  Now the charts refresh
-  // on every SSE push (~30s) using the same source as the per-bucket view.
-  //
-  // Per-bin aggregation: SUM across buckets for re_/ss_ (the picker's
-  // totals across the whole fleet); MAX across buckets for bs_/ns_
-  // (worst streak anywhere, since a single bad streak is the
-  // operator's signal).  Empty bins stay null.
-  function _aggregateAllBucketsLive() {
-    var keys = Object.keys(state.bucketLive || {});
-    if (!keys.length) return null;
-    var tsSet = {};
-    for (var i = 0; i < keys.length; i++) {
-      var lb = state.bucketLive[keys[i]];
-      if (lb && lb.ts) {
-        for (var j = 0; j < lb.ts.length; j++) tsSet[lb.ts[j]] = true;
-      }
-    }
-    var ts = Object.keys(tsSet).map(Number).sort(function(a, b) { return a - b; });
-    if (!ts.length) return null;
-    var tsIdx = {};
-    for (var k = 0; k < ts.length; k++) tsIdx[ts[k]] = k;
-    var cols = {};
-    var sumPrefixes = { re_: true, ss_: true };
-    var maxPrefixes = { bs_: true, ns_: true };
-    for (var b = 0; b < keys.length; b++) {
-      var lb2 = state.bucketLive[keys[b]];
-      if (!lb2 || !lb2.cols) continue;
-      var lbTs = lb2.ts || [];
-      for (var col in lb2.cols) {
-        if (!cols[col]) cols[col] = new Array(ts.length).fill(null);
-        var vals = lb2.cols[col];
-        var isMax = !!maxPrefixes[col.substring(0, 3)];
-        for (var v = 0; v < vals.length; v++) {
-          var idx = tsIdx[lbTs[v]];
-          if (idx == null) continue;
-          var cur = cols[col][idx];
-          var val = vals[v];
-          if (val == null) continue;
-          if (cur == null) {
-            cols[col][idx] = val;
-          } else if (isMax) {
-            if (val > cur) cols[col][idx] = val;
-          } else {
-            cols[col][idx] = cur + val;
-          }
-        }
-      }
-    }
-    return {ts: ts, cols: cols};
-  }
-
   function _appendLiveMetrics(doc) {
     if (!doc.metric_by_bucket || !state.bucketLive) return;
     var ts = doc.generated_ts; if (!ts) return;
@@ -2145,81 +2041,6 @@
         },
       }),
     });
-  }
-
-  function renderDivChart(canvasId, suffix) {
-    // v0.8.7: guard state.swaps — SSE can fire renderDivergenceCharts
-    // before boot()'s data/swaps.json fetch resolves, so state.swaps is
-    // still null.  Without this guard, `doc[rng]` throws
-    // "Cannot read properties of null (reading '')" and aborts the
-    // whole renderDivergenceCharts call (both div + div_sustained).
-    var doc = state.swaps, rng = $("range") ? $("range").value : "1h";
-    if (!doc) return;
-    var d = doc[rng];
-    if (!d) return;
-    var ts = d.ts;
-    var sfx = suffix || "";
-
-    function mkLine(key, label, color, dash) {
-      return {
-        label: label,
-        data: (d[key] || []).map(function (y, k) {
-          return {x: ts[k] * 1000, y: y};
-        }),
-        borderColor: color,
-        backgroundColor: color,
-        borderDash: dash || [],
-        pointRadius: 2,
-        pointHoverRadius: 4,
-        borderWidth: 1.5,
-        spanGaps: true,
-      };
-    }
-
-    mk(canvasId, {
-      type: "line",
-      data: {datasets: [
-        mkLine("d1_rate" + sfx, "diverges=1", "#59a14f"),
-        mkLine("d1_lo"   + sfx, "d1 95% lo", "#59a14f", [4, 3]),
-        mkLine("d1_hi"   + sfx, "d1 95% hi", "#59a14f", [4, 3]),
-        mkLine("d0_rate" + sfx, "diverges=0", "#e15759"),
-        mkLine("d0_lo"   + sfx, "d0 95% lo", "#e15759", [4, 3]),
-        mkLine("d0_hi"   + sfx, "d0 95% hi", "#e15759", [4, 3]),
-      ]},
-      options: timeOpts({
-        scales: {
-          x: {type: "time", grid: {display: false},
-              ticks: {maxRotation: 0, autoSkipPadding: 24}},
-          y: {min: 0, max: 1, grid: {drawTicks: false},
-              ticks: {maxTicksLimit: 5, padding: 6,
-                      callback: function (v) {
-                        return Math.round(v * 100) + "%";
-                      }}},
-        },
-        plugins: {
-          legend: {
-            display: true, position: "bottom", align: "start",
-            labels: {boxWidth: 8, boxHeight: 8, padding: 8,
-                     font: {size: 10.5},
-                     filter: function (item) {
-                       return !/_lo|_hi/.test(item.text);
-                     }},
-          },
-        },
-      }),
-    });
-  }
-
-  function sustainedHasData() {
-    var doc = state.swaps;
-    if (!doc) return false;
-    var d = doc["24h"] || doc["7d"] || doc["all"];
-    if (!d) return false;
-    var arr = d.d1_n_sustained || [];
-    for (var i = 0; i < arr.length; i++) {
-      if ((arr[i] || 0) > 0) return true;
-    }
-    return false;
   }
 
   function renderScoreNow() {
@@ -2685,25 +2506,6 @@
     });
   }
 
-  function renderDivergenceCharts() {
-    renderDivChart("div", "");
-    renderDivChart("div_sustained", "_sustained");
-    var note = document.getElementById("div_sustained_note");
-    if (note) {
-      if (sustainedHasData()) {
-        note.textContent = "sustained = median srate in [t+60, t+300], " +
-          "compared to last srate before the swap. Excludes the cwnd-reset " +
-          "dip. This is the accurate throughput measure.";
-        note.style.color = "";
-      } else {
-        note.textContent = "no sustained data yet. Requires 0.4.53+ emitting " +
-          "`srate` lines AND the collector writing srate.csv AND a swap " +
-          "landing with 60+ s of post-swap votes. Will populate on its own.";
-        note.style.color = "#9aa0a6";
-      }
-    }
-  }
-
   function renderFleet() {
     /* 0.4.78.2: fleet.json no longer drives a separate chart.  Its
      * coverage_24h feeds the new coverage column on the top-
@@ -2833,8 +2635,6 @@ function _populateBucketSelect(desiredBucket) {
         renderSwaps();
       });
       requestAnimationFrame(function() {
-        _safeRender("div", function() { renderDivChart("div", ""); });
-        _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
       });
       requestAnimationFrame(function() {
         _safeRender("score-now", function() { renderScoreNow(); });
@@ -2941,8 +2741,6 @@ function _populateBucketSelect(desiredBucket) {
           try { localStorage.setItem("bpftune.range", rs.value); } catch (e) {}
           renderBucket();
           renderSwaps();
-          _safeRender("div", function() { renderDivChart("div", ""); });
-          _safeRender("div_sustained", function() { renderDivChart("div_sustained", "_sustained"); });
           _safeRender("score-now", function() { renderScoreNow(); });
           // v0.9.1: re-render the Swap Target Pick table on range change
           // too — it reads from live metric_by_bucket data (not historical),

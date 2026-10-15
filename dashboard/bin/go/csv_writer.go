@@ -474,52 +474,6 @@ type proofCSVRow struct {
         Dest    string
 }
 
-func writeProofsCSV(proofs []proofCSVRow, now int64) {
-        if len(proofs) == 0 {
-                return
-        }
-        dedupMu.Lock()
-        defer dedupMu.Unlock()
-
-        writeCSVHeaderIfEmpty(proofsCSVPath, proofsCSVHeader())
-        f, err := os.OpenFile(proofsCSVPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-        if err != nil {
-                return
-        }
-        defer f.Close()
-
-        for _, p := range proofs {
-                cookie, _ := strconv.ParseInt(p.Cookie, 10, 64)
-                if writtenProofs[cookie] == nil {
-                        writtenProofs[cookie] = map[float64]bool{}
-                }
-                if writtenProofs[cookie][p.Ts] {
-                        continue
-                }
-                writtenProofs[cookie][p.Ts] = true
-
-                if len(writtenProofs[cookie]) > 1000 {
-                        for k := range writtenProofs[cookie] {
-                                if k < p.Ts-3600 {
-                                        delete(writtenProofs[cookie], k)
-                                }
-                        }
-                }
-
-                row := []string{
-                        strconv.FormatInt(now, 10),
-                        strconv.FormatFloat(p.Ts, 'f', 6, 64),
-                        p.Cookie,
-                        p.Alg,
-                        strconv.FormatInt(p.RateBps, 10),
-                        strconv.FormatFloat(p.Mbps, 'f', 1, 64),
-                        p.Tier,
-                        p.Dest,
-                }
-                f.WriteString(strings.Join(row, ",") + "\n")
-        }
-}
-
 // ============================================================================
 // suppress unused warning
 // ============================================================================

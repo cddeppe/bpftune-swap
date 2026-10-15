@@ -801,58 +801,6 @@ func buildLastSnapshotMap(last bucketSnapshot) map[string]interface{} {
         }
 }
 
-// countSwapsPerBin counts swap events per time bin for a specific bucket.
-func countSwapsPerBin(swapOutcomes interface{}, bucketID string, width int, span int) []interface{} {
-        so, ok := swapOutcomes.(map[string]interface{})
-        if !ok {
-                return []interface{}{}
-        }
-        sl, _ := so["swaps_list"].([]interface{})
-        if !ok {
-                _ = sl
-                return []interface{}{}
-        }
-        now := time.Now().Unix()
-        uptime := readProcUptime()
-        nowEpoch := float64(now)
-        var cutoff int64
-        if span > 0 {
-                cutoff = now - int64(span)
-        }
-        binCounts := map[int64]int{}
-        for _, s := range sl {
-                sm, ok := s.(map[string]interface{})
-                if !ok {
-                        continue
-                }
-                dest, _ := sm["dest"].(string)
-                if dest != bucketID {
-                        continue
-                }
-                ts, ok := sm["ts"].(float64)
-                if !ok {
-                        continue
-                }
-                epochTs := nowEpoch - uptime + ts
-                tsInt := int64(epochTs)
-                if span > 0 && tsInt < cutoff {
-                        continue
-                }
-                binIdx := tsInt / int64(width)
-                binCounts[binIdx]++
-        }
-        var binIdxs []int64
-        for bi := range binCounts {
-                binIdxs = append(binIdxs, bi)
-        }
-        sort.Slice(binIdxs, func(i, j int) bool { return binIdxs[i] < binIdxs[j] })
-        result := make([]interface{}, len(binIdxs))
-        for i, bi := range binIdxs {
-                result[i] = binCounts[bi]
-        }
-        return result
-}
-
 // ============================================================================
 // sortedAlgs returns CONGS in alphabetical order (matches Python renderer).
 // ============================================================================
