@@ -19,13 +19,21 @@ import (
 
 // routeHealthEntry is the per-bucket health data.
 type routeHealthEntry struct {
-        RTTMs    float64 `json:"rtt_ms"`
+        RTTMs    float64 `json:"rtt_ms"`        // combined min RTT (backward compat)
         LossPct  float64 `json:"loss_pct"`
         RateMbps float64 `json:"rate_mbps"`
         Protocol string  `json:"protocol"`  // "ipv4", "ipv6", "dual"
         Health   string  `json:"health"`     // "good", "degraded", "bad"
         BestAlg  string  `json:"best_alg"`
         Inst     int     `json:"inst"`
+
+        // v0.9.78: per-direction RTT split for the Origin Health panel.
+        // IncomingRTTMs is the min RTT measured on connections where the
+        // remote peer initiated (rport > 32768). OutgoingRTTMs is the min
+        // RTT for connections this host initiated (rport ≤ 32768).
+        // 0 = no data for that direction (the panel renders "no data").
+        IncomingRTTMs float64 `json:"incoming_rtt_ms"`
+        OutgoingRTTMs float64 `json:"outgoing_rtt_ms"`
 }
 
 // buildRouteHealth creates a map of bucketID → routeHealthEntry from the
@@ -54,9 +62,35 @@ func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) 
                 // suitable for route health display. The rtt log line gives
                 // the raw RTT from actual connections.
                 rttMs := 0.0
-                if currentParsedLog != nil && currentParsedLog.RttByDest != nil {
-                        if rttUs, ok := currentParsedLog.RttByDest[addr]; ok && rttUs > 0 {
-                                rttMs = rttUs / 1000.0
+                // v0.9.78: per-direction RTT split. addr here is the raw
+                // BPF bucket address (e.g. "130.61.0.0" or "v6:26061a40").
+                // The IncomingRttByDest / OutgoingRttByDest maps are keyed
+                // by the resolved dest label, so we resolve addr to a label
+                // first, then look up the per-direction RTT.
+                var inRTTMs, outRTTMs float64
+                if currentParsedLog != nil {
+                        if currentParsedLog.RttByDest != nil {
+                                if rttUs, ok := currentParsedLog.RttByDest[addr]; ok && rttUs > 0 {
+                                        rttMs = rttUs / 1000.0
+                                }
+                        }
+                        // v0.9.78: also look up per-direction RTT. The maps
+                        // are keyed by the dest label (after labelFor / aliases
+                        // resolution), not the raw bucket addr — so we have
+                        // to resolve the label first.
+                        addrLabel := labelFor(addr)
+                        if addrLabel == "" {
+                                addrLabel = addr
+                        }
+                        if currentParsedLog.IncomingRttByDest != nil {
+                                if v, ok := currentParsedLog.IncomingRttByDest[addrLabel]; ok && v > 0 {
+                                        inRTTMs = v / 1000.0
+                                }
+                        }
+                        if currentParsedLog.OutgoingRttByDest != nil {
+                                if v, ok := currentParsedLog.OutgoingRttByDest[addrLabel]; ok && v > 0 {
+                                        outRTTMs = v / 1000.0
+                                }
                         }
                 }
                 // Fallback to BPF map min_rtt if no log RTT available
@@ -131,6 +165,9 @@ func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) 
                         Health:   health,
                         BestAlg:  bestAlg,
                         Inst:     h.Inst,
+                        // v0.9.78: per-direction RTT for Origin Health panel.
+                        IncomingRTTMs: round1(inRTTMs),
+                        OutgoingRTTMs: round1(outRTTMs),
                 }
         }
 

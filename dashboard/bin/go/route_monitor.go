@@ -48,6 +48,14 @@ type destRouteState struct {
         V6RTT  float64
         V6Loss float64
         UsingBPF bool
+        // v0.9.78: per-direction RTT for the Origin Health panel.
+        // V4InRTT/V6InRTT = incoming v4/v6 RTT (remote peer initiated).
+        // V4OutRTT/V6OutRTT = outgoing v4/v6 RTT (this host initiated).
+        // 0 = no data for that direction.
+        V4InRTT  float64
+        V4OutRTT float64
+        V6InRTT  float64
+        V6OutRTT float64
 
         LastSwitchTs     int64
         LastSwitchReason string
@@ -350,6 +358,10 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         // Before this, the route monitor read from bpfHealth which only had
         // one merged RTT (usually v4). Now we get both v4 and v6 RTT separately.
         var v4BpfRTT, v4BpfLoss, v6BpfRTT, v6BpfLoss float64
+        // v0.9.78: per-direction RTT split for the Origin Health panel.
+        // We track the incoming and outgoing RTT separately so the panel can
+        // show both directions side-by-side.
+        var v4InRTT, v4OutRTT, v6InRTT, v6OutRTT float64
         usingBPF := false
         if bpfHealth != nil {
                 for addr, raw := range bpfHealth {
@@ -365,11 +377,18 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                                 v4BpfRTT = entry.RTTMs
                                 v4BpfLoss = entry.LossPct
                                 usingBPF = true
+                                // v0.9.78: capture per-direction RTT (only populated
+                                // from log-parsed met lines, not the BPF map min_rtt).
+                                if entry.IncomingRTTMs > 0 { v4InRTT = entry.IncomingRTTMs }
+                                if entry.OutgoingRTTMs > 0 { v4OutRTT = entry.OutgoingRTTMs }
                         }
                         if entry.Protocol == "ipv6" || entry.Protocol == "dual" {
                                 v6BpfRTT = entry.RTTMs
                                 v6BpfLoss = entry.LossPct
                                 usingBPF = true
+                                // v0.9.78: capture per-direction RTT for v6 too.
+                                if entry.IncomingRTTMs > 0 { v6InRTT = entry.IncomingRTTMs }
+                                if entry.OutgoingRTTMs > 0 { v6OutRTT = entry.OutgoingRTTMs }
                         }
                 }
         }
@@ -445,6 +464,11 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         state.UsingBPF = usingBPF
         state.V4RTT = v4RTT; state.V4Loss = v4Loss
         state.V6RTT = v6RTT; state.V6Loss = v6Loss
+        // v0.9.78: store per-direction RTT so the Origin Health panel can
+        // show both directions side-by-side. 0 means no data for that
+        // direction (no incoming or outgoing traffic measured).
+        state.V4InRTT = v4InRTT; state.V4OutRTT = v4OutRTT
+        state.V6InRTT = v6InRTT; state.V6OutRTT = v6OutRTT
 
         // v0.9.35: RTT=0 means no data (ping failed or BPF has no metrics).
         // A real RTT is always > 0. If RTT=0, skip — don't count as good or bad.
@@ -572,6 +596,18 @@ func (rm *RouteMonitor) getState() []interface{} {
                         "v6_rtt_ms": round1(state.V6RTT),
                         "v6_loss_pct": round1(state.V6Loss),
                         "v6_has_data": v6HasData,
+                        // v0.9.78: per-direction RTT for the Origin Health panel.
+                        // Each direction is rendered side-by-side in the panel;
+                        // 0 / false means "no data" for that direction (no
+                        // incoming or outgoing traffic measured for this peer).
+                        "v4_in_rtt_ms":     round1(state.V4InRTT),
+                        "v4_out_rtt_ms":    round1(state.V4OutRTT),
+                        "v4_in_has_data":   state.V4InRTT > 0,
+                        "v4_out_has_data":  state.V4OutRTT > 0,
+                        "v6_in_rtt_ms":     round1(state.V6InRTT),
+                        "v6_out_rtt_ms":    round1(state.V6OutRTT),
+                        "v6_in_has_data":   state.V6InRTT > 0,
+                        "v6_out_has_data":  state.V6OutRTT > 0,
                         "using_bpf": state.UsingBPF,
                         "last_switch_ts": state.LastSwitchTs,
                         "last_switch_reason": state.LastSwitchReason,

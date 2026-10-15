@@ -2469,19 +2469,31 @@
 
       // Build compact row showing both protocols side by side
       // v0.9.37: use has_data flags to show "no data" instead of "0.0ms 100%"
-      var v4Rtt, v4Loss, v6Rtt, v6Loss;
-      if (r.v4_has_data === false) {
-        v4Rtt = "—"; v4Loss = "—";
-      } else {
-        v4Rtt = r.v4_rtt_ms != null ? r.v4_rtt_ms.toFixed(1) : "—";
-        v4Loss = r.v4_loss_pct != null ? r.v4_loss_pct.toFixed(1) : "—";
+      // v0.9.78: split each protocol into incoming (↓) + outgoing (↑)
+      // directions so the user can see which side actually has traffic.
+      // The Origin Health panel is conceptually about INCOMING traffic,
+      // but we show both directions because the user wants to verify
+      // whether a peer is sending them data or only receiving it.
+      function dirRtt(proto, dir) {
+        var rttKey = proto + '_' + dir + '_rtt_ms';
+        var hasKey = proto + '_' + dir + '_has_data';
+        if (r[hasKey] === false || r[rttKey] == null || r[rttKey] === 0) {
+          return '<i style="opacity:0.4">—</i>';
+        }
+        return '<b>' + r[rttKey].toFixed(1) + '</b>ms';
       }
-      if (r.v6_has_data === false) {
-        v6Rtt = "—"; v6Loss = "—";
-      } else {
-        v6Rtt = r.v6_rtt_ms != null ? r.v6_rtt_ms.toFixed(1) : "—";
-        v6Loss = r.v6_loss_pct != null ? r.v6_loss_pct.toFixed(1) : "—";
+      // Fall back to combined RTT (for older collectors without v0.9.78 fields)
+      function combinedRtt(proto) {
+        if (r[proto + '_has_data'] === false) return '<i style="opacity:0.4">—</i>';
+        var v = r[proto + '_rtt_ms'];
+        return v != null ? '<b>' + v.toFixed(1) + '</b>ms' : '<i style="opacity:0.4">—</i>';
       }
+      var hasV4In  = r.v4_in_has_data  === true;
+      var hasV4Out = r.v4_out_has_data === true;
+      var hasV6In  = r.v6_in_has_data  === true;
+      var hasV6Out = r.v6_out_has_data === true;
+      // If collector didn't ship v0.9.78 fields, use combined RTT
+      var usingSplitDirs = (r.v4_in_rtt_ms != null || r.v6_in_rtt_ms != null);
 
       // Determine which protocol is better (lower RTT + loss wins)
       // v0.9.37: skip comparison if either has no data
@@ -2507,24 +2519,37 @@
         '<span class="route-proto ' + protoBadge + '">' + esc(protoBadge) + '</span>' +
         '<span style="min-width:80px;color:var(--fg);font-weight:600;">' + esc(label) + preferredBadge + '</span>';
 
+      // v0.9.78: render each protocol with BOTH directions (↓ incoming + ↑ outgoing).
+      // The down-arrow (↓) shows traffic flowing IN to this host (remote peer
+      // initiated). The up-arrow (↑) shows traffic flowing OUT from this host
+      // (this host initiated). "—" means no measured RTT for that direction.
+      // For older collectors that don't ship v0.9.78 fields, fall back to a
+      // single combined v4/v6 metric (no direction split).
       if (hasV4) {
-        var v4NoData = r.v4_has_data === false;
-        var v4HealthClass = v4NoData ? "" : ((r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good");
-        // v0.9.73: fix no-op ternary that was always emitting "" for both
-        // branches, so the route-metric span never received a "good"/"degraded"
-        // color tint. The RTT/loss numbers still showed but without the
-        // visual health cue the user could not tell at a glance which rows
-        // were degraded.
-        html += '<span class="route-metric ' + (v4NoData ? '' : v4HealthClass) + '" style="' +
-          (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
-          (v4NoData ? 'v4: <i style="opacity:0.5">no data</i>' : 'v4: <b>' + v4Rtt + '</b>ms <b>' + v4Loss + '%</b>') + '</span>';
+        if (usingSplitDirs) {
+          html += '<span class="route-metric ' + v4Class + '" style="' +
+            (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
+            'v4↓ ' + dirRtt('v4','in') + ' &nbsp; v4↑ ' + dirRtt('v4','out') + '</span>';
+        } else {
+          var v4NoData = r.v4_has_data === false;
+          var v4HealthClass = v4NoData ? "" : ((r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good");
+          html += '<span class="route-metric ' + (v4NoData ? '' : v4HealthClass) + '" style="' +
+            (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
+            'v4: ' + (v4NoData ? '<i style="opacity:0.5">no data</i>' : combinedRtt('v4') + ' <b>' + (r.v4_loss_pct != null ? r.v4_loss_pct.toFixed(1) : '—') + '%</b>') + '</span>';
+        }
       }
       if (hasV6) {
-        var v6NoData = r.v6_has_data === false;
-        var v6HealthClass = v6NoData ? "" : ((r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good");
-        html += '<span class="route-metric ' + (v6NoData ? '' : v6HealthClass) + '" style="' +
-          (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
-          (v6NoData ? 'v6: <i style="opacity:0.5">no data</i>' : 'v6: <b>' + v6Rtt + '</b>ms <b>' + v6Loss + '%</b>') + '</span>';
+        if (usingSplitDirs) {
+          html += '<span class="route-metric ' + v6Class + '" style="' +
+            (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
+            'v6↓ ' + dirRtt('v6','in') + ' &nbsp; v6↑ ' + dirRtt('v6','out') + '</span>';
+        } else {
+          var v6NoData = r.v6_has_data === false;
+          var v6HealthClass = v6NoData ? "" : ((r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good");
+          html += '<span class="route-metric ' + (v6NoData ? '' : v6HealthClass) + '" style="' +
+            (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
+            'v6: ' + (v6NoData ? '<i style="opacity:0.5">no data</i>' : combinedRtt('v6') + ' <b>' + (r.v6_loss_pct != null ? r.v6_loss_pct.toFixed(1) : '—') + '%</b>') + '</span>';
+        }
       }
       if (!hasV4 && !hasV6) {
         html += '<span class="route-metric">(no data)</span>';
