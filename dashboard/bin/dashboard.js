@@ -100,8 +100,8 @@
   }
 
   // v0.9.68: Look up domain name from ctrld DNS cache for a bucket IP.
-  // The bucket is a /16 masked IP (e.g. "142.250.0.0"). We check if any
-  // cached IP matches the first two octets.
+  // v0.9.70: Fixed IPv6 matching — BPF stores v6 as "v6:hexprefix" but
+  // ctrld_domains has full IPv6 addresses like "2606:1a40:3::1".
   function getDomainForBucketDisplay(bucketAddr) {
     var domains = window.__current_doc && window.__current_doc.ctrld_domains;
     if (!domains) return "";
@@ -109,13 +109,30 @@
     // Try exact match first
     if (domains[bucketAddr]) return domains[bucketAddr];
 
-    // For /16 masked IPs like "142.250.0.0", match first two octets
+    // IPv4: /16 masked IPs like "142.250.0.0" — match first two octets
     var parts = bucketAddr.split(".");
-    if (parts.length !== 4) return "";
-    var prefix = parts[0] + "." + parts[1] + ".";
-    for (var ip in domains) {
-      if (ip.indexOf(prefix) === 0) return domains[ip];
+    if (parts.length === 4) {
+      var prefix = parts[0] + "." + parts[1] + ".";
+      for (var ip in domains) {
+        if (ip.indexOf(prefix) === 0) return domains[ip];
+      }
+      return "";
     }
+
+    // IPv6: BPF stores as "v6:hexprefix" (first 4 bytes in hex, e.g. "v6:26061a40")
+    // ctrld_domains has full IPv6 like "2606:1a40:3::1"
+    // Convert: "v6:26061a40" → "2606:1a40:" prefix → match against ctrld IPs
+    if (bucketAddr.indexOf("v6:") === 0) {
+      var hex = bucketAddr.substring(3); // "26061a40"
+      if (hex.length >= 8) {
+        // Build IPv6 prefix: "2606:1a40:"
+        var v6Prefix = hex.substring(0,4) + ":" + hex.substring(4,8) + ":";
+        for (var ip in domains) {
+          if (ip.indexOf(v6Prefix) === 0) return domains[ip];
+        }
+      }
+    }
+
     return "";
   }
 
