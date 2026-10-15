@@ -1348,17 +1348,32 @@
       if (window.__latest_doc_ts && _ts < window.__latest_doc_ts) {
         return;
       }
+      // v0.9.73: also skip the whole render if generated_ts is UNCHANGED
+      // since the last render — SSE can deliver a duplicate full-doc snapshot
+      // (the 5-min heartbeat) even when nothing has changed. Skipping saves
+      // 6 rAFs × ~30ms of DOM work for a no-op refresh.
+      if (window.__latest_doc_ts === _ts && window.__current_doc === doc) {
+        return;
+      }
       window.__latest_doc_ts = _ts;
     }
     window.__current_doc = doc;
 
-    // v0.9.49: ALL phases now yield via requestAnimationFrame.
-    // Previously Phase 1 ran synchronously (including _syncBucketDropdown
-    // which rebuilds the buckets table + dropdown) and blocked the main
-    // thread for 100-200ms on every SSE push. Now Phase 1 also yields,
-    // so the browser can handle scroll/touch between every phase.
+    // v0.9.73: replace back-to-back requestAnimationFrame with setTimeout(0)
+    // so the browser can process queued input events (scroll, click, touch)
+    // BETWEEN phases. The previous pattern scheduled 6 rAFs in quick
+    // succession; rAFs fire before paint but DON'T yield to input events
+    // between themselves, so a single SSE push could lock scroll/select
+    // for 6 consecutive frames (≈100ms+) even with the v0.9.49 phase split.
+    //
+    // setTimeout(0) yields to the event loop, letting the browser handle
+    // any pending input first. We use the same `if (doc !== window.__current_doc)
+    // return;` stale-guard pattern as before so a newer SSE push supersedes
+    // pending phases from an older one.
+    function _next(fn) { setTimeout(function () { if (doc !== window.__current_doc) return; fn(); }, 0); }
 
-    // Phase 1: lightweight state updates (no DOM work)
+    // Phase 1: lightweight state updates (no DOM work) — runs synchronously,
+    // very cheap (just object assignment).
     if (doc.now_mono) SERVER_NOW_MONO = doc.now_mono;
     state.metricByBucket = doc.metric_by_bucket || {};
     if (!state.bucketLive) state.bucketLive = {};
@@ -1372,51 +1387,53 @@
     _fetchAndApplyLabels();
 
     // Phase 1b: DOM-heavy state updates (bucket dropdown, tags) — yield first
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _syncBucketDropdown(doc);
       _updateBucketTags();
     });
 
-    // Phase 2a: build/system/tunables panels — yield
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
-      _safeRender('log_window', function() { renderLogWindow(doc); });
-      _safeRender('build', function() { renderBuild(doc.build || {}); });
-      _safeRender('system', function() { renderSystem(doc.system || {}); });
-      _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
+    // Phase 2a: build/system/tunables panels — yield + MEMOIZE.
+    // These panels rarely change; skipping re-render when the input data hash
+    // matches saves 50-100ms of DOM teardown/rebuild per SSE push.
+    _next(function() {
+      _memoRender('log_window', doc.log_window || {}, function() { renderLogWindow(doc); });
+      _memoRender('build', doc.build || {}, function() { renderBuild(doc.build || {}); });
+      _memoRender('system', doc.system || {}, function() { renderSystem(doc.system || {}); });
+      _memoRender('tunables', doc.tunables || [], function() { renderTunables(doc.tunables || []); });
     });
 
     // Phase 2b: bucket-specific panels + health — yield
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
       _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
       renderRouteHealth(doc);
       renderOriginHealth(doc);
-      renderServiceHealth(doc);
+      // v0.9.73: service_health changes at most once per 5 min — defer to idle.
+      _ric(function() {
+        if (doc !== window.__current_doc) return; // stale
+        _memoRender('service_health', doc.service_health || {}, function() {
+          renderServiceHealth(doc);
+        });
+      });
       // v0.9.40: hide the loading overlay after Phase 2 (HTML panels visible)
       _hideLoadingOverlay();
     });
 
     // Phase 3: heavy chart renders — yield between each chart
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _renderFilteredPanels(doc);
       _safeRender('swaps', function() { renderSwaps(); });
     });
 
     // Phase 4: remaining charts
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _safeRender('score-now', function() { renderScoreNow(); });
       if ($("range")) {
         _safeRender('bucket_chart', function() { renderBucket(); });
       }
     });
 
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _safeRender('div', function() { renderDivChart("div", ""); });
       _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
     });
@@ -1669,6 +1686,38 @@
   var _renderPending = false;
   var _lastRenderTs = 0;
   var _pendingDoc = null;
+
+  // v0.9.73: per-panel memoization for rarely-changing panels.
+  // The previous code re-rendered build/system/tunables/service_health
+  // on EVERY 30s SSE push even though they change at most once per
+  // session (build) or every few minutes (system uptime tick).
+  // Each re-render does a full innerHTML teardown + rebuild, which is
+  // the #1 cause of scroll/select freeze during SSE pushes.
+  // We compute a cheap JSON hash of the panel's input data; if the
+  // hash matches the previous render, we skip the DOM work entirely.
+  var _panelHash = {};
+  function _panelUnchanged(label, data) {
+    try {
+      var h = JSON.stringify(data);
+      if (_panelHash[label] === h) return true;
+      _panelHash[label] = h;
+    } catch (e) { /* unhashable — always render */ }
+    return false;
+  }
+  function _memoRender(label, data, fn) {
+    if (_panelUnchanged(label, data)) return;
+    _safeRender(label, fn);
+  }
+
+  // v0.9.73: requestIdleCallback with setTimeout fallback.
+  // For non-critical panels (build, system, tunables, service_health)
+  // we defer the render to idle time so the browser can paint the
+  // critical panels first and process any queued input events.
+  // Browsers without requestIdleCallback fall back to setTimeout(0),
+  // which still yields to the event loop between renders.
+  var _ric = (typeof requestIdleCallback === 'function')
+    ? function (fn) { return requestIdleCallback(fn, { timeout: 2000 }); }
+    : function (fn) { return setTimeout(fn, 0); };
 
   function mk(id, cfg) {
     var cv = $(id);
@@ -2461,14 +2510,19 @@
       if (hasV4) {
         var v4NoData = r.v4_has_data === false;
         var v4HealthClass = v4NoData ? "" : ((r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good");
-        html += '<span class="route-metric' + (v4HealthClass === 'good' ? '' : '') + '" style="' +
+        // v0.9.73: fix no-op ternary that was always emitting "" for both
+        // branches, so the route-metric span never received a "good"/"degraded"
+        // color tint. The RTT/loss numbers still showed but without the
+        // visual health cue the user could not tell at a glance which rows
+        // were degraded.
+        html += '<span class="route-metric ' + (v4NoData ? '' : v4HealthClass) + '" style="' +
           (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
           (v4NoData ? 'v4: <i style="opacity:0.5">no data</i>' : 'v4: <b>' + v4Rtt + '</b>ms <b>' + v4Loss + '%</b>') + '</span>';
       }
       if (hasV6) {
         var v6NoData = r.v6_has_data === false;
         var v6HealthClass = v6NoData ? "" : ((r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good");
-        html += '<span class="route-metric" style="' +
+        html += '<span class="route-metric ' + (v6NoData ? '' : v6HealthClass) + '" style="' +
           (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
           (v6NoData ? 'v6: <i style="opacity:0.5">no data</i>' : 'v6: <b>' + v6Rtt + '</b>ms <b>' + v6Loss + '%</b>') + '</span>';
       }

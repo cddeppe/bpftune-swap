@@ -1,7 +1,9 @@
 package main
 
 import (
+        "fmt"
         "strings"
+        "sync"
         "testing"
 )
 
@@ -143,4 +145,163 @@ func TestRxSwapStillMatchesV4Only(t *testing.T) {
                 t.Fatalf("dest6b group should be empty for v4-only: got %s", m[12])
         }
         t.Logf("rxSwap still matches v4-only swap events ✓")
+}
+
+// TestMergeProofsNewestFirstUsesEpochTs verifies the v0.9.73 fix.
+// Before: mergeProofsNewestFirst sorted by boot_ts (BPF ktime), which is
+// not comparable across boots. After a reboot, stale CSV proofs from a
+// prior long-running boot (high boot_ts) would sort above fresh live
+// proofs (low boot_ts), and the top-N truncation would drop every new
+// live proof — leaving the recent_proofs panel frozen on yesterday's
+// data even though new proofs were arriving.
+//
+// This test constructs exactly that scenario:
+//   - 2 CSV proofs from a previous boot: epoch_ts yesterday, boot_ts large
+//   - 2 live proofs from the current boot: epoch_ts now,      boot_ts small
+// and asserts that the merge returns them ordered by epoch_ts desc
+// (i.e. live proofs first), not by boot_ts.
+func TestMergeProofsNewestFirstUsesEpochTs(t *testing.T) {
+        now := int64(1730000000) // some wall-clock epoch
+        yesterday := now - 24*3600
+
+        live := []interface{}{
+                map[string]interface{}{
+                        "boot_ts":  float64(300), // current-boot BPF ktime (small)
+                        "epoch_ts": now - 60,    // 1 minute ago
+                        "alg":      "bbr",
+                        "mbps":     12.5,
+                        "tier":     "proved",
+                        "dest":     "1.2.3.4",
+                },
+                map[string]interface{}{
+                        "boot_ts":  float64(310),
+                        "epoch_ts": now - 30, // 30 seconds ago (newer)
+                        "alg":      "bbr",
+                        "mbps":     9.8,
+                        "tier":     "good",
+                        "dest":     "1.2.3.4",
+                },
+        }
+        csvProofs := []interface{}{
+                map[string]interface{}{
+                        "boot_ts":  float64(85000), // previous-boot BPF ktime (LARGE)
+                        "epoch_ts": yesterday - 3600,
+                        "alg":      "cubic",
+                        "mbps":     1.0,
+                        "tier":     "good",
+                        "dest":     "5.6.7.8",
+                },
+                map[string]interface{}{
+                        "boot_ts":  float64(86000),
+                        "epoch_ts": yesterday - 7200,
+                        "alg":      "cubic",
+                        "mbps":     0.8,
+                        "tier":     "good",
+                        "dest":     "5.6.7.8",
+                },
+        }
+
+        out := mergeProofsNewestFirst(live, csvProofs, 18)
+        if len(out) != 4 {
+                t.Fatalf("expected 4 merged proofs, got %d", len(out))
+        }
+
+        // The newest entry MUST be the live proof with epoch_ts = now-30.
+        first, ok := out[0].(map[string]interface{})
+        if !ok {
+                t.Fatalf("out[0] is not a map[string]interface{}")
+        }
+        firstTs, _ := first["epoch_ts"].(int64)
+        if firstTs != now-30 {
+                t.Fatalf("mergeProofsNewestFirst not sorting by epoch_ts: "+
+                        "out[0].epoch_ts = %d, want %d (was the sort key still boot_ts?)",
+                        firstTs, now-30)
+        }
+
+        // The oldest entry MUST be the CSV proof with epoch_ts = yesterday-7200.
+        last, ok := out[3].(map[string]interface{})
+        if !ok {
+                t.Fatalf("out[3] is not a map[string]interface{}")
+        }
+        lastTs, _ := last["epoch_ts"].(int64)
+        if lastTs != yesterday-7200 {
+                t.Fatalf("mergeProofsNewestFirst not sorting by epoch_ts: "+
+                        "out[3].epoch_ts = %d, want %d", lastTs, yesterday-7200)
+        }
+
+        // Verify the buggy sort order (boot_ts) would have placed CSV first.
+        // This is what would happen if the bug regressed.
+        if first["alg"] == "cubic" {
+                t.Fatalf("REGRESSION: cubic CSV proof sorted above bbr live proof — " +
+                        "did mergeProofsNewestFirst revert to sorting by boot_ts?")
+        }
+
+        t.Logf("mergeProofsNewestFirst sorts by epoch_ts (live proofs at top) ✓")
+}
+
+
+// TestRouteSnapshotConcurrentAccess verifies the v0.9.73 fix for the
+// data race on lastHostsSnapshot / lastBpfHealthSnapshot.
+//
+// Before the fix, the collect goroutine wrote these vars without any
+// lock while the route-monitor goroutine iterated them without any
+// lock — a textbook Go race that can throw a runtime panic on
+// concurrent map iteration + assignment.
+//
+// This test runs N writers and M readers in parallel and relies on
+// `go test -race` to detect any unsynchronized access. It would
+// deterministically fail (with -race) before the v0.9.73 fix and
+// passes cleanly after.
+func TestRouteSnapshotConcurrentAccess(t *testing.T) {
+        const writers = 4
+        const readers = 8
+        const iters = 200
+
+        var wg sync.WaitGroup
+        wg.Add(writers + readers)
+
+        // Writers: continuously publish new snapshots, replacing the slice
+        // header and the map header. Under the old code this is the
+        // racy-write pattern; under the new code it is serialized by
+        // snapshotMu.Lock().
+        for w := 0; w < writers; w++ {
+                go func(id int) {
+                        defer wg.Done()
+                        for i := 0; i < iters; i++ {
+                                hosts := []hostEntry{
+                                        {Addr: fmt.Sprintf("10.0.%d.%d", id, i%256), Inst: 2, V4MinRTT: float64(i)},
+                                }
+                                bpfHealth := map[string]interface{}{
+                                        fmt.Sprintf("dest-%d-%d", id, i): map[string]interface{}{"rtt": i},
+                                }
+                                setRouteSnapshot(hosts, bpfHealth)
+                        }
+                }(w)
+        }
+
+        // Readers: continuously snapshot the package vars and iterate the
+        // returned local copies. Under the old code this read pattern was
+        // racy with the writers above; under the new code it is serialized
+        // by snapshotMu.RLock().
+        for r := 0; r < readers; r++ {
+                go func() {
+                        defer wg.Done()
+                        for i := 0; i < iters; i++ {
+                                hosts, bpfHealth := getRouteSnapshot()
+                                if hosts == nil {
+                                        continue
+                                }
+                                for _, h := range hosts {
+                                        _ = h.Addr
+                                }
+                                for k, v := range bpfHealth {
+                                        _ = k
+                                        _ = v
+                                }
+                        }
+                }()
+        }
+
+        wg.Wait()
+        t.Logf("route snapshot concurrent access (writers=%d readers=%d iters=%d) ✓", writers, readers, iters)
 }

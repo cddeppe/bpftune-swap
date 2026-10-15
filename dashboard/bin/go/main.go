@@ -692,13 +692,27 @@ func main() {
         go collector.renderSlowToDisk() // v0.7.5n: async
 
         // Collection loop (every 30s)
+        // v0.9.73: add recover() — without it, ANY panic in collect() (nil map
+        // deref, type assertion failure, out-of-bounds metric slot) silently
+        // kills this goroutine. The HTTP server keeps serving the last
+        // c.current snapshot forever; SSE deltas stop entirely; the dashboard
+        // freezes at last-known state with no log entry explaining why.
+        // Mirrors the recover() pattern already used in
+        // loadCSVTailIntoRingBuffer (csv_reader.go).
         go func() {
                 ticker := time.NewTicker(collectorMode.CollectInterval)
                 defer ticker.Stop()
                 for range ticker.C {
-                        collector.collect()
-                        // COL-002: refresh sentinel so Python renderer knows we're alive
-                        _ = os.WriteFile("/var/run/bpftune-collector-go.active", []byte("1\n"), 0644)
+                        func() {
+                                defer func() {
+                                        if r := recover(); r != nil {
+                                                fmt.Fprintf(os.Stderr, "collector: collect() PANICKED: %v\n%s\n", r, debug.Stack())
+                                        }
+                                }()
+                                collector.collect()
+                                // COL-002: refresh sentinel so Python renderer knows we're alive
+                                _ = os.WriteFile("/var/run/bpftune-collector-go.active", []byte("1\n"), 0644)
+                        }()
                 }
         }()
 

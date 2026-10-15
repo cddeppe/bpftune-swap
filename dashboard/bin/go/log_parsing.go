@@ -186,10 +186,25 @@ func buildLogPanels(swaps []swapRow,
         }
         topProofsSlice := lastN(allProofs, 18)
         // v0.9.13: MERGE live + CSV instead of replacing.
+        // v0.9.73: add 24h cutoff mirroring the swaps fallback above.
+        // Without it, days-old CSV proofs can populate the panel and (combined
+        // with the now-fixed boot_ts sort bug) hide the fact that no new proofs
+        // are arriving.
         if len(topProofsSlice) < 18 {
-                csvProofs := readRecentProofsFromCSV(18)
+                csvProofs := readRecentProofsFromCSV(50)
                 if len(csvProofs) > 0 {
-                        topProofsSlice = mergeProofsNewestFirst(topProofsSlice, csvProofs, 18)
+                        var recentCsvProofs []interface{}
+                        cutoff := now - 24*3600
+                        for _, p := range csvProofs {
+                                if m, ok := p.(map[string]interface{}); ok {
+                                        if ts, ok := m["epoch_ts"].(int64); ok && ts >= cutoff {
+                                                recentCsvProofs = append(recentCsvProofs, p)
+                                        }
+                                }
+                        }
+                        if len(recentCsvProofs) > 0 {
+                                topProofsSlice = mergeProofsNewestFirst(topProofsSlice, recentCsvProofs, 18)
+                        }
                 }
         }
         topProofs = topProofsSlice
@@ -1088,15 +1103,32 @@ func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
 }
 
 // mergeProofsNewestFirst merges two newest-first proof lists, deduplicates
-// by boot_ts+alg, and returns the top N newest entries.
+// by epoch_ts+alg, and returns the top N newest entries.
+//
+// v0.9.73: BUGFIX — port the v0.9.61 fix from mergeSwapsNewestFirst.
+// Previously sorted by boot_ts (BPF ktime), which is NOT comparable across
+// boots: after a reboot, CSV proofs from the previous long-running boot have
+// large ktime values (50000+) while current-boot live proofs have small
+// ktime values (200-1000). The buggy sort placed stale CSV proofs above
+// fresh live proofs; the top-18 truncation then dropped every new live
+// proof, leaving the recent_proofs panel frozen on yesterday's data.
+// epoch_ts (wall-clock) is always comparable, so we sort by it instead.
+// Both producers already emit epoch_ts (singlepass.go:GetProofRows and
+// csv_fallback.go:readRecentProofsFromCSV).
 func mergeProofsNewestFirst(live, csv []interface{}, n int) []interface{} {
         seen := make(map[string]bool)
         var merged []interface{}
+        getEpochTs := func(m map[string]interface{}) int64 {
+                if ts, ok := m["epoch_ts"].(int64); ok && ts > 0 {
+                        return ts
+                }
+                return 0
+        }
         add := func(row interface{}) {
                 if m, ok := row.(map[string]interface{}); ok {
-                        ts, _ := m["boot_ts"].(float64)
+                        ts := getEpochTs(m)
                         alg, _ := m["alg"].(string)
-                        key := fmt.Sprintf("%.3f:%s", ts, alg)
+                        key := fmt.Sprintf("%d:%s", ts, alg)
                         if !seen[key] {
                                 seen[key] = true
                                 merged = append(merged, row)
@@ -1109,9 +1141,10 @@ func mergeProofsNewestFirst(live, csv []interface{}, n int) []interface{} {
         for _, r := range csv {
                 add(r)
         }
+        // Sort by epoch_ts descending (newest first)
         sort.Slice(merged, func(i, j int) bool {
-                ti, _ := merged[i].(map[string]interface{})["boot_ts"].(float64)
-                tj, _ := merged[j].(map[string]interface{})["boot_ts"].(float64)
+                ti := getEpochTs(merged[i].(map[string]interface{}))
+                tj := getEpochTs(merged[j].(map[string]interface{}))
                 return ti > tj
         })
         if len(merged) > n {

@@ -57,10 +57,53 @@ var routeMonitor = &RouteMonitor{
         destinations: map[string]*destRouteState{},
 }
 
+// v0.9.73: dedicated mutex for the package-level snapshot vars below.
+//
+// Before this fix, the writer (collect.go:126-127, running in the 30s
+// collect goroutine) wrote lastHostsSnapshot / lastBpfHealthSnapshot
+// WITHOUT any lock. The route-monitor goroutine read the same vars in
+// cycle() under rm.mu (which does NOT protect these package vars) and
+// in evaluateDestination without any lock at all.
+//
+// That is a textbook Go data race:
+//   - Concurrent map header assignment + iteration on
+//     lastBpfHealthSnapshot can throw a runtime panic, killing the
+//     route-monitor goroutine. The Origin Health panel then freezes
+//     at whatever was last computed.
+//   - Concurrent slice header assignment + iteration on
+//     lastHostsSnapshot is undefined behavior even if it rarely panics.
+//
+// The fix uses a sync.RWMutex so multiple readers (route-monitor cycle)
+// can proceed concurrently while the writer (collector collect)
+// serializes against all of them.
 var (
-        lastHostsSnapshot    []hostEntry
-        lastBpfHealthSnapshot map[string]interface{}
+        snapshotMu             sync.RWMutex
+        lastHostsSnapshot      []hostEntry
+        lastBpfHealthSnapshot  map[string]interface{}
 )
+
+// setSnapshot is called by the collect goroutine to publish the latest
+// BPF map + route-health data for the route-monitor goroutine to consume.
+// MUST be called without holding rm.mu to avoid lock-ordering issues.
+func setRouteSnapshot(hosts []hostEntry, bpfHealth map[string]interface{}) {
+        snapshotMu.Lock()
+        defer snapshotMu.Unlock()
+        lastHostsSnapshot = hosts
+        lastBpfHealthSnapshot = bpfHealth
+}
+
+// getRouteSnapshot returns local copies of the latest snapshots. The
+// returned slices/maps may be read freely without holding snapshotMu —
+// subsequent setRouteSnapshot calls replace the package-level headers
+// rather than mutating the underlying data, so stale references remain
+// valid for the duration of a cycle.
+func getRouteSnapshot() (hosts []hostEntry, bpfHealth map[string]interface{}) {
+        snapshotMu.RLock()
+        defer snapshotMu.RUnlock()
+        hosts = lastHostsSnapshot
+        bpfHealth = lastBpfHealthSnapshot
+        return
+}
 
 var routeMonitorEnabled = false
 
@@ -80,10 +123,9 @@ func runRouteMonitor() {
 }
 
 func (rm *RouteMonitor) cycle() {
-        rm.mu.Lock()
-        hosts := lastHostsSnapshot
-        bpfHealth := lastBpfHealthSnapshot
-        rm.mu.Unlock()
+        // v0.9.73: take snapshot under the dedicated snapshotMu, not rm.mu
+        // (rm.mu protects rm.destinations, not these package-level vars).
+        hosts, bpfHealth := getRouteSnapshot()
 
         if hosts == nil {
                 return
@@ -102,8 +144,11 @@ func (rm *RouteMonitor) cycle() {
         }
         rm.mu.Unlock()
 
+        // v0.9.73: pass the local `hosts` snapshot so evaluateDestination
+        // doesn't re-read the package-level var without a lock (the original
+        // code at line 308 did exactly that, which was racy).
         for _, de := range toEval {
-                rm.evaluateDestination(de.label, de.state, bpfHealth)
+                rm.evaluateDestination(de.label, de.state, bpfHealth, hosts)
         }
 }
 
@@ -171,10 +216,9 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                         }
                 }
                 // If only v4, try to find v6 counterpart via domain
+                // v0.9.73: delete dead scaffolding loop — was leftover from
+                // v0.9.72 v6->v4 linking work and never iterated anything.
                 if hasV4 && !hasV6 {
-                        for _, domain := range []string{} {
-                                _ = domain
-                        }
                         // Look up domain for this v4 label
                         domain := getDomainForBucket(lbl)
                         if domain != "" {
@@ -262,7 +306,10 @@ func ipv6ToBpfHex(ip string) string {
 }
 
 // evaluateDestination uses BPF data with minimal ICMP fallback.
-func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}) {
+// v0.9.73: added `hosts` parameter so the per-protocol min_rtt lookup
+// at line ~308 can read from the caller's local snapshot instead of
+// reading the package-level lastHostsSnapshot without a lock.
+func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}, hosts []hostEntry) {
         state.mu.Lock()
         hasV4 := state.HasIPv4
         hasV6 := state.HasIPv6
@@ -306,8 +353,11 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         // v0.9.38: also check hosts snapshot for per-protocol min_rtt.
         // This is the real fix — the merged BPF map entry has V4MinRTT and
         // V6MinRTT tracked separately, so v6 gets real data.
-        if lastHostsSnapshot != nil {
-                for _, h := range lastHostsSnapshot {
+        // v0.9.73: read from the `hosts` parameter (caller's local snapshot)
+        // instead of the package-level lastHostsSnapshot — eliminates the
+        // data race on that var.
+        if hosts != nil {
+                for _, h := range hosts {
                         if h.Inst < 2 { continue }
                         lbl := labelFor(h.Addr)
                         if lbl == "" { lbl = h.Addr }

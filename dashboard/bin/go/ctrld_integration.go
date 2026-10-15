@@ -139,8 +139,15 @@ func getDomainForIP(ip string) string {
 }
 
 // getDomainForBucket returns the domain name for a bucket IP prefix.
-// The bucket is a /16 masked IP (e.g. "142.250.0.0"). We check if any
-// IP in the DNS cache falls within this /16 and return the domain.
+// The bucket is a /16 masked IPv4 (e.g. "142.250.0.0") or an IPv6 prefix
+// of the form "v6:<hex-prefix>" (e.g. "v6:26061a40"). We check if any
+// IP in the DNS cache falls within the prefix and return the domain.
+//
+// v0.9.73: port the IPv6 prefix logic from the JS-side
+// getDomainForBucketDisplay (dashboard.js:122-134) — without this, the
+// v0.9.72 v6->v4 linking branch in route_monitor.go:194-206 was
+// unreachable for v6-only labels, leaving them stranded with no
+// domain enrichment.
 func getDomainForBucket(bucketAddr string) string {
         ctrldState.mu.RLock()
         defer ctrldState.mu.RUnlock()
@@ -153,20 +160,38 @@ func getDomainForBucket(bucketAddr string) string {
                 return domain
         }
 
-        // For /16 masked IPs like "142.250.0.0", check if any cached IP
-        // matches the first two octets
-        parts := strings.Split(bucketAddr, ".")
-        if len(parts) != 4 {
-                // Not a v4 address (could be "v6:..." or a label)
+        // IPv4 /16 path
+        if strings.Count(bucketAddr, ".") == 3 && !strings.HasPrefix(bucketAddr, "v6:") {
+                parts := strings.Split(bucketAddr, ".")
+                if len(parts) == 4 {
+                        prefix := parts[0] + "." + parts[1] + "."
+                        for ip, domain := range ctrldState.ipToDomain {
+                                if strings.HasPrefix(ip, prefix) {
+                                        return domain
+                                }
+                        }
+                }
                 return ""
         }
-        prefix := parts[0] + "." + parts[1] + "."
 
-        // Scan the cache for a matching IP
-        for ip, domain := range ctrldState.ipToDomain {
-                if strings.HasPrefix(ip, prefix) {
-                        return domain
+        // IPv6 prefix path: bucket labels are of the form "v6:<hex>" where
+        // <hex> is the leading hex digits of the IPv6 address (no colons,
+        // lowercase). The cached IPv6 strings are the full canonical form
+        // (e.g. "2606:1a40:..."). To compare, strip colons from the cached
+        // IP and match the hex prefix.
+        if strings.HasPrefix(bucketAddr, "v6:") {
+                hexPrefix := strings.TrimPrefix(bucketAddr, "v6:")
+                hexPrefix = strings.ToLower(hexPrefix)
+                for ip, domain := range ctrldState.ipToDomain {
+                        if !strings.Contains(ip, ":") {
+                                continue // skip v4 entries
+                        }
+                        compact := strings.ToLower(strings.ReplaceAll(ip, ":", ""))
+                        if strings.HasPrefix(compact, hexPrefix) {
+                                return domain
+                        }
                 }
+                return ""
         }
 
         return ""
