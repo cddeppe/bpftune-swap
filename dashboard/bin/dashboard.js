@@ -99,40 +99,11 @@
     return (row.ts || 0) + monoOffset;
   }
 
-  // v0.9.68: Look up domain name from ctrld DNS cache for a bucket IP.
-  // v0.9.70: Fixed IPv6 matching — BPF stores v6 as "v6:hexprefix" but
-  // ctrld_domains has full IPv6 addresses like "2606:1a40:3::1".
+  // v0.9.81: getDomainForBucketDisplay removed (ctrld integration was deleted).
+  // Was used to show domain names from the ctrld DNS cache in the Route Health
+  // and Origin Health panels. Returns "" now — domain resolution via aliases
+  // file (labelFor) still works for manually-labeled destinations.
   function getDomainForBucketDisplay(bucketAddr) {
-    var domains = window.__current_doc && window.__current_doc.ctrld_domains;
-    if (!domains) return "";
-
-    // Try exact match first
-    if (domains[bucketAddr]) return domains[bucketAddr];
-
-    // IPv4: /16 masked IPs like "142.250.0.0" — match first two octets
-    var parts = bucketAddr.split(".");
-    if (parts.length === 4) {
-      var prefix = parts[0] + "." + parts[1] + ".";
-      for (var ip in domains) {
-        if (ip.indexOf(prefix) === 0) return domains[ip];
-      }
-      return "";
-    }
-
-    // IPv6: BPF stores as "v6:hexprefix" (first 4 bytes in hex, e.g. "v6:26061a40")
-    // ctrld_domains has full IPv6 like "2606:1a40:3::1"
-    // Convert: "v6:26061a40" → "2606:1a40:" prefix → match against ctrld IPs
-    if (bucketAddr.indexOf("v6:") === 0) {
-      var hex = bucketAddr.substring(3); // "26061a40"
-      if (hex.length >= 8) {
-        // Build IPv6 prefix: "2606:1a40:"
-        var v6Prefix = hex.substring(0,4) + ":" + hex.substring(4,8) + ":";
-        for (var ip in domains) {
-          if (ip.indexOf(v6Prefix) === 0) return domains[ip];
-        }
-      }
-    }
-
     return "";
   }
 
@@ -408,15 +379,9 @@
         cell = '<td class="mono"><span class="covbar"><i style="width:' +
                pct.toFixed(0) + '%"></i></span>' + pct.toFixed(0) + '%</td>';
       }
-      // v0.9.68: show domain name from ctrld DNS cache if available
+      // v0.9.81: ctrld domain display removed (integration deleted).
+      // Domain resolution now happens only via the aliases file (labelFor).
       var destDisplay = esc(shortAddr(r.dest));
-      var sh = window.__current_doc && window.__current_doc.service_health;
-      if (sh && sh.ctrld_available) {
-        var domain = getDomainForBucketDisplay(r.dest);
-        if (domain) {
-          destDisplay = '<span style="color:var(--good)">' + esc(domain) + '</span> <span class="dim">' + destDisplay + '</span>';
-        }
-      }
       html += '<tr>' +
         '<td class="mono name">' + destDisplay + '</td>' +
         '<td class="mono">' + fmtN(r.inst) + '</td>' +
@@ -1407,7 +1372,7 @@
       _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
       _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
       renderRouteHealth(doc);
-      renderOriginHealth(doc);
+      // v0.9.81: Origin Health panel removed (was renderOriginHealth here).
       // v0.9.73: service_health changes at most once per 5 min — defer to idle.
       _ric(function() {
         if (doc !== window.__current_doc) return; // stale
@@ -2431,165 +2396,6 @@
     setHTML("lv-route-health", html);
   }
 
-  // v0.9.33: Origin Health panel — shows ALL route_monitor destinations
-  // (not filtered by bucket). Displays top incoming traffic destinations
-  // with their IPv4/IPv6 health comparison.
-  function renderOriginHealth(doc) {
-    var el = $("lv-origin-health");
-    if (!el) return;
-    if (!doc) return;
-
-    var rm = doc.route_monitor;
-    if (!rm || !rm.length) {
-      setHTML("lv-origin-health", '<div class="placeholder">(discovering destinations&hellip;)</div>');
-      return;
-    }
-
-    // v0.9.80: Sort by DATA presence first (entries with v4 or v6 RTT data
-    // show before "no data" entries), then dual-stack first, then by label.
-    // Previously sorted dual-stack first then by label — but with a 10-entry
-    // limit, the v6-only entries (like 2a00:1450::, 2001:4860::, 2603:c020::)
-    // were sorted to the bottom and cut off, making it look like "IPv6 is
-    // missing" when the v6 buckets actually existed in the BPF map.
-    var sorted = rm.slice().sort(function(a, b) {
-      var aHas = (a.v4_has_data !== false && a.v4_rtt_ms > 0) ||
-                 (a.v6_has_data !== false && a.v6_rtt_ms > 0) ||
-                 (a.v4_in_rtt_ms > 0) || (a.v4_out_rtt_ms > 0) ||
-                 (a.v6_in_rtt_ms > 0) || (a.v6_out_rtt_ms > 0);
-      var bHas = (b.v4_has_data !== false && b.v4_rtt_ms > 0) ||
-                 (b.v6_has_data !== false && b.v6_rtt_ms > 0) ||
-                 (b.v4_in_rtt_ms > 0) || (b.v4_out_rtt_ms > 0) ||
-                 (b.v6_in_rtt_ms > 0) || (b.v6_out_rtt_ms > 0);
-      if (aHas !== bHas) return aHas ? -1 : 1;
-      var aDual = (a.has_ipv4 && a.has_ipv6) ? 0 : 1;
-      var bDual = (b.has_ipv4 && b.has_ipv6) ? 0 : 1;
-      if (aDual !== bDual) return aDual - bDual;
-      return (a.label || "").localeCompare(b.label || "");
-    });
-
-    // v0.9.80: show up to 25 (was 10) so v6-only entries aren't cut off.
-    var shown = sorted.slice(0, 25);
-
-    var html = '<div class="route-health origin-grid">';
-    shown.forEach(function(r) {
-      var label = r.label || "?";
-      // v0.9.71: show domain from ctrld DNS cache for origin IPs
-      if (r.domain) {
-        label = r.domain + ' (' + label + ')';
-      }
-      var hasV4 = r.has_ipv4;
-      var hasV6 = r.has_ipv6;
-      var preferred = r.preferred || "";
-
-      // Build compact row showing both protocols side by side
-      // v0.9.37: use has_data flags to show "no data" instead of "0.0ms 100%"
-      // v0.9.78: split each protocol into incoming (↓) + outgoing (↑)
-      // directions so the user can see which side actually has traffic.
-      // The Origin Health panel is conceptually about INCOMING traffic,
-      // but we show both directions because the user wants to verify
-      // whether a peer is sending them data or only receiving it.
-      function dirRtt(proto, dir) {
-        var rttKey = proto + '_' + dir + '_rtt_ms';
-        var hasKey = proto + '_' + dir + '_has_data';
-        if (r[hasKey] === false || r[rttKey] == null || r[rttKey] === 0) {
-          return '<i style="opacity:0.4">—</i>';
-        }
-        return '<b>' + r[rttKey].toFixed(1) + '</b>ms';
-      }
-      // Fall back to combined RTT (for older collectors without v0.9.78 fields)
-      function combinedRtt(proto) {
-        if (r[proto + '_has_data'] === false) return '<i style="opacity:0.4">—</i>';
-        var v = r[proto + '_rtt_ms'];
-        return v != null ? '<b>' + v.toFixed(1) + '</b>ms' : '<i style="opacity:0.4">—</i>';
-      }
-      var hasV4In  = r.v4_in_has_data  === true;
-      var hasV4Out = r.v4_out_has_data === true;
-      var hasV6In  = r.v6_in_has_data  === true;
-      var hasV6Out = r.v6_out_has_data === true;
-      // v0.9.79: only use the split-direction display when at least ONE
-      // direction actually has data. v0.9.78 checked `r.v4_in_rtt_ms != null`
-      // which was always true (the field is always populated, as 0 when no
-      // data), so the panel ALWAYS used the split-direction display and
-      // showed "—" for every direction on peers where the log didn't have
-      // per-direction RTT. Now we fall back to the combined single-metric
-      // display (which uses the BPF map's min_rtt as fallback) when no
-      // per-direction data is available — restoring v0.9.77's behavior
-      // for those peers while keeping the direction split for peers that
-      // do have log-parsed per-direction RTT.
-      var usingSplitDirs = (r.v4_in_rtt_ms > 0 || r.v4_out_rtt_ms > 0 ||
-                            r.v6_in_rtt_ms > 0 || r.v6_out_rtt_ms > 0);
-
-      // Determine which protocol is better (lower RTT + loss wins)
-      // v0.9.37: skip comparison if either has no data
-      var betterProto = "";
-      if (hasV4 && hasV6 && r.v4_has_data !== false && r.v6_has_data !== false) {
-        var v4Score = (r.v4_loss_pct || 0) * 10 + (r.v4_rtt_ms || 999);
-        var v6Score = (r.v6_loss_pct || 0) * 10 + (r.v6_rtt_ms || 999);
-        if (v4Score < v6Score) betterProto = "v4";
-        else if (v6Score < v4Score) betterProto = "v6";
-      }
-
-      // Highlight the preferred/better protocol
-      var v4Class = betterProto === "v4" ? "good" : "";
-      var v6Class = betterProto === "v6" ? "good" : "";
-
-      var protoBadge = hasV4 && hasV6 ? 'dual' : (hasV6 ? 'ipv6' : 'ipv4');
-
-      var preferredBadge = "";
-      if (preferred === "ipv4") preferredBadge = ' <span style="color:#4285f4;font-size:9px">◄ pref</span>';
-      if (preferred === "ipv6") preferredBadge = ' <span style="color:#34a853;font-size:9px">◄ pref</span>';
-
-      html += '<div class="route-row" style="flex-wrap:wrap;">' +
-        '<span class="route-proto ' + protoBadge + '">' + esc(protoBadge) + '</span>' +
-        '<span style="min-width:80px;color:var(--fg);font-weight:600;">' + esc(label) + preferredBadge + '</span>';
-
-      // v0.9.78: render each protocol with BOTH directions (↓ incoming + ↑ outgoing).
-      // The down-arrow (↓) shows traffic flowing IN to this host (remote peer
-      // initiated). The up-arrow (↑) shows traffic flowing OUT from this host
-      // (this host initiated). "—" means no measured RTT for that direction.
-      // For older collectors that don't ship v0.9.78 fields, fall back to a
-      // single combined v4/v6 metric (no direction split).
-      if (hasV4) {
-        if (usingSplitDirs) {
-          html += '<span class="route-metric ' + v4Class + '" style="' +
-            (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
-            'v4↓ ' + dirRtt('v4','in') + ' &nbsp; v4↑ ' + dirRtt('v4','out') + '</span>';
-        } else {
-          var v4NoData = r.v4_has_data === false;
-          var v4HealthClass = v4NoData ? "" : ((r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good");
-          html += '<span class="route-metric ' + (v4NoData ? '' : v4HealthClass) + '" style="' +
-            (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
-            'v4: ' + (v4NoData ? '<i style="opacity:0.5">no data</i>' : combinedRtt('v4') + ' <b>' + (r.v4_loss_pct != null ? r.v4_loss_pct.toFixed(1) : '—') + '%</b>') + '</span>';
-        }
-      }
-      if (hasV6) {
-        if (usingSplitDirs) {
-          html += '<span class="route-metric ' + v6Class + '" style="' +
-            (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
-            'v6↓ ' + dirRtt('v6','in') + ' &nbsp; v6↑ ' + dirRtt('v6','out') + '</span>';
-        } else {
-          var v6NoData = r.v6_has_data === false;
-          var v6HealthClass = v6NoData ? "" : ((r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good");
-          html += '<span class="route-metric ' + (v6NoData ? '' : v6HealthClass) + '" style="' +
-            (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
-            'v6: ' + (v6NoData ? '<i style="opacity:0.5">no data</i>' : combinedRtt('v6') + ' <b>' + (r.v6_loss_pct != null ? r.v6_loss_pct.toFixed(1) : '—') + '%</b>') + '</span>';
-        }
-      }
-      if (!hasV4 && !hasV6) {
-        html += '<span class="route-metric">(no data)</span>';
-      }
-
-      // Show last switch reason if any
-      if (r.last_switch_reason) {
-        html += '<span style="font-size:9px;color:var(--muted-2);width:100%;">' + esc(r.last_switch_reason) + '</span>';
-      }
-
-      html += '</div>';
-    });
-    html += '</div>';
-    setHTML("lv-origin-health", html);
-  }
-
   // v0.9.46: Service Health panel — shows the health of all system
   // components the tuner depends on: BPF programs, bpftune service,
   // trace capture service, log file freshness, explore_pct, trace buffer.
@@ -2613,7 +2419,7 @@
       { label: "Log Freshness", value: sh.log_age + " old", ok: sh.log_fresh_ok },
       { label: "Explore %", value: sh.explore_pct + "%", ok: sh.explore_pct_ok },
       { label: "Trace Buffer", value: (sh.trace_buffer_kb >= 1024 ? Math.round(sh.trace_buffer_kb/1024) + "MB" : sh.trace_buffer_kb + "KB"), ok: sh.trace_buffer_ok },
-      { label: "ctrld DNS", value: sh.ctrld_available ? (sh.ctrld_entry_count + " domains") : "not installed", ok: sh.ctrld_ok },
+      // v0.9.81: "ctrld DNS" service health check removed (integration deleted).
     ];
 
     var allOk = sh.all_ok;
@@ -2936,7 +2742,6 @@ _safeRender("score-now", function() { renderScoreNow(); });
       renderMetricForBucket();
       _safeRender("score-now", function() { renderScoreNow(); });
       renderRouteHealth(window.__current_doc);
-      renderOriginHealth(window.__current_doc);
       renderServiceHealth(window.__current_doc);
     }).catch(function (e) {
       state.bucketDoc = null;
@@ -2944,7 +2749,6 @@ _safeRender("score-now", function() { renderScoreNow(); });
       renderRecentSwapsForBucket();
       renderMetricForBucket();
       renderRouteHealth(window.__current_doc);
-      renderOriginHealth(window.__current_doc);
       renderServiceHealth(window.__current_doc);
     });
   }

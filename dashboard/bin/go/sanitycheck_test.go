@@ -1,9 +1,7 @@
 package main
 
 import (
-        "fmt"
         "strings"
-        "sync"
         "testing"
 )
 
@@ -239,69 +237,3 @@ func TestMergeProofsNewestFirstUsesEpochTs(t *testing.T) {
         t.Logf("mergeProofsNewestFirst sorts by epoch_ts (live proofs at top) ✓")
 }
 
-
-// TestRouteSnapshotConcurrentAccess verifies the v0.9.73 fix for the
-// data race on lastHostsSnapshot / lastBpfHealthSnapshot.
-//
-// Before the fix, the collect goroutine wrote these vars without any
-// lock while the route-monitor goroutine iterated them without any
-// lock — a textbook Go race that can throw a runtime panic on
-// concurrent map iteration + assignment.
-//
-// This test runs N writers and M readers in parallel and relies on
-// `go test -race` to detect any unsynchronized access. It would
-// deterministically fail (with -race) before the v0.9.73 fix and
-// passes cleanly after.
-func TestRouteSnapshotConcurrentAccess(t *testing.T) {
-        const writers = 4
-        const readers = 8
-        const iters = 200
-
-        var wg sync.WaitGroup
-        wg.Add(writers + readers)
-
-        // Writers: continuously publish new snapshots, replacing the slice
-        // header and the map header. Under the old code this is the
-        // racy-write pattern; under the new code it is serialized by
-        // snapshotMu.Lock().
-        for w := 0; w < writers; w++ {
-                go func(id int) {
-                        defer wg.Done()
-                        for i := 0; i < iters; i++ {
-                                hosts := []hostEntry{
-                                        {Addr: fmt.Sprintf("10.0.%d.%d", id, i%256), Inst: 2, V4MinRTT: float64(i)},
-                                }
-                                bpfHealth := map[string]interface{}{
-                                        fmt.Sprintf("dest-%d-%d", id, i): map[string]interface{}{"rtt": i},
-                                }
-                                setRouteSnapshot(hosts, bpfHealth)
-                        }
-                }(w)
-        }
-
-        // Readers: continuously snapshot the package vars and iterate the
-        // returned local copies. Under the old code this read pattern was
-        // racy with the writers above; under the new code it is serialized
-        // by snapshotMu.RLock().
-        for r := 0; r < readers; r++ {
-                go func() {
-                        defer wg.Done()
-                        for i := 0; i < iters; i++ {
-                                hosts, bpfHealth := getRouteSnapshot()
-                                if hosts == nil {
-                                        continue
-                                }
-                                for _, h := range hosts {
-                                        _ = h.Addr
-                                }
-                                for k, v := range bpfHealth {
-                                        _ = k
-                                        _ = v
-                                }
-                        }
-                }()
-        }
-
-        wg.Wait()
-        t.Logf("route snapshot concurrent access (writers=%d readers=%d iters=%d) ✓", writers, readers, iters)
-}

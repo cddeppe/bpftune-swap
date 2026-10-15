@@ -608,11 +608,13 @@ func main() {
         // For servers with more buckets, use 60 (30min) to save memory.
         ringCapFlag := flag.Int("ring-cap", 120, "ring buffer entries per bucket (120=1h, 60=30min, 240=2h)")
         collectorModeFlag := flag.String("collector-mode", "normal", "collector mode: lean|normal|debug|normal-light")
-        routeMonitorFlag := flag.Bool("route-monitor", false, "enable per-destination IPv4/IPv6 route preference switching")
         flag.Parse()
         collectorMode = parseCollectorMode(*collectorModeFlag)
-        routeMonitorEnabled = *routeMonitorFlag
-        fmt.Fprintf(os.Stderr, "collector: mode=%s interval=%s logTail=%dMB routeMonitor=%v\n", collectorMode.Name, collectorMode.CollectInterval, collectorMode.LogTailBytes/1_000_000, routeMonitorEnabled)
+        // v0.9.81: removed --route-monitor flag + route monitor goroutine +
+        // Origin Health panel + ctrld integration. They added complexity
+        // without value for the user's use case. Route Health panel (the BPF
+        // map per-bucket health view) is unaffected.
+        fmt.Fprintf(os.Stderr, "collector: mode=%s interval=%s logTail=%dMB\n", collectorMode.Name, collectorMode.CollectInterval, collectorMode.LogTailBytes/1_000_000)
 
         // v0.7.3: set ring buffer cap
         ringCap = *ringCapFlag
@@ -672,8 +674,9 @@ func main() {
 
         collector := NewCollector()
 
-        // v0.9.33: start route monitor goroutine (if enabled via --route-monitor)
-        go runRouteMonitor()
+        // v0.9.81: route monitor goroutine removed (was --route-monitor flag).
+        // The Origin Health panel + automatic v4/v6 route switching + ctrld
+        // DNS cache integration were all removed as unnecessary complexity.
 
         // Synchronous first collect — current.json populated before HTTP starts.
         collector.collect()

@@ -105,19 +105,7 @@ func (c *Collector) collect() {
                 "hostname":         readProc("/proc/sys/kernel/hostname"),
                 "now_mono":         nowMono(pl.MaxTs),
                 "route_health":     routeHealth,
-                "route_monitor":    routeMonitor.getState(),
                 "service_health":   getServiceHealth(),
-        }
-
-        // v0.9.34: save snapshots for the route monitor goroutine to reuse.
-        // This avoids the route monitor calling readBPFMap() itself.
-        // v0.9.36: reuse the routeHealth we already built above (was building it again).
-        // v0.9.73: publish under snapshotMu to fix a data race — the route-monitor
-        // goroutine was reading lastHostsSnapshot/lastBpfHealthSnapshot without any
-        // lock; concurrent map header assignment + iteration could throw a runtime
-        // panic and silently kill the Origin Health panel.
-        if routeMonitorEnabled {
-                setRouteSnapshot(hosts, routeHealth)
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------
