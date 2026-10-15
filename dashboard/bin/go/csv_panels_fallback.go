@@ -312,19 +312,45 @@ func buildDivergenceFromCSV(n int) []interface{} {
 
 // buildChurnFromCSV reads the last N swaps from swaps.csv and computes
 // from_alg → to_alg transition counts. Mirrors buildChurnFromParsed.
+// v0.9.87: also returns cookies/one/mid/many/max (was missing these fields,
+// causing the frontend to show 0 for all cookie churn stats when the CSV
+// fallback was used).
 func buildChurnFromCSV(n int) map[string]interface{} {
         rows := readSwapsCSVRows(n)
         if len(rows) == 0 {
                 return map[string]interface{}{
-                        "total":     0,
-                        "transitions": []interface{}{},
+                        "total":        0,
+                        "transitions":  []interface{}{},
+                        "cookies":      0,
+                        "one":          0,
+                        "mid":          0,
+                        "many":         0,
+                        "max":          0,
                 }
         }
 
         transitions := map[string]int{}
+        // v0.9.87: also compute per-cookie swap counts (same as buildChurnFromParsed)
+        counts := map[int64]int{}
         for _, r := range rows {
-                key := r.FromAlg + " → " + r.ToAlg
+                key := r.FromAlg + " \u2192 " + r.ToAlg
                 transitions[key]++
+                counts[r.Cookie]++
+        }
+        one, mid, many := 0, 0, 0
+        maxCount := 0
+        for _, v := range counts {
+                switch {
+                case v >= 5:
+                        many++
+                case v >= 2:
+                        mid++
+                default:
+                        one++
+                }
+                if v > maxCount {
+                        maxCount = v
+                }
         }
 
         var keys []string
@@ -344,6 +370,11 @@ func buildChurnFromCSV(n int) map[string]interface{} {
         return map[string]interface{}{
                 "total":       len(rows),
                 "transitions": list,
+                "cookies":     len(counts),
+                "one":         one,
+                "mid":         mid,
+                "many":        many,
+                "max":         maxCount,
         }
 }
 

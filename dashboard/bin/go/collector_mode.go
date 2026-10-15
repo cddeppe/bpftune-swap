@@ -48,7 +48,7 @@ func parseCollectorMode(mode string) CollectorMode {
                 // Skips renderToDisk when no new swaps.
                 // Caches BPF map reads when entry count unchanged.
                 return CollectorMode{
-                        "normal-light", 30 * time.Second, 2_000_000,
+                        "normal-light", 30 * time.Second, 4_000_000,
                         true, true, true, 5, true,
                         2, true, true,
                 }
