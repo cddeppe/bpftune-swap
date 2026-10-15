@@ -2492,8 +2492,18 @@
       var hasV4Out = r.v4_out_has_data === true;
       var hasV6In  = r.v6_in_has_data  === true;
       var hasV6Out = r.v6_out_has_data === true;
-      // If collector didn't ship v0.9.78 fields, use combined RTT
-      var usingSplitDirs = (r.v4_in_rtt_ms != null || r.v6_in_rtt_ms != null);
+      // v0.9.79: only use the split-direction display when at least ONE
+      // direction actually has data. v0.9.78 checked `r.v4_in_rtt_ms != null`
+      // which was always true (the field is always populated, as 0 when no
+      // data), so the panel ALWAYS used the split-direction display and
+      // showed "—" for every direction on peers where the log didn't have
+      // per-direction RTT. Now we fall back to the combined single-metric
+      // display (which uses the BPF map's min_rtt as fallback) when no
+      // per-direction data is available — restoring v0.9.77's behavior
+      // for those peers while keeping the direction split for peers that
+      // do have log-parsed per-direction RTT.
+      var usingSplitDirs = (r.v4_in_rtt_ms > 0 || r.v4_out_rtt_ms > 0 ||
+                            r.v6_in_rtt_ms > 0 || r.v6_out_rtt_ms > 0);
 
       // Determine which protocol is better (lower RTT + loss wins)
       // v0.9.37: skip comparison if either has no data
