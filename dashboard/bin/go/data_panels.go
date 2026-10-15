@@ -180,7 +180,7 @@ func buildChurnFromParsed(swaps []swapRow) map[string]interface{} {
 		counts[sw.Cookie]++
 	}
 	if len(counts) == 0 {
-		return map[string]interface{}{"cookies": 0, "one": 0, "mid": 0, "many": 0, "max": 0}
+		return map[string]interface{}{"cookies": 0, "one": 0, "mid": 0, "many": 0, "max": 0, "total": 0, "transitions": []interface{}{}}
 	}
 	one, mid, many := 0, 0, 0
 	maxCount := 0
@@ -197,7 +197,7 @@ func buildChurnFromParsed(swaps []swapRow) map[string]interface{} {
 			maxCount = v
 		}
 	}
-	return map[string]interface{}{"cookies": len(counts), "one": one, "mid": mid, "many": many, "max": maxCount}
+	return map[string]interface{}{"cookies": len(counts), "one": one, "mid": mid, "many": many, "max": maxCount, "total": len(swaps), "transitions": []interface{}{}}
 }
 
 // v0.5.12: buildDivergenceFromParsed accepts pre-parsed results (no re-parse)

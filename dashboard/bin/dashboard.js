@@ -880,6 +880,26 @@
         open_pct: totalLoss ? Math.round(openLoss/totalLoss*100) : 0,
       };
     }
+    // v0.9.88: recompute churn from the bucket-filtered swaps_list
+    // so cookies/one/mid/many/max match the filtered swap_outcomes
+    if (f.swap_outcomes && f.swap_outcomes.swaps_list) {
+      var ws = f.swap_outcomes.swaps_list;
+      var ck = {};
+      ws.forEach(function(s) { ck[s.cookie] = (ck[s.cookie]||0)+1; });
+      var cOne=0, cMid=0, cMany=0, cMax=0;
+      for (var k in ck) {
+        var v = ck[k];
+        if (v >= 5) cMany++;
+        else if (v >= 2) cMid++;
+        else cOne++;
+        if (v > cMax) cMax = v;
+      }
+      f.churn = {
+        cookies: Object.keys(ck).length,
+        one: cOne, mid: cMid, many: cMany, max: cMax,
+        total: ws.length, transitions: []
+      };
+    }
     // Filter recent proofs
     if (f.recent_proofs) {
       f.recent_proofs = f.recent_proofs.filter(function(p) {
@@ -1310,7 +1330,7 @@
       if (_newBL.hasOwnProperty(_bk)) state.bucketLive[_bk] = _newBL[_bk];
     }
     _appendLiveMetrics(doc);
-    state.recentSwapsByBucket = doc.recent_swaps_by_bucket || null;
+    // v0.9.88: recent_swaps_by_bucket was never set by the backend; removed dead read
     state.lastLiveSwaps = doc.recent_swaps || [];
     _fetchAndApplyLabels();
 

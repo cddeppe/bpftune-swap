@@ -89,6 +89,8 @@ func readRecentSwapsFromCSV(n int) []interface{} {
                         "mt_alg":            mtAlg,
                         "rb_alg":            rbAlg,
                         "dest":              destLabel,
+			"outcome_srate":     "", // v0.9.88: add for frontend compat
+			"_bucket":           destLabel, // v0.9.88: add for swap_outcomes filter
                 }
                 out = append(out, row)
         }

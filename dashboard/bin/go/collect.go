@@ -161,14 +161,7 @@ func (c *Collector) collect() {
         // rate progression panel to go empty when a specific bucket
         // was selected (frontend's _filterByBucket looks for rate_raw).
         doc["rate_raw"] = pl.GetRateRaw()
-        divResult := buildDivergenceFromParsed(allSwaps, allMets, allSrates)
-        if collectorMode.CSVFallback && len(allSwaps) < 50 {
-                csvDiv := buildDivergenceFromCSV(200)
-                if len(csvDiv) > len(divResult) {
-                        divResult = csvDiv
-                }
-        }
-        doc["divergence"] = divResult
+        // v0.9.88: divergence panel was removed in v0.9.82; skip computation
         doc["tunables"] = buildTunables()
 
         // ----- Capture snapshots for the in-memory ring buffer --------------
