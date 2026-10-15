@@ -29,6 +29,8 @@ import (
         "strings"
         "sync"
         "time"
+
+        "golang.org/x/sys/unix"
 )
 
 // BPF remote_host_map value layout (must match kernel struct exactly).
@@ -371,7 +373,16 @@ func valueJSONToBytes(v map[string]interface{}) []byte {
 // CRITICAL: bpftool --json map lookup returns a SINGLE object (not a list),
 // or null if the key isn't found. The old code unmarshaled as a list,
 // which caused EVERY lookup to fail silently → 0 hosts patched.
+//
+// v0.9.86: tries the raw syscall path first (BPF_MAP_LOOKUP_ELEM), falls
+// back to bpftool fork if the syscall fails (e.g., map FD can't be obtained
+// or kernel doesn't support BPF_MAP_GET_FD_BY_ID).
 func mapLookupBytes(mapID int, keyArgs []string) ([]byte, error) {
+        // v0.9.86: try raw syscall first — ~0.01ms vs ~15ms for bpftool fork.
+        if buf, err := mapLookupBytesSyscall(mapID, keyArgs); err == nil {
+                return buf, nil
+        }
+        // Fall back to bpftool fork if syscall failed.
         args := []string{"--json", "map", "lookup", "id", strconv.Itoa(mapID), "key", "hex"}
         args = append(args, keyArgs...)
         out, err := exec.Command("bpftool", args...).Output()
@@ -414,9 +425,78 @@ func mapLookupBytes(mapID int, keyArgs []string) ([]byte, error) {
         return valueJSONToBytes(val), nil
 }
 
+// v0.9.86: cached BPF map FD (file descriptor). The FD is valid until the
+// map is destroyed (bpftune reload). If the FD becomes stale, the syscall
+// will return EBADF and we fall back to bpftool.
+var cachedMapFD int = -1
+
+// mapLookupBytesSyscall uses BPF_MAP_LOOKUP_ELEM syscall to read a map
+// entry without forking bpftool. Returns the raw value bytes.
+func mapLookupBytesSyscall(mapID int, keyArgs []string) ([]byte, error) {
+        // Get or refresh the map FD from the map ID.
+        fd, err := getMapFD(mapID)
+        if err != nil {
+                return nil, err
+        }
+
+        // Convert keyArgs (hex strings like "0a", "0b") to bytes.
+        key, err := hexArgsToBytes(keyArgs)
+        if err != nil {
+                return nil, err
+        }
+
+        // Allocate value buffer to the exact size the kernel expects.
+        value := make([]byte, sizeofRemoteHost)
+
+        // Read the map entry via raw syscall.
+        if err := bpfMapLookupElem(fd, key, value); err != nil {
+                // If the FD is stale (EBADF), invalidate the cache so the next
+                // call re-resolves the FD.
+                if err == unix.EBADF {
+                        cachedMapFD = -1
+                }
+                return nil, err
+        }
+        return value, nil
+}
+
+// getMapFD resolves a BPF map ID to a file descriptor, with caching.
+func getMapFD(mapID int) (int, error) {
+        if cachedMapFD > 0 {
+                return cachedMapFD, nil
+        }
+        fd, err := bpfMapGetFDByID(uint32(mapID))
+        if err != nil {
+                return -1, err
+        }
+        cachedMapFD = fd
+        return fd, nil
+}
+
+// hexArgsToBytes converts bpftool's hex key args (like "0a", "0b", "00")
+// to a raw byte slice for BPF syscalls.
+func hexArgsToBytes(keyArgs []string) ([]byte, error) {
+        buf := make([]byte, len(keyArgs))
+        for i, s := range keyArgs {
+                b, err := strconv.ParseUint(s, 0, 8)
+                if err != nil {
+                        return nil, fmt.Errorf("key byte %d parse %q: %w", i, s, err)
+                }
+                buf[i] = byte(b)
+        }
+        return buf, nil
+}
+
 // mapUpdateBytes writes the (possibly modified) buffer back to the BPF map.
 // Mirrors Python _map_update_bytes.
+// v0.9.86: tries the raw syscall path first (BPF_MAP_UPDATE_ELEM), falls
+// back to bpftool fork if the syscall fails.
 func mapUpdateBytes(mapID int, keyArgs []string, buf []byte) bool {
+        // v0.9.86: try raw syscall first.
+        if mapUpdateBytesSyscall(mapID, keyArgs, buf) {
+                return true
+        }
+        // Fall back to bpftool fork.
         args := []string{"map", "update", "id", strconv.Itoa(mapID), "key", "hex"}
         args = append(args, keyArgs...)
         args = append(args, "value", "hex")
@@ -426,6 +506,26 @@ func mapUpdateBytes(mapID int, keyArgs []string, buf []byte) bool {
         cmd := exec.Command("bpftool", args...)
         if err := cmd.Run(); err != nil {
                 fmt.Fprintf(os.Stderr, "[writeback] WARN map update failed: %v\n", err)
+                return false
+        }
+        return true
+}
+
+// mapUpdateBytesSyscall uses BPF_MAP_UPDATE_ELEM syscall to write a map
+// entry without forking bpftool. Returns true on success.
+func mapUpdateBytesSyscall(mapID int, keyArgs []string, buf []byte) bool {
+        fd, err := getMapFD(mapID)
+        if err != nil {
+                return false
+        }
+        key, err := hexArgsToBytes(keyArgs)
+        if err != nil {
+                return false
+        }
+        if err := bpfMapUpdateElem(fd, key, buf, 0); err != nil {
+                if err == unix.EBADF {
+                        cachedMapFD = -1 // invalidate stale FD
+                }
                 return false
         }
         return true
