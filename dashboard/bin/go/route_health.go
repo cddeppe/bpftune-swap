@@ -38,7 +38,7 @@ func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) 
                         continue
                 }
                 addr := h.Addr
-                if addr == "" || addr == "0.0.0.1" || addr == "?" {
+                if addr == "" || addr == "0.0.0.0" || addr == "?" {
                         continue
                 }
                 if strings.HasPrefix(addr, "127.") ||

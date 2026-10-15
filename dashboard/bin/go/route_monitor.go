@@ -57,10 +57,53 @@ var routeMonitor = &RouteMonitor{
         destinations: map[string]*destRouteState{},
 }
 
+// v0.9.73: dedicated mutex for the package-level snapshot vars below.
+//
+// Before this fix, the writer (collect.go:126-127, running in the 30s
+// collect goroutine) wrote lastHostsSnapshot / lastBpfHealthSnapshot
+// WITHOUT any lock. The route-monitor goroutine read the same vars in
+// cycle() under rm.mu (which does NOT protect these package vars) and
+// in evaluateDestination without any lock at all.
+//
+// That is a textbook Go data race:
+//   - Concurrent map header assignment + iteration on
+//     lastBpfHealthSnapshot can throw a runtime panic, killing the
+//     route-monitor goroutine. The Origin Health panel then freezes
+//     at whatever was last computed.
+//   - Concurrent slice header assignment + iteration on
+//     lastHostsSnapshot is undefined behavior even if it rarely panics.
+//
+// The fix uses a sync.RWMutex so multiple readers (route-monitor cycle)
+// can proceed concurrently while the writer (collector collect)
+// serializes against all of them.
 var (
-        lastHostsSnapshot    []hostEntry
-        lastBpfHealthSnapshot map[string]interface{}
+        snapshotMu             sync.RWMutex
+        lastHostsSnapshot      []hostEntry
+        lastBpfHealthSnapshot  map[string]interface{}
 )
+
+// setSnapshot is called by the collect goroutine to publish the latest
+// BPF map + route-health data for the route-monitor goroutine to consume.
+// MUST be called without holding rm.mu to avoid lock-ordering issues.
+func setRouteSnapshot(hosts []hostEntry, bpfHealth map[string]interface{}) {
+        snapshotMu.Lock()
+        defer snapshotMu.Unlock()
+        lastHostsSnapshot = hosts
+        lastBpfHealthSnapshot = bpfHealth
+}
+
+// getRouteSnapshot returns local copies of the latest snapshots. The
+// returned slices/maps may be read freely without holding snapshotMu —
+// subsequent setRouteSnapshot calls replace the package-level headers
+// rather than mutating the underlying data, so stale references remain
+// valid for the duration of a cycle.
+func getRouteSnapshot() (hosts []hostEntry, bpfHealth map[string]interface{}) {
+        snapshotMu.RLock()
+        defer snapshotMu.RUnlock()
+        hosts = lastHostsSnapshot
+        bpfHealth = lastBpfHealthSnapshot
+        return
+}
 
 var routeMonitorEnabled = false
 
@@ -68,6 +111,9 @@ func runRouteMonitor() {
         if !routeMonitorEnabled {
                 return
         }
+        // v0.9.71: run an immediate cycle on startup so destinations
+        // appear instantly instead of waiting 5 minutes.
+        routeMonitor.cycle()
         // v0.9.35: 5 minute interval — minimal ICMP footprint
         ticker := time.NewTicker(300 * time.Second)
         defer ticker.Stop()
@@ -77,10 +123,9 @@ func runRouteMonitor() {
 }
 
 func (rm *RouteMonitor) cycle() {
-        rm.mu.Lock()
-        hosts := lastHostsSnapshot
-        bpfHealth := lastBpfHealthSnapshot
-        rm.mu.Unlock()
+        // v0.9.73: take snapshot under the dedicated snapshotMu, not rm.mu
+        // (rm.mu protects rm.destinations, not these package-level vars).
+        hosts, bpfHealth := getRouteSnapshot()
 
         if hosts == nil {
                 return
@@ -99,13 +144,18 @@ func (rm *RouteMonitor) cycle() {
         }
         rm.mu.Unlock()
 
+        // v0.9.73: pass the local `hosts` snapshot so evaluateDestination
+        // doesn't re-read the package-level var without a lock (the original
+        // code at line 308 did exactly that, which was racy).
         for _, de := range toEval {
-                rm.evaluateDestination(de.label, de.state, bpfHealth)
+                rm.evaluateDestination(de.label, de.state, bpfHealth, hosts)
         }
 }
 
 // discoverDestinations finds dual-stack destinations from BPF map + aliases.
-// NO DNS lookups — only uses the aliases file and BPF map entries.
+// v0.9.72: also links v4 and v6 entries via ctrld DNS cache — if the
+// same domain resolves to both v4 and v6 IPs, the BPF map entries
+// are linked as dual-stack even without aliases.
 func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[string]interface{}) {
         aliasLabels := loadAliasesLabelsMap()
         type protoAddrs struct{ v4, v6 string }
@@ -116,6 +166,32 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 if strings.Contains(ip, ":") { pa.v6 = ip } else { pa.v4 = ip }
         }
 
+        // v0.9.72: Build a domain→{v4prefix, v6prefix} map from ctrld cache.
+        // This lets us link v4 BPF entries like "130.61.0.0" with v6 entries
+        // like "v6:26061a40" when they belong to the same domain.
+        type domPrefixes struct{ v4, v6 string }
+        domainMap := map[string]*domPrefixes{}
+        ctrldState.mu.RLock()
+        if ctrldState.available {
+                for ip, domain := range ctrldState.ipToDomain {
+                        dp, ok := domainMap[domain]
+                        if !ok { dp = &domPrefixes{}; domainMap[domain] = dp }
+                        if strings.Contains(ip, ":") {
+                                // IPv6 — extract first 4 bytes as hex prefix
+                                // e.g. "2606:1a40:3::1" → "26061a40" → "v6:26061a40"
+                                hex := ipv6ToBpfHex(ip)
+                                if hex != "" { dp.v6 = "v6:" + hex }
+                        } else {
+                                // IPv4 — extract /16 prefix
+                                parts := strings.Split(ip, ".")
+                                if len(parts) >= 2 {
+                                        dp.v4 = parts[0] + "." + parts[1] + ".0.0"
+                                }
+                        }
+                }
+        }
+        ctrldState.mu.RUnlock()
+
         byLabel := map[string][]hostEntry{}
         for _, h := range hosts {
                 if h.Inst < 2 { continue }
@@ -125,6 +201,53 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 lbl := labelFor(addr)
                 if lbl == "" { lbl = addr }
                 byLabel[lbl] = append(byLabel[lbl], h)
+        }
+
+        // v0.9.72: Also link v4 and v6 entries via domain matching.
+        // For each v4-only entry, check if ctrld knows a v6 counterpart.
+        // For each v6-only entry, check if ctrld knows a v4 counterpart.
+        for lbl, entries := range byLabel {
+                hasV4, hasV6 := false, false
+                for _, h := range entries {
+                        if strings.Contains(h.Addr, ":") || strings.HasPrefix(h.Addr, "v6:") {
+                                hasV6 = true
+                        } else {
+                                hasV4 = true
+                        }
+                }
+                // If only v4, try to find v6 counterpart via domain
+                // v0.9.73: delete dead scaffolding loop — was leftover from
+                // v0.9.72 v6->v4 linking work and never iterated anything.
+                if hasV4 && !hasV6 {
+                        // Look up domain for this v4 label
+                        domain := getDomainForBucket(lbl)
+                        if domain != "" {
+                                if dp, ok := domainMap[domain]; ok && dp.v6 != "" {
+                                        // Check if the v6 BPF entry exists in hosts
+                                        for _, h := range hosts {
+                                                if h.Addr == dp.v6 && h.Inst >= 2 {
+                                                        // Found the v6 counterpart — add it
+                                                        byLabel[lbl] = append(byLabel[lbl], h)
+                                                        break
+                                                }
+                                        }
+                                }
+                        }
+                }
+                // If only v6, try to find v4 counterpart via domain
+                if hasV6 && !hasV4 {
+                        domain := getDomainForBucket(lbl)
+                        if domain != "" {
+                                if dp, ok := domainMap[domain]; ok && dp.v4 != "" {
+                                        for _, h := range hosts {
+                                                if h.Addr == dp.v4 && h.Inst >= 2 {
+                                                        byLabel[lbl] = append(byLabel[lbl], h)
+                                                        break
+                                                }
+                                        }
+                                }
+                        }
+                }
         }
 
         allLabels := map[string]bool{}
@@ -168,8 +291,25 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
         }
 }
 
+// ipv6ToBpfHex converts a full IPv6 address to the BPF map's 8-hex-char
+// prefix format. e.g. "2606:1a40:3::1" → "26061a40"
+func ipv6ToBpfHex(ip string) string {
+        // Take the first two hextets: "2606:1a40:..." → "2606" + "1a40"
+        parts := strings.Split(ip, ":")
+        if len(parts) < 2 { return "" }
+        h1 := parts[0]
+        h2 := parts[1]
+        // Pad to 4 chars each
+        for len(h1) < 4 { h1 = "0" + h1 }
+        for len(h2) < 4 { h2 = "0" + h2 }
+        return h1 + h2
+}
+
 // evaluateDestination uses BPF data with minimal ICMP fallback.
-func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}) {
+// v0.9.73: added `hosts` parameter so the per-protocol min_rtt lookup
+// at line ~308 can read from the caller's local snapshot instead of
+// reading the package-level lastHostsSnapshot without a lock.
+func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}, hosts []hostEntry) {
         state.mu.Lock()
         hasV4 := state.HasIPv4
         hasV6 := state.HasIPv6
@@ -213,8 +353,11 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         // v0.9.38: also check hosts snapshot for per-protocol min_rtt.
         // This is the real fix — the merged BPF map entry has V4MinRTT and
         // V6MinRTT tracked separately, so v6 gets real data.
-        if lastHostsSnapshot != nil {
-                for _, h := range lastHostsSnapshot {
+        // v0.9.73: read from the `hosts` parameter (caller's local snapshot)
+        // instead of the package-level lastHostsSnapshot — eliminates the
+        // data race on that var.
+        if hosts != nil {
+                for _, h := range hosts {
                         if h.Inst < 2 { continue }
                         lbl := labelFor(h.Addr)
                         if lbl == "" { lbl = h.Addr }
@@ -373,12 +516,16 @@ func (rm *RouteMonitor) getState() []interface{} {
         out := make([]interface{}, 0, len(states))
         for _, state := range states {
                 state.mu.Lock()
-                // v0.9.37: has_data flags so frontend can show "no data"
+                // v0.9.71: look up domain from ctrld DNS cache for origin IPs.
+                // For unlabeled destinations (raw IPs like "130.61.0.0"),
+                // the label IS the IP — look it up directly.
+                domain := getDomainForBucket(state.Label)
                 // instead of misleading "0.0ms 100% loss"
                 v4HasData := state.V4RTT > 0
                 v6HasData := state.V6RTT > 0
                 entry := map[string]interface{}{
                         "label": state.Label,
+                        "domain": domain, // v0.9.71: from ctrld DNS cache
                         "has_ipv4": state.HasIPv4,
                         "has_ipv6": state.HasIPv6,
                         "preferred": state.PreferredProto,

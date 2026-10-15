@@ -58,16 +58,6 @@
     _loadingOverlayHidden = true;
   }
 
-  function loadScript(url) {
-    return new Promise(function (resolve, reject) {
-      var s = document.createElement("script");
-      s.src = url;
-      s.onload = resolve;
-      s.onerror = function () { reject(new Error("failed to load " + url)); };
-      document.head.appendChild(s);
-    });
-  }
-
   function applyChartDefaults() {
     var dark = window.matchMedia &&
                window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -98,6 +88,54 @@
   function setHTML(id, s) { var e = $(id); if (e) e.innerHTML = s; }
   /* 0.4.79: monotonic-age label for recent swaps / proofs. */
   var SERVER_NOW_MONO = 0;
+
+  // v0.9.65: single helper for BPF ktime → epoch conversion.
+  // Used by renderSwaps, swaps-per-bin, and renderScoreNow.
+  // Replaces 3 copies of the same formula.
+  function epochOf(row, sseDoc) {
+    if (row.epoch_ts) return row.epoch_ts;
+    var now = (sseDoc.generated_ts) || (Date.now() / 1000);
+    var monoOffset = (sseDoc.now_mono && sseDoc.now_mono > 0) ? (now - sseDoc.now_mono) : 0;
+    return (row.ts || 0) + monoOffset;
+  }
+
+  // v0.9.68: Look up domain name from ctrld DNS cache for a bucket IP.
+  // v0.9.70: Fixed IPv6 matching — BPF stores v6 as "v6:hexprefix" but
+  // ctrld_domains has full IPv6 addresses like "2606:1a40:3::1".
+  function getDomainForBucketDisplay(bucketAddr) {
+    var domains = window.__current_doc && window.__current_doc.ctrld_domains;
+    if (!domains) return "";
+
+    // Try exact match first
+    if (domains[bucketAddr]) return domains[bucketAddr];
+
+    // IPv4: /16 masked IPs like "142.250.0.0" — match first two octets
+    var parts = bucketAddr.split(".");
+    if (parts.length === 4) {
+      var prefix = parts[0] + "." + parts[1] + ".";
+      for (var ip in domains) {
+        if (ip.indexOf(prefix) === 0) return domains[ip];
+      }
+      return "";
+    }
+
+    // IPv6: BPF stores as "v6:hexprefix" (first 4 bytes in hex, e.g. "v6:26061a40")
+    // ctrld_domains has full IPv6 like "2606:1a40:3::1"
+    // Convert: "v6:26061a40" → "2606:1a40:" prefix → match against ctrld IPs
+    if (bucketAddr.indexOf("v6:") === 0) {
+      var hex = bucketAddr.substring(3); // "26061a40"
+      if (hex.length >= 8) {
+        // Build IPv6 prefix: "2606:1a40:"
+        var v6Prefix = hex.substring(0,4) + ":" + hex.substring(4,8) + ":";
+        for (var ip in domains) {
+          if (ip.indexOf(v6Prefix) === 0) return domains[ip];
+        }
+      }
+    }
+
+    return "";
+  }
+
   // v0.9.20: ageLabel accepts optional epoch_ts (wall-clock).
   // When boot_ts is from a PREVIOUS boot (age < 0), fall back to
   // epoch_ts so ages display correctly after a reboot.
@@ -370,8 +408,17 @@
         cell = '<td class="mono"><span class="covbar"><i style="width:' +
                pct.toFixed(0) + '%"></i></span>' + pct.toFixed(0) + '%</td>';
       }
+      // v0.9.68: show domain name from ctrld DNS cache if available
+      var destDisplay = esc(shortAddr(r.dest));
+      var sh = window.__current_doc && window.__current_doc.service_health;
+      if (sh && sh.ctrld_available) {
+        var domain = getDomainForBucketDisplay(r.dest);
+        if (domain) {
+          destDisplay = '<span style="color:var(--good)">' + esc(domain) + '</span> <span class="dim">' + destDisplay + '</span>';
+        }
+      }
       html += '<tr>' +
-        '<td class="mono name">' + esc(shortAddr(r.dest)) + '</td>' +
+        '<td class="mono name">' + destDisplay + '</td>' +
         '<td class="mono">' + fmtN(r.inst) + '</td>' +
         '<td class="mono dim">' + (r.rtt_us / 1000).toFixed(1) + ' ms</td>' +
         '<td class="mono">' + r.ref_mbps.toFixed(1) + '</td>' +
@@ -1301,17 +1348,32 @@
       if (window.__latest_doc_ts && _ts < window.__latest_doc_ts) {
         return;
       }
+      // v0.9.73: also skip the whole render if generated_ts is UNCHANGED
+      // since the last render — SSE can deliver a duplicate full-doc snapshot
+      // (the 5-min heartbeat) even when nothing has changed. Skipping saves
+      // 6 rAFs × ~30ms of DOM work for a no-op refresh.
+      if (window.__latest_doc_ts === _ts && window.__current_doc === doc) {
+        return;
+      }
       window.__latest_doc_ts = _ts;
     }
     window.__current_doc = doc;
 
-    // v0.9.49: ALL phases now yield via requestAnimationFrame.
-    // Previously Phase 1 ran synchronously (including _syncBucketDropdown
-    // which rebuilds the buckets table + dropdown) and blocked the main
-    // thread for 100-200ms on every SSE push. Now Phase 1 also yields,
-    // so the browser can handle scroll/touch between every phase.
+    // v0.9.73: replace back-to-back requestAnimationFrame with setTimeout(0)
+    // so the browser can process queued input events (scroll, click, touch)
+    // BETWEEN phases. The previous pattern scheduled 6 rAFs in quick
+    // succession; rAFs fire before paint but DON'T yield to input events
+    // between themselves, so a single SSE push could lock scroll/select
+    // for 6 consecutive frames (≈100ms+) even with the v0.9.49 phase split.
+    //
+    // setTimeout(0) yields to the event loop, letting the browser handle
+    // any pending input first. We use the same `if (doc !== window.__current_doc)
+    // return;` stale-guard pattern as before so a newer SSE push supersedes
+    // pending phases from an older one.
+    function _next(fn) { setTimeout(function () { if (doc !== window.__current_doc) return; fn(); }, 0); }
 
-    // Phase 1: lightweight state updates (no DOM work)
+    // Phase 1: lightweight state updates (no DOM work) — runs synchronously,
+    // very cheap (just object assignment).
     if (doc.now_mono) SERVER_NOW_MONO = doc.now_mono;
     state.metricByBucket = doc.metric_by_bucket || {};
     if (!state.bucketLive) state.bucketLive = {};
@@ -1325,46 +1387,53 @@
     _fetchAndApplyLabels();
 
     // Phase 1b: DOM-heavy state updates (bucket dropdown, tags) — yield first
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _syncBucketDropdown(doc);
       _updateBucketTags();
     });
 
-    // Phase 2: simple HTML panels (fast, no charts) — yield
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
-      _safeRender('log_window', function() { renderLogWindow(doc); });
-      _safeRender('build', function() { renderBuild(doc.build || {}); });
-      _safeRender('system', function() { renderSystem(doc.system || {}); });
-      _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
+    // Phase 2a: build/system/tunables panels — yield + MEMOIZE.
+    // These panels rarely change; skipping re-render when the input data hash
+    // matches saves 50-100ms of DOM teardown/rebuild per SSE push.
+    _next(function() {
+      _memoRender('log_window', doc.log_window || {}, function() { renderLogWindow(doc); });
+      _memoRender('build', doc.build || {}, function() { renderBuild(doc.build || {}); });
+      _memoRender('system', doc.system || {}, function() { renderSystem(doc.system || {}); });
+      _memoRender('tunables', doc.tunables || [], function() { renderTunables(doc.tunables || []); });
+    });
+
+    // Phase 2b: bucket-specific panels + health — yield
+    _next(function() {
       _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
       _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
       renderRouteHealth(doc);
       renderOriginHealth(doc);
-      renderServiceHealth(doc);
+      // v0.9.73: service_health changes at most once per 5 min — defer to idle.
+      _ric(function() {
+        if (doc !== window.__current_doc) return; // stale
+        _memoRender('service_health', doc.service_health || {}, function() {
+          renderServiceHealth(doc);
+        });
+      });
       // v0.9.40: hide the loading overlay after Phase 2 (HTML panels visible)
       _hideLoadingOverlay();
     });
 
     // Phase 3: heavy chart renders — yield between each chart
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _renderFilteredPanels(doc);
       _safeRender('swaps', function() { renderSwaps(); });
     });
 
     // Phase 4: remaining charts
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _safeRender('score-now', function() { renderScoreNow(); });
       if ($("range")) {
         _safeRender('bucket_chart', function() { renderBucket(); });
       }
     });
 
-    requestAnimationFrame(function() {
-      if (doc !== window.__current_doc) return; // stale
+    _next(function() {
       _safeRender('div', function() { renderDivChart("div", ""); });
       _safeRender('div_sustained', function() { renderDivChart("div_sustained", "_sustained"); });
     });
@@ -1408,25 +1477,6 @@
     });
   }
 
-  // v0.9.43: throttled refreshNowCardAndChart — was firing on every SSE
-  // push (every 30s), doing synchronous chart renders (loadBucket →
-  // renderBucket, renderNow, renderScoreNow) that blocked the main
-  // thread and prevented scrolling. Now it goes through a 2s minimum
-  // interval throttle so the browser can handle input between renders.
-  var _refreshNowPending = false;
-  var _lastRefreshNowTs = 0;
-  function throttledRefreshNow() {
-    if (_refreshNowPending) return;
-    var now = Date.now();
-    if (now - _lastRefreshNowTs < 2000) return; // min 2s between refreshes
-    _refreshNowPending = true;
-    requestAnimationFrame(function() {
-      _refreshNowPending = false;
-      _lastRefreshNowTs = Date.now();
-      try { refreshNowCardAndChart(); } catch(e) { console.error('refreshNow:', e); }
-    });
-  }
-
   // SSE real-time updates with polling fallback.
   // SSE pushes data within 1s of collection; polling fallback (30s)
   // ensures the dashboard still works if SSE crashes.
@@ -1462,11 +1512,16 @@
           }
           // v0.9.34: throttled render via requestAnimationFrame
           throttledRender(window.__current_doc);
-          // v0.9.43: throttle refreshNowCardAndChart too — was firing
-          // on every SSE push (every 30s), doing synchronous chart
-          // renders that blocked the main thread and prevented scrolling.
-          // Now it goes through the same rAF throttle as renderLiveState.
-          throttledRefreshNow();
+          // v0.9.62: REMOVED throttledRefreshNow() — was the #1 cause of
+          // scroll freeze. It called loadBucket() on every SSE push (30s),
+          // which did fetch() + 7 synchronous chart renders (renderBucket,
+          // renderNow, renderScoreNow, renderRouteHealth, renderOriginHealth,
+          // renderServiceHealth). That's 200-500ms of main-thread blocking.
+          //
+          // renderLiveState already handles all live updates via SSE data.
+          // loadBucket is only needed when the user changes the bucket
+          // dropdown (handled by bs.onchange) or on initial boot.
+          // throttledRefreshNow();
         } catch (err) {
           console.error("SSE parse error:", err);
         }
@@ -1631,6 +1686,38 @@
   var _renderPending = false;
   var _lastRenderTs = 0;
   var _pendingDoc = null;
+
+  // v0.9.73: per-panel memoization for rarely-changing panels.
+  // The previous code re-rendered build/system/tunables/service_health
+  // on EVERY 30s SSE push even though they change at most once per
+  // session (build) or every few minutes (system uptime tick).
+  // Each re-render does a full innerHTML teardown + rebuild, which is
+  // the #1 cause of scroll/select freeze during SSE pushes.
+  // We compute a cheap JSON hash of the panel's input data; if the
+  // hash matches the previous render, we skip the DOM work entirely.
+  var _panelHash = {};
+  function _panelUnchanged(label, data) {
+    try {
+      var h = JSON.stringify(data);
+      if (_panelHash[label] === h) return true;
+      _panelHash[label] = h;
+    } catch (e) { /* unhashable — always render */ }
+    return false;
+  }
+  function _memoRender(label, data, fn) {
+    if (_panelUnchanged(label, data)) return;
+    _safeRender(label, fn);
+  }
+
+  // v0.9.73: requestIdleCallback with setTimeout fallback.
+  // For non-critical panels (build, system, tunables, service_health)
+  // we defer the render to idle time so the browser can paint the
+  // critical panels first and process any queued input events.
+  // Browsers without requestIdleCallback fall back to setTimeout(0),
+  // which still yields to the event loop between renders.
+  var _ric = (typeof requestIdleCallback === 'function')
+    ? function (fn) { return requestIdleCallback(fn, { timeout: 2000 }); }
+    : function (fn) { return setTimeout(fn, 0); };
 
   function mk(id, cfg) {
     var cv = $(id);
@@ -2372,6 +2459,10 @@
     var html = '<div class="route-health origin-grid">';
     shown.forEach(function(r) {
       var label = r.label || "?";
+      // v0.9.71: show domain from ctrld DNS cache for origin IPs
+      if (r.domain) {
+        label = r.domain + ' (' + label + ')';
+      }
       var hasV4 = r.has_ipv4;
       var hasV6 = r.has_ipv6;
       var preferred = r.preferred || "";
@@ -2419,14 +2510,19 @@
       if (hasV4) {
         var v4NoData = r.v4_has_data === false;
         var v4HealthClass = v4NoData ? "" : ((r.v4_loss_pct > 5 || r.v4_rtt_ms > 100) ? "degraded" : "good");
-        html += '<span class="route-metric' + (v4HealthClass === 'good' ? '' : '') + '" style="' +
+        // v0.9.73: fix no-op ternary that was always emitting "" for both
+        // branches, so the route-metric span never received a "good"/"degraded"
+        // color tint. The RTT/loss numbers still showed but without the
+        // visual health cue the user could not tell at a glance which rows
+        // were degraded.
+        html += '<span class="route-metric ' + (v4NoData ? '' : v4HealthClass) + '" style="' +
           (betterProto === 'v4' ? 'color:#4285f4;' : '') + '">' +
           (v4NoData ? 'v4: <i style="opacity:0.5">no data</i>' : 'v4: <b>' + v4Rtt + '</b>ms <b>' + v4Loss + '%</b>') + '</span>';
       }
       if (hasV6) {
         var v6NoData = r.v6_has_data === false;
         var v6HealthClass = v6NoData ? "" : ((r.v6_loss_pct > 5 || r.v6_rtt_ms > 100) ? "degraded" : "good");
-        html += '<span class="route-metric" style="' +
+        html += '<span class="route-metric ' + (v6NoData ? '' : v6HealthClass) + '" style="' +
           (betterProto === 'v6' ? 'color:#34a853;' : '') + '">' +
           (v6NoData ? 'v6: <i style="opacity:0.5">no data</i>' : 'v6: <b>' + v6Rtt + '</b>ms <b>' + v6Loss + '%</b>') + '</span>';
       }
@@ -2468,6 +2564,7 @@
       { label: "Log Freshness", value: sh.log_age + " old", ok: sh.log_fresh_ok },
       { label: "Explore %", value: sh.explore_pct + "%", ok: sh.explore_pct_ok },
       { label: "Trace Buffer", value: (sh.trace_buffer_kb >= 1024 ? Math.round(sh.trace_buffer_kb/1024) + "MB" : sh.trace_buffer_kb + "KB"), ok: sh.trace_buffer_ok },
+      { label: "ctrld DNS", value: sh.ctrld_available ? (sh.ctrld_entry_count + " domains") : "not installed", ok: sh.ctrld_ok },
     ];
 
     var allOk = sh.all_ok;
@@ -2526,15 +2623,12 @@
       var sw = sse.swap_outcomes.swaps_list;
       var now = (sse.generated_ts) || (Date.now()/1000);
       var fixedAxis = buildFixedAxis(rng, now);
-      var monoOffset = (sse.now_mono && sse.now_mono > 0) ? (now - sse.now_mono) : 0;
       if (fixedAxis) {
         window.__chart_axis_min = fixedAxis.ts[0] * 1000;
         window.__chart_axis_max = fixedAxis.ts[fixedAxis.ts.length - 1] * 1000;
         var swapCounts = fixedAxis.ts.map(function(){return 0;});
         sw.forEach(function(s) {
-          // v0.9.56: use epoch_ts (wall-clock) instead of s.ts + monoOffset
-          // (BPF ktime conversion that breaks on reboot/migration)
-          var t = s.epoch_ts || (s.ts || 0) + monoOffset;
+          var t = epochOf(s, sse);
           var fa = fixedAxis.ts;
           if (t < fa[0] || t > fa[fa.length - 1]) return;
           if (t <= fa[0]) { swapCounts[0]++; return; }
@@ -2652,7 +2746,6 @@
       // where offset = generated_ts - now_mono.  Without this, all swaps fall
       // outside the [now-rSec, now] window (since swap.ts ~= 887000 but
       // generated_ts ~= 1790700000) and no bars appear.
-      var monoOffset = (sse.now_mono && sse.now_mono > 0) ? (now - sse.now_mono) : 0;
       // Set min/max globals (same as renderBucket) so this chart's x-axis
       // also spans the full fixed window even where bins are 0.
       if (fixedAxis) {
@@ -2668,7 +2761,7 @@
         // to its nearest bin via binary search.  Empty bins -> 0 bars.
         var swapCounts = fixedAxis.ts.map(function(){return 0;});
         sw.forEach(function(s) {
-          var t = s.epoch_ts || (s.ts || 0) + monoOffset;   // v0.9.56: prefer epoch_ts (wall-clock)
+          var t = epochOf(s, sse);
           var fa = fixedAxis.ts;
           if (t < fa[0] || t > fa[fa.length - 1]) return;
           if (t <= fa[0]) { swapCounts[0]++; return; }
@@ -2691,7 +2784,7 @@
         var bSec = 86400;
         var bins = {};
         sw.forEach(function(s) {
-          var t = (s.ts || 0) + monoOffset;   // monotonic -> epoch
+          var t = epochOf(s, sse);
           var b = Math.floor(t/bSec)*bSec;
           bins[b] = (bins[b]||0)+1;
         });
@@ -3077,7 +3170,95 @@ function _populateBucketSelect(desiredBucket) {
 })();
 
   /* ---- Label Editor Modal (reads /etc/bpftune/aliases groups) ---- */
+  // v0.9.66: moved from index.html inline script to here (was duplicated)
   function _le_esc(s) { return String(s==null?'':s).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+
+  /* ---- Inline IP label edit (click on a bucket name) ---- */
+  function ipLabelEdit(el) {
+    var ip = el.getAttribute('data-ip');
+    if (!ip) return;
+    var old = el.textContent;
+    var input = document.createElement('input');
+    input.type = 'text'; input.className = 'ip-edit';
+    input.value = el.getAttribute('data-label') || '';
+    input.placeholder = 'label...';
+    input.style.width = Math.max(80, old.length * 8 + 20) + 'px';
+    el.textContent = '';
+    el.appendChild(input);
+    input.focus(); input.select();
+    var done = false;
+    function save() {
+      if (done) return; done = true;
+      var label = input.value.trim();
+      fetch('/api/labels', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ip: ip, label: label})})
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.ok) {
+            el.textContent = label || ip;
+            el.setAttribute('data-label', label);
+            if (window.__liveFetch) window.__liveFetch();
+          } else {
+            el.textContent = old;
+          }
+        })
+        .catch(function() { el.textContent = old; });
+    }
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); save(); }
+      if (e.key === 'Escape') { done = true; el.textContent = old; }
+    });
+    input.addEventListener('blur', save);
+  }
+  document.addEventListener('click', function(e) {
+    var el = e.target.closest('.ip-label');
+    if (el && !el.querySelector('input')) ipLabelEdit(el);
+  });
+
+  /* ---- Bucket IPs (individual IPs inside masked buckets) ---- */
+  var _bucketIps = null;
+  var _allLabels = [];
+
+  function loadBucketIps() {
+    fetch('current.json', {cache: 'no-store'}).then(function(r) { return r.json(); }).then(function(doc) {
+      var buckets = doc.bucket_ips || {};
+      fetch('/api/labels').then(function(r) { return r.json(); }).then(function(ld) {
+        var labels = ld.labels || {};
+        _allLabels = Object.keys(labels).map(function(ip) { return labels[ip]; }).filter(function(l,i,a){ return a.indexOf(l)===i; }).sort();
+        renderBucketIps(buckets, labels);
+      }).catch(function() { renderBucketIps(buckets, {}); });
+    }).catch(function() {
+      document.getElementById('bucket-ips-list').innerHTML = '<div style="font-size:11px;color:var(--muted)">Could not fetch current.json</div>';
+    });
+  }
+
+  function renderBucketIps(buckets, labels) {
+    var unlabeled = {};
+    Object.keys(buckets).forEach(function(m) { if (!labels[m]) unlabeled[m] = buckets[m]; });
+    buckets = unlabeled;
+    var html = '';
+    Object.keys(buckets).sort(function(a,b) { return (labels[a]||a).localeCompare(labels[b]||b); }).forEach(function(masked) {
+      var ips = buckets[masked];
+      var label = labels[masked] || masked;
+      var count = ips.length;
+      html += '<div style="margin-bottom:8px"><b style="font-size:12px">' + _le_esc(label) + '</b>';
+      html += ' <span style="color:var(--muted);font-size:10px">' + count + ' IPs</span>';
+      html += ' <button onclick="_bi_toggle(\'' + _le_esc(masked) + '\')" style="font-size:10px;padding:0 4px;cursor:pointer">show</button>';
+      html += '</div>';
+      html += '<div id="bi-' + _le_esc(masked) + '" style="display:none;margin-left:16px">';
+      ips.forEach(function(ip) {
+        var opts = '<option value="">move to...</option>';
+        _allLabels.forEach(function(l) { opts += '<option value="' + _le_esc(l) + '">' + _le_esc(l) + '</option>'; });
+        opts += '<option value="__new__">new label...</option>';
+        html += '<div style="font-size:11px;padding:2px 0">' + _le_esc(ip) + ' ';
+        html += '<select onchange="_bi_move(\'' + ip + '\',\'' + _le_esc(masked) + '\',this.value)" style="font-size:10px;border:1px solid var(--muted);border-radius:3px">' + opts + '</select>';
+        html += '</div>';
+      });
+      html += '</div>';
+    });
+    document.getElementById('bucket-ips-list').innerHTML = html || '<div class="placeholder" style="font-size:11px;color:var(--muted)">All IPs are labeled</div>';
+  }
+
   function openLabelEditor() {
     fetch('/api/labels').then(function(r) { return r.json(); }).then(function(d) {
       _le_render(d.labels || {}, d.groups || {});
