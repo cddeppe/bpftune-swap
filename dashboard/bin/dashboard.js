@@ -1331,13 +1331,18 @@
       _updateBucketTags();
     });
 
-    // Phase 2: simple HTML panels (fast, no charts) — yield
+    // Phase 2a: build/system/tunables panels — yield
     requestAnimationFrame(function() {
       if (doc !== window.__current_doc) return; // stale
       _safeRender('log_window', function() { renderLogWindow(doc); });
       _safeRender('build', function() { renderBuild(doc.build || {}); });
       _safeRender('system', function() { renderSystem(doc.system || {}); });
       _safeRender('tunables', function() { renderTunables(doc.tunables || []); });
+    });
+
+    // Phase 2b: bucket-specific panels + health — yield
+    requestAnimationFrame(function() {
+      if (doc !== window.__current_doc) return; // stale
       _safeRender('metric_for_bucket', function() { renderMetricForBucket(); });
       _safeRender('recent_swaps_for_bucket', function() { renderRecentSwapsForBucket(); });
       renderRouteHealth(doc);
@@ -1462,11 +1467,16 @@
           }
           // v0.9.34: throttled render via requestAnimationFrame
           throttledRender(window.__current_doc);
-          // v0.9.43: throttle refreshNowCardAndChart too — was firing
-          // on every SSE push (every 30s), doing synchronous chart
-          // renders that blocked the main thread and prevented scrolling.
-          // Now it goes through the same rAF throttle as renderLiveState.
-          throttledRefreshNow();
+          // v0.9.62: REMOVED throttledRefreshNow() — was the #1 cause of
+          // scroll freeze. It called loadBucket() on every SSE push (30s),
+          // which did fetch() + 7 synchronous chart renders (renderBucket,
+          // renderNow, renderScoreNow, renderRouteHealth, renderOriginHealth,
+          // renderServiceHealth). That's 200-500ms of main-thread blocking.
+          //
+          // renderLiveState already handles all live updates via SSE data.
+          // loadBucket is only needed when the user changes the bucket
+          // dropdown (handled by bs.onchange) or on initial boot.
+          // throttledRefreshNow();
         } catch (err) {
           console.error("SSE parse error:", err);
         }
