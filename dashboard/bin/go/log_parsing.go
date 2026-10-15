@@ -318,12 +318,15 @@ func buildRecentSwapRows(swaps []swapRow,
         srateByCookie map[int64][]srateEntry,
         cdest map[string]cdestEntry) []interface{} {
 
-        // v0.9.56: Use wall-clock epoch time directly. The old code computed
-        // epoch_ts = nowEpoch - uptime + sw.Ts (BPF ktime → epoch conversion)
-        // which broke on reboot, live migration, and when the log had events
-        // from a previous boot. Now we use the collector's read time as the
-        // epoch_ts, which is always correct regardless of BPF clock state.
+        // v0.9.57: Restore correct BPF ktime → epoch conversion.
+        // epoch_ts = nowEpoch - uptime + boot_ts
+        // This is the actual swap event time in wall-clock epoch.
+        // The frontend also does this same conversion as a fallback:
+        //   monoOffset = generated_ts - now_mono (= epoch_boot)
+        //   t = s.ts + monoOffset (= epoch_event)
         nowEpoch := time.Now().Unix()
+        uptime := readProcUptime()
+        bootEpoch := float64(nowEpoch) - uptime
 
         rows := make([]interface{}, 0, len(swaps))
         for _, sw := range swaps {
@@ -366,7 +369,7 @@ func buildRecentSwapRows(swaps []swapRow,
 
                 row := map[string]interface{}{
                         "boot_ts":           sw.Ts,
-                        "epoch_ts":          nowEpoch, // v0.9.56: wall-clock read time (always correct)
+                        "epoch_ts":          int64(bootEpoch + sw.Ts),
                         "from_alg":          fromAlg,
                         "to_alg":            toAlg,
                         "d":                 d,
@@ -685,8 +688,10 @@ func fieldValue(s swapOutRow, field string) string {
 }
 
 func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
-        // v0.9.56: use wall-clock epoch time instead of BPF ktime
+        // v0.9.57: Restore correct BPF ktime → epoch conversion
         nowEpoch := time.Now().Unix()
+        uptime := readProcUptime()
+        bootEpoch := float64(nowEpoch) - uptime
         out := make([]interface{}, 0, len(swaps))
         for _, s := range swaps {
                 // BUG 14 fix: use nil for unmeasured outcomes (dashboard expects null, not "")
@@ -699,7 +704,7 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
                 }
                 out = append(out, map[string]interface{}{
                         "ts":                s.Ts,
-                        "epoch_ts":          nowEpoch, // v0.9.56: wall-clock read time
+                        "epoch_ts":          int64(bootEpoch + s.Ts),
                         "boot_ts":           s.Ts,
                         "cookie":            s.Cookie,
                         "dest":              s.Dest,
@@ -715,8 +720,10 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
 // ============================================================================
 
 func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{} {
-        // v0.9.56: Use wall-clock epoch time directly (same fix as swaps)
+        // v0.9.57: Restore correct BPF ktime → epoch conversion
+        uptime := readProcUptime()
         nowEpoch := float64(time.Now().Unix())
+        bootEpoch := nowEpoch - uptime
         var lines []string
         for _, l := range strings.Split(text, "\n") {
                 if strings.Contains(l, "proof cookie=") {
@@ -765,7 +772,7 @@ func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{
                 }
                 out = append(out, map[string]interface{}{
                         "boot_ts":  ts,
-                        "epoch_ts": int64(nowEpoch), // v0.9.56: wall-clock read time (always correct)
+                        "epoch_ts": int64(bootEpoch + ts),
                         "alg":      algName(alg),
                         "mbps":     round1(float64(rate) / bpsToMbps),
                         "tier":     tierLabel,
