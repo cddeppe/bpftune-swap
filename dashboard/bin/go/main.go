@@ -89,9 +89,27 @@ func (c *Collector) writeCurrentJSON() {
         os.Rename(tmp, path)
 }
 
-func computeKeyHashes(doc map[string]interface{}) map[string]string {
+// v0.9.83: slow-changing keys that don't need to be hashed every 30s cycle.
+// These are hashed every 4th cycle (every 2 min) to reduce json.Marshal +
+// MD5 overhead. The SSE delta for these keys will be delayed by up to 2 min,
+// which is fine since they rarely change.
+var slowChangingKeys = map[string]bool{
+        "build":     true, // version info — never changes during a session
+        "system":    true, // uptime ticks once per minute, 2-min delay is fine
+        "hostname":  true, // never changes
+        "tunables":  true, // changes only on sysctl writes
+        "log_window": true, // changes only when log range shifts
+}
+
+func computeKeyHashes(doc map[string]interface{}, fullHash bool) map[string]string {
         hashes := make(map[string]string)
         for k, v := range doc {
+                // v0.9.83: skip slow-changing keys on non-full cycles.
+                // Their hash from the previous cycle is reused (the caller
+                // merges newHashes with prevHashes for slow keys).
+                if !fullHash && slowChangingKeys[k] {
+                        continue
+                }
                 data, _ := json.Marshal(v)
                 sum := md5.Sum(data)
                 hashes[k] = fmt.Sprintf("%x", sum)
@@ -115,7 +133,25 @@ func (c *Collector) notifySSE() {
         //
         // The first cycle after startup (prevHashes == nil) sends the full
         // document. Subsequent cycles send only the delta.
-        newHashes := computeKeyHashes(current)
+        //
+        // v0.9.83: hash slow-changing keys only every 4th cycle (every 2 min)
+        // to reduce json.Marshal + MD5 overhead. On non-full cycles, reuse
+        // the previous hash for slow-changing keys so their delta detection
+        // still works (they'll just be delayed by up to 2 min).
+        fullHash := (cycleCount % 4) == 0
+        newHashes := computeKeyHashes(current, fullHash)
+
+        // v0.9.83: on non-full cycles, carry forward the previous hash for
+        // slow-changing keys that weren't recomputed this cycle.
+        if !fullHash && len(prevHashes) > 0 {
+                for k := range slowChangingKeys {
+                        if _, ok := newHashes[k]; !ok {
+                                if prev, ok := prevHashes[k]; ok {
+                                        newHashes[k] = prev
+                                }
+                        }
+                }
+        }
 
         if len(prevHashes) == 0 {
                 // Full document — first push or after reset
@@ -754,16 +790,19 @@ func main() {
                 }
         }()
 
-        // renderSlowToDisk loop (once a day at 4am, or every 24h): 7d + all
+        // renderSlowToDisk loop: 7d + all charts
+        // v0.9.83: changed from daily (4am) to every 30 min so 7d/all charts
+        // stay fresh without manual restart. The cost is ~10-30s of CPU every
+        // 30 min (reads full CSV history), which is acceptable.
+        // Also prunes SQLite rows older than 30 days on each run.
         go func() {
-                // Calculate time until next 4am
-                now := time.Now()
-                next := time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
-                time.Sleep(next.Sub(now))
+                // First run: wait 5 min after startup so the first collect +
+                // renderToDisk cycles complete, then generate 7d+all.
+                time.Sleep(5 * time.Minute)
                 collector.renderSlowToDisk()
-                // v0.9.10: prune SQLite rows older than 30 days daily
                 pruneSQLiteOld(30)
-                ticker := time.NewTicker(24 * time.Hour)
+                // v0.9.83: every 30 min (was every 24h)
+                ticker := time.NewTicker(30 * time.Minute)
                 defer ticker.Stop()
                 for range ticker.C {
                         collector.renderSlowToDisk()

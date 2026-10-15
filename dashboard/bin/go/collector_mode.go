@@ -36,14 +36,19 @@ func parseCollectorMode(mode string) CollectorMode {
         case "debug":
                 return CollectorMode{"debug", 30 * time.Second, 16_000_000, true, true, true, 1, false, 1, false, false}
         case "normal-light":
+                // v0.9.83: reduced log tail from 8MB to 2MB.
+                // The 8MB tail was overkill — the user's log had only ~180KB
+                // of events (1513 lines × ~120 bytes). 2MB still covers
+                // ~17K lines = 100+ collect cycles of events, which is way
+                // more than the 30s cycle needs. Saves ~75% of log I/O +
+                // parsing per cycle.
                 // v0.9.33: normal mode with reduced CPU/memory.
                 // Keeps CSV fallback + 30s interval (dashboard stays fresh).
-                // Reduces log tail to 8MB (50% less parsing).
                 // Throttles CSV writes to every 2nd cycle (60s).
                 // Skips renderToDisk when no new swaps.
                 // Caches BPF map reads when entry count unchanged.
                 return CollectorMode{
-                        "normal-light", 30 * time.Second, 8_000_000,
+                        "normal-light", 30 * time.Second, 2_000_000,
                         true, true, true, 5, true,
                         2, true, true,
                 }
