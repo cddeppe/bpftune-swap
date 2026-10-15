@@ -15,7 +15,6 @@ package main
 
 import (
         "fmt"
-        "net"
         "os"
         "path/filepath"
         "regexp"
@@ -180,11 +179,10 @@ func buildLogPanels(swaps []swapRow,
         topSwaps = topSwapsSlice
 
         // ----- recent_proofs (newest-first, last 18) --------------------------
+        // v0.9.63: always use pl (single-pass parser). Old else-branch deleted.
         var allProofs []interface{}
         if pl != nil {
                 allProofs = pl.GetProofRows(cdest)
-        } else {
-                allProofs = buildRecentProofRows(text, cdest)
         }
         topProofsSlice := lastN(allProofs, 18)
         // v0.9.13: MERGE live + CSV instead of replacing.
@@ -220,10 +218,9 @@ func buildLogPanels(swaps []swapRow,
         }
 
         // ----- bucket_ips (all dest= occurrences, /16 or /32 grouped) ------
+        // v0.9.63: always use pl (single-pass parser). Old else-branch deleted.
         if pl != nil {
                 bucketIPs = pl.GetBucketIPs()
-        } else {
-                bucketIPs = buildBucketIPs(text)
         }
 
         // ----- log_window (oldest/newest swap ts, span, age) ----------------
@@ -236,8 +233,6 @@ func buildLogPanels(swaps []swapRow,
         var logProofsRaw []interface{}
         if pl != nil {
                 logProofsRaw = pl.GetProofsRaw()
-        } else {
-                logProofsRaw = buildProofsRaw(text)
         }
         csvProofsRaw := buildProofsRawFromCSVCached()
         if len(csvProofsRaw) > 0 {
@@ -255,57 +250,6 @@ func buildLogPanels(swaps []swapRow,
 var currentParsedLog *parsedLog
 
 // ============================================================================
-// parseSwapsMetsSrates — extract swap / met / srate events from text
-// ============================================================================
-
-func parseSwapsMetsSrates(text string) (swaps []swapRow,
-        metByCookie map[int64][]metEntry, srateByCookie map[int64][]srateEntry) {
-
-        metByCookie = map[int64][]metEntry{}
-        srateByCookie = map[int64][]srateEntry{}
-
-        for _, line := range strings.Split(text, "\n") {
-                line = strings.TrimSpace(line)
-                if line == "" {
-                        continue
-                }
-                if m := rxSwap.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        cookie, _ := strconv.ParseInt(m[2], 10, 64)
-                        fa, _ := strconv.Atoi(m[3])
-                        ta, _ := strconv.Atoi(m[4])
-                        bc, _ := strconv.Atoi(m[5])
-                        ac, _ := strconv.Atoi(m[6])
-                        row := swapRow{
-                                Ts: ts, Cookie: cookie, From: fa, To: ta, Bc: bc, Ac: ac,
-                                D: m[7], Mt: m[8], Rb: m[9],
-                                Dest: m[10], Dest6: m[11], Dest6b: m[12],
-                        }
-                        swaps = append(swaps, row)
-                        continue
-                }
-                if m := rxMet.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        cookie, _ := strconv.ParseInt(m[2], 10, 64)
-                        rport := m[3]
-                        alg, _ := strconv.Atoi(m[4])
-                        val, _ := strconv.ParseInt(m[6], 10, 64)
-                        metByCookie[cookie] = append(metByCookie[cookie],
-                                metEntry{Ts: ts, Val: val, Rport: rport, Alg: alg})
-                        continue
-                }
-                if m := rxSrate.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        cookie, _ := strconv.ParseInt(m[2], 10, 64)
-                        alg, _ := strconv.Atoi(m[3])
-                        sr, _ := strconv.ParseInt(m[4], 10, 64)
-                        srateByCookie[cookie] = append(srateByCookie[cookie],
-                                srateEntry{Ts: ts, Srate: sr, Alg: alg})
-                }
-        }
-        return swaps, metByCookie, srateByCookie
-}
-
 // ============================================================================
 // buildRecentSwapRows — derive outcome per swap, return dashboard rows
 // ============================================================================
@@ -711,82 +655,6 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
         }
         return out
 }
-
-// ============================================================================
-// buildRecentProofRows — parse proof events, attach dest via cookie map
-// ============================================================================
-
-func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{} {
-        // v0.9.57: Restore correct BPF ktime → epoch conversion
-        uptime := readProcUptime()
-        nowEpoch := float64(time.Now().Unix())
-        bootEpoch := nowEpoch - uptime
-        var lines []string
-        for _, l := range strings.Split(text, "\n") {
-                if strings.Contains(l, "proof cookie=") {
-                        lines = append(lines, l)
-                }
-        }
-        // Take last 18 (oldest → newest), then reverse so newest-first.
-        if len(lines) > 18 {
-                lines = lines[len(lines)-18:]
-        }
-        out := make([]interface{}, 0, len(lines))
-        for _, l := range lines {
-                m := rxProof.FindStringSubmatch(l)
-                if m == nil {
-                        continue
-                }
-                ts, _ := strconv.ParseFloat(m[1], 64)
-                cookie := m[2]
-                alg, _ := strconv.Atoi(m[3])
-                rate, _ := strconv.ParseInt(m[4], 10, 64)
-                tier := m[5]
-                tierLabel := "good"
-                if tier == "2" {
-                        tierLabel = "proved"
-                }
-                dest := ""
-                // v0.9.2: prefer the proof's own dest fields (new in
-                // tuner 0.4.98 — proof printk now carries dest=/dest6=/dest6b=).
-                // This fixes the '(unknown)' issue for passive connections
-                // which fire proofs but never fire estab (so cdest has no
-                // entry for their cookie). Fall back to cdest for older BPF
-                // that doesn't have dest= in the proof line.
-                v4, v6, v6b := m[6], m[7], m[8]
-                if v4 != "" || v6 != "" || v6b != "" {
-                        ds := destStr(v4, v6, v6b)
-                        dest = labelFor(ds)
-                        if dest == "" {
-                                dest = ds
-                        }
-                } else if d, ok := cdest[cookie]; ok {
-                        ds := destStr(d[0], d[1], d[2])
-                        dest = labelFor(ds)
-                        if dest == "" {
-                                dest = ds
-                        }
-                }
-                out = append(out, map[string]interface{}{
-                        "boot_ts":  ts,
-                        "epoch_ts": int64(bootEpoch + ts),
-                        "alg":      algName(alg),
-                        "mbps":     round1(float64(rate) / bpsToMbps),
-                        "tier":     tierLabel,
-                        "dest":     dest,
-                })
-        }
-        return reverse(out)
-}
-
-// ============================================================================
-// cookieDestMap — cookie → (v4, v6) from estab + swap events
-// ============================================================================
-
-// cookieDestMap builds the cookie→dest map from estab + swap events.
-// v0.9.0: stores cdestEntry [3]string{v4, v6, v6b} — dest6b is now
-// captured from both rxSwap (group 12) and rxEstab (group 6, newly added).
-//
 // Merge rule: existing entries are NOT overwritten by empty dest fields
 // (so a swap event without dest6b doesn't blow away a prior estab's value).
 // This is the same BUG 5 fix that was already in place for the [2]string
@@ -830,74 +698,6 @@ func cookieDestMap(text string) map[string]cdestEntry {
         }
         return out
 }
-func buildBucketIPs(text string) map[string]interface{} {
-        buckets := map[string][]string{}
-        p4 := prefix4Value()
-        p6 := prefix6Value()
-        for _, line := range strings.Split(text, "\n") {
-                if m := rxDestInt.FindStringSubmatch(line); m != nil && len(m) > 1 {
-                        n, err := strconv.ParseUint(m[1], 10, 64)
-                        if err != nil || n == 0 {
-                                continue
-                        }
-                        // Build 4-byte v4 IP.
-                        b := make([]byte, 4)
-                        b[0] = byte(n >> 24)
-                        b[1] = byte(n >> 16)
-                        b[2] = byte(n >> 8)
-                        b[3] = byte(n)
-                        full := net.IP(b).String()
-                        // Mask with prefix4.
-                        mask := net.CIDRMask(p4, 32)
-                        masked := net.IP(b).Mask(mask).String()
-                        if !contains(buckets[masked], full) {
-                                buckets[masked] = append(buckets[masked], full)
-                        }
-                }
-                if m := rxDest6.FindStringSubmatch(line); m != nil && len(m) > 1 {
-                        n6, err := strconv.ParseUint(m[1], 10, 64)
-                        if err != nil || n6 == 0 {
-                                continue
-                        }
-                        // Build 16-byte v6 IP (top 32 bits = n6, rest = 0).
-                        ip := make([]byte, 16)
-                        ip[0] = byte(n6 >> 24)
-                        ip[1] = byte(n6 >> 16)
-                        ip[2] = byte(n6 >> 8)
-                        ip[3] = byte(n6)
-                        // Build full form (may include dest6b for /64 form).
-                        fullIP := make([]byte, 16)
-                        copy(fullIP, ip)
-                        if m2 := rxDest6B.FindStringSubmatch(line); m2 != nil && len(m2) > 1 {
-                                n6b, err := strconv.ParseUint(m2[1], 10, 64)
-                                if err == nil && n6b != 0 {
-                                        fullIP[4] = byte(n6b >> 24)
-                                        fullIP[5] = byte(n6b >> 16)
-                                        fullIP[6] = byte(n6b >> 8)
-                                        fullIP[7] = byte(n6b)
-                                }
-                        }
-                        fullV6 := net.IP(fullIP).String()
-                        // Mask with prefix6.
-                        mask := net.CIDRMask(p6, 128)
-                        masked := net.IP(ip).Mask(mask).String()
-                        if !contains(buckets[masked], fullV6) {
-                                buckets[masked] = append(buckets[masked], fullV6)
-                        }
-                }
-        }
-        out := map[string]interface{}{}
-        for k, v := range buckets {
-                // Cast []string → []interface{} for JSON marshalling.
-                iface := make([]interface{}, len(v))
-                for i, s := range v {
-                        iface[i] = s
-                }
-                out[k] = iface
-        }
-        return out
-}
-
 // ============================================================================
 // buildLogWindow — oldest/newest swap ts + span/age info
 // ============================================================================
@@ -961,60 +761,6 @@ func buildLogWindow(swaps []swapRow, proofs []interface{}) map[string]interface{
                 "age_min":    ageMin,
         }
 }
-
-// ============================================================================
-// buildProofsRaw — proof leaderboard (good/proved/sampled per alg)
-// ============================================================================
-
-func buildProofsRaw(text string) []interface{} {
-        events, samples := proofEvents(text)
-        algSet := map[int]bool{}
-        for a := range events {
-                algSet[a] = true
-        }
-        for a := range samples {
-                algSet[a] = true
-        }
-        var algs []int
-        for a := range algSet {
-                algs = append(algs, a)
-        }
-        sort.Ints(algs)
-        out := make([]interface{}, 0, len(algs))
-        for _, a := range algs {
-                e := events[a]
-                s := samples[a]
-                var provenMax, sampledAvg, sampledMax interface{}
-                if e.provenMax > 0 {
-                        provenMax = round1(float64(e.provenMax) / bpsToMbps)
-                }
-                if s.n > 0 {
-                        sampledAvg = round1(float64(s.sum) / float64(s.n) / bpsToMbps)
-                        sampledMax = round1(float64(s.sampMax) / bpsToMbps)
-                }
-                var samplesN interface{}
-                if s.n > 0 {
-                        samplesN = s.n
-                }
-                out = append(out, map[string]interface{}{
-                        "alg":         algName(a),
-                        "good":        e.good,
-                        "proved":      e.proved,
-                        "proven_max":  provenMax,
-                        "sampled_avg": sampledAvg,
-                        "sampled_max": sampledMax,
-                        "samples":     samplesN,
-                })
-        }
-        // Sort descending by proven_max (treat nil as 0).
-        sort.Slice(out, func(i, j int) bool {
-                vi, _ := out[i].(map[string]interface{})["proven_max"].(float64)
-                vj, _ := out[j].(map[string]interface{})["proven_max"].(float64)
-                return vi > vj
-        })
-        return out
-}
-
 type proofEvent struct {
         good, proved int
         provenMax    int64
@@ -1024,86 +770,6 @@ type proofSample struct {
         n       int
         sampMax int64
 }
-
-func proofEvents(text string) (map[int]proofEvent, map[int]proofSample) {
-        events := map[int]proofEvent{}
-        samples := map[int]proofSample{}
-        metByCookie := map[int64][]struct {
-                Ts  float64
-                Alg int
-        }{}
-
-        for _, line := range strings.Split(text, "\n") {
-                if strings.Contains(line, "proof cookie=") {
-                        m := rxProof.FindStringSubmatch(line)
-                        if m == nil {
-                                continue
-                        }
-                        a, _ := strconv.Atoi(m[3])
-                        rate, _ := strconv.ParseInt(m[4], 10, 64)
-                        tier := m[5]
-                        e := events[a]
-                        if tier == "2" {
-                                e.proved++
-                        } else {
-                                e.good++
-                        }
-                        if rate > e.provenMax {
-                                e.provenMax = rate
-                        }
-                        events[a] = e
-                        continue
-                }
-                if m := rxMet.FindStringSubmatch(line); m != nil {
-                        ts, _ := strconv.ParseFloat(m[1], 64)
-                        c, _ := strconv.ParseInt(m[2], 10, 64)
-                        alg, _ := strconv.Atoi(m[4])
-                        metByCookie[c] = append(metByCookie[c],
-                                struct {
-                                        Ts  float64
-                                        Alg int
-                                }{ts, alg})
-                }
-        }
-        const metWindowS = 60.0
-        for _, line := range strings.Split(text, "\n") {
-                m := rxMidsamp.FindStringSubmatch(line)
-                if m == nil {
-                        continue
-                }
-                ts, _ := strconv.ParseFloat(m[1], 64)
-                c, _ := strconv.ParseInt(m[2], 10, 64)
-                r, _ := strconv.ParseInt(m[3], 10, 64)
-                if r <= 0 {
-                        continue
-                }
-                cand := metByCookie[c]
-                var bestA int = -1
-                var bestD float64 = -1
-                for _, e := range cand {
-                        d := e.Ts - ts
-                        if d < 0 {
-                                d = -d
-                        }
-                        if bestD < 0 || d < bestD {
-                                bestD = d
-                                bestA = e.Alg
-                        }
-                }
-                if bestA < 0 || bestD < 0 || bestD > metWindowS {
-                        continue
-                }
-                s := samples[bestA]
-                s.sum += r
-                s.n++
-                if r > s.sampMax {
-                        s.sampMax = r
-                }
-                samples[bestA] = s
-        }
-        return events, samples
-}
-
 // ============================================================================
 // Dest decoding (numeric → IP string)
 // ============================================================================
