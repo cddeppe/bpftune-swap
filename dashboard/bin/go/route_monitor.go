@@ -309,6 +309,28 @@ func ipv6ToBpfHex(ip string) string {
 // v0.9.73: added `hosts` parameter so the per-protocol min_rtt lookup
 // at line ~308 can read from the caller's local snapshot instead of
 // reading the package-level lastHostsSnapshot without a lock.
+//
+// v0.9.74: BUGFIX — three interrelated bugs caused the Origin Health
+// panel to show "v4: no data" for both single-stack AND dual-stack
+// destinations even when the BPF map had real v4 RTT data:
+//
+//   1. Early return at line 320 for single-stack destinations skipped
+//      ALL metric population, not just the switch logic. So every
+//      v4-only or v6-only entry in the panel showed "no data".
+//   2. The hosts-snapshot loop did `break` after finding the FIRST
+//      matching host. For dual-stack destinations there are TWO
+//      matching hosts (the v4 bucket and the v6 bucket), and only
+//      one of V4MinRTT/V6MinRTT is non-zero on each. If the first
+//      match was the v6 bucket, v4BpfRTT was never populated from
+//      the hosts snapshot, leaving the panel showing v4 "no data".
+//   3. The ICMP ping fallback was gated on `hasV4 && hasV6`, so
+//      single-stack destinations never got a ping either.
+//
+// The fix: (1) replace the early return with a `canSwitch` flag that
+// only gates the switch logic at the bottom; (2) remove the `break`
+// so we visit ALL matching hosts; (3) drop the `hasV4 && hasV6`
+// requirement from the ping conditions so single-stack destinations
+// can also fall back to ICMP.
 func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState, bpfHealth map[string]interface{}, hosts []hostEntry) {
         state.mu.Lock()
         hasV4 := state.HasIPv4
@@ -317,9 +339,11 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         v6Addr := state.IPv6Addr
         state.mu.Unlock()
 
-        if !hasV4 || !hasV6 {
-                return // single-stack, can't switch
-        }
+        // v0.9.74: do NOT return early for single-stack destinations —
+        // we still need to populate state.V4RTT / state.V6RTT so the
+        // panel can show their BPF-measured RTT. Only the switch logic
+        // at the bottom requires both protocols.
+        canSwitch := hasV4 && hasV6
 
         // Read BPF metrics
         // v0.9.38: read per-protocol min_rtt directly from the hosts snapshot.
@@ -356,6 +380,12 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
         // v0.9.73: read from the `hosts` parameter (caller's local snapshot)
         // instead of the package-level lastHostsSnapshot — eliminates the
         // data race on that var.
+        // v0.9.74: do NOT `break` after the first matching host. For dual-stack
+        // destinations there are typically two matching hosts (the v4 bucket
+        // like "130.61.0.0" with V4MinRTT > 0 and the v6 bucket like
+        // "v6:26061a40" with V6MinRTT > 0). The old `break` meant we only
+        // saw one of them — if v6 came first, v4BpfRTT stayed at 0 and the
+        // panel showed "v4: no data".
         if hosts != nil {
                 for _, h := range hosts {
                         if h.Inst < 2 { continue }
@@ -370,16 +400,20 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                                 v6BpfRTT = h.V6MinRTT / 1000.0
                                 usingBPF = true
                         }
-                        break // found this label
                 }
         }
 
         // v0.9.35: minimal ICMP — only 1 ping, only dual-stack, only when BPF has no data
         // v0.9.37: ICMP returns -1,-1 when it can't get data (blocked, no route).
         // Don't overwrite BPF data with -1; only use ICMP result if it's > 0.
+        // v0.9.74: drop the `hasV4 && hasV6` requirement so single-stack
+        // destinations can also fall back to ICMP. (Note: on cloud providers
+        // that block ICMP, ping will return -1 and we keep RTT=0 — which the
+        // panel renders as "no data". That's an environment limitation, not
+        // a code bug.)
         var v4PingRTT, v4PingLoss, v6PingRTT, v6PingLoss float64
-        needV4Ping := hasV4 && hasV6 && v4BpfRTT == 0 && v4Addr != ""
-        needV6Ping := hasV4 && hasV6 && v6BpfRTT == 0 && v6Addr != ""
+        needV4Ping := hasV4 && v4BpfRTT == 0 && v4Addr != ""
+        needV6Ping := hasV6 && v6BpfRTT == 0 && v6Addr != ""
         if needV4Ping || needV6Ping {
                 usingBPF = false
                 if needV4Ping {
@@ -437,7 +471,10 @@ func (rm *RouteMonitor) evaluateDestination(label string, state *destRouteState,
                 state.v6BadStreak = 0; state.v6GoodStreak = 0
         }
 
-        // Switch logic
+        // Switch logic — only for dual-stack destinations
+        if !canSwitch {
+                return
+        }
         if (state.PreferredProto == "" || state.PreferredProto == "ipv4") &&
                 state.v4BadStreak >= switchThreshold && state.v6GoodStreak >= switchThreshold {
                 rm.switchTo(state, "ipv6",
