@@ -88,6 +88,17 @@
   function setHTML(id, s) { var e = $(id); if (e) e.innerHTML = s; }
   /* 0.4.79: monotonic-age label for recent swaps / proofs. */
   var SERVER_NOW_MONO = 0;
+
+  // v0.9.65: single helper for BPF ktime → epoch conversion.
+  // Used by renderSwaps, swaps-per-bin, and renderScoreNow.
+  // Replaces 3 copies of the same formula.
+  function epochOf(row, sseDoc) {
+    if (row.epoch_ts) return row.epoch_ts;
+    var now = (sseDoc.generated_ts) || (Date.now() / 1000);
+    var monoOffset = (sseDoc.now_mono && sseDoc.now_mono > 0) ? (now - sseDoc.now_mono) : 0;
+    return (row.ts || 0) + monoOffset;
+  }
+
   // v0.9.20: ageLabel accepts optional epoch_ts (wall-clock).
   // When boot_ts is from a PREVIOUS boot (age < 0), fall back to
   // epoch_ts so ages display correctly after a reboot.
@@ -2507,15 +2518,12 @@
       var sw = sse.swap_outcomes.swaps_list;
       var now = (sse.generated_ts) || (Date.now()/1000);
       var fixedAxis = buildFixedAxis(rng, now);
-      var monoOffset = (sse.now_mono && sse.now_mono > 0) ? (now - sse.now_mono) : 0;
       if (fixedAxis) {
         window.__chart_axis_min = fixedAxis.ts[0] * 1000;
         window.__chart_axis_max = fixedAxis.ts[fixedAxis.ts.length - 1] * 1000;
         var swapCounts = fixedAxis.ts.map(function(){return 0;});
         sw.forEach(function(s) {
-          // v0.9.56: use epoch_ts (wall-clock) instead of s.ts + monoOffset
-          // (BPF ktime conversion that breaks on reboot/migration)
-          var t = s.epoch_ts || (s.ts || 0) + monoOffset;
+          var t = epochOf(s, sse);
           var fa = fixedAxis.ts;
           if (t < fa[0] || t > fa[fa.length - 1]) return;
           if (t <= fa[0]) { swapCounts[0]++; return; }
@@ -2633,7 +2641,6 @@
       // where offset = generated_ts - now_mono.  Without this, all swaps fall
       // outside the [now-rSec, now] window (since swap.ts ~= 887000 but
       // generated_ts ~= 1790700000) and no bars appear.
-      var monoOffset = (sse.now_mono && sse.now_mono > 0) ? (now - sse.now_mono) : 0;
       // Set min/max globals (same as renderBucket) so this chart's x-axis
       // also spans the full fixed window even where bins are 0.
       if (fixedAxis) {
@@ -2649,7 +2656,7 @@
         // to its nearest bin via binary search.  Empty bins -> 0 bars.
         var swapCounts = fixedAxis.ts.map(function(){return 0;});
         sw.forEach(function(s) {
-          var t = s.epoch_ts || (s.ts || 0) + monoOffset;   // v0.9.56: prefer epoch_ts (wall-clock)
+          var t = epochOf(s, sse);
           var fa = fixedAxis.ts;
           if (t < fa[0] || t > fa[fa.length - 1]) return;
           if (t <= fa[0]) { swapCounts[0]++; return; }
@@ -2672,7 +2679,7 @@
         var bSec = 86400;
         var bins = {};
         sw.forEach(function(s) {
-          var t = (s.ts || 0) + monoOffset;   // monotonic -> epoch
+          var t = epochOf(s, sse);
           var b = Math.floor(t/bSec)*bSec;
           bins[b] = (bins[b]||0)+1;
         });

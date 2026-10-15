@@ -491,12 +491,10 @@ func (pl *parsedLog) GetProofRows(cdest map[string]cdestEntry) []interface{} {
                                 dest = ds
                         }
                 }
-                // v0.9.31 (Bug 1): add epoch_ts for age label (was missing)
-                uptime := readProcUptime()
-                nowEpoch := float64(time.Now().Unix())
+                // v0.9.65: use epochOf() helper instead of inline formula
                 out = append(out, map[string]interface{}{
                         "boot_ts":  ts,
-                        "epoch_ts": int64(nowEpoch - uptime + ts),
+                        "epoch_ts": epochOf(ts),
                         "alg":      algName(alg),
                         "mbps":     round1(float64(rate) / bpsToMbps),
                         "tier":     tierLabel,

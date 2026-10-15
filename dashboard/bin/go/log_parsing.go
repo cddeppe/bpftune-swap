@@ -259,16 +259,7 @@ func buildRecentSwapRows(swaps []swapRow,
         srateByCookie map[int64][]srateEntry,
         cdest map[string]cdestEntry) []interface{} {
 
-        // v0.9.57: Restore correct BPF ktime → epoch conversion.
-        // epoch_ts = nowEpoch - uptime + boot_ts
-        // This is the actual swap event time in wall-clock epoch.
-        // The frontend also does this same conversion as a fallback:
-        //   monoOffset = generated_ts - now_mono (= epoch_boot)
-        //   t = s.ts + monoOffset (= epoch_event)
-        nowEpoch := time.Now().Unix()
-        uptime := readProcUptime()
-        bootEpoch := float64(nowEpoch) - uptime
-
+        // v0.9.65: use epochOf() helper instead of inline formula
         rows := make([]interface{}, 0, len(swaps))
         for _, sw := range swaps {
                 o := outcomeComposite(metByCookie, sw.Cookie, sw.Ts)
@@ -310,7 +301,7 @@ func buildRecentSwapRows(swaps []swapRow,
 
                 row := map[string]interface{}{
                         "boot_ts":           sw.Ts,
-                        "epoch_ts":          int64(bootEpoch + sw.Ts),
+                        "epoch_ts":          epochOf(sw.Ts),
                         "from_alg":          fromAlg,
                         "to_alg":            toAlg,
                         "d":                 d,
@@ -629,10 +620,7 @@ func fieldValue(s swapOutRow, field string) string {
 }
 
 func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
-        // v0.9.57: Restore correct BPF ktime → epoch conversion
-        nowEpoch := time.Now().Unix()
-        uptime := readProcUptime()
-        bootEpoch := float64(nowEpoch) - uptime
+        // v0.9.65: use epochOf() helper
         out := make([]interface{}, 0, len(swaps))
         for _, s := range swaps {
                 // BUG 14 fix: use nil for unmeasured outcomes (dashboard expects null, not "")
@@ -645,7 +633,7 @@ func buildSwapsListForOutcomes(swaps []swapOutRow) []interface{} {
                 }
                 out = append(out, map[string]interface{}{
                         "ts":                s.Ts,
-                        "epoch_ts":          int64(bootEpoch + s.Ts),
+                        "epoch_ts":          epochOf(s.Ts),
                         "boot_ts":           s.Ts,
                         "cookie":            s.Cookie,
                         "dest":              s.Dest,
@@ -743,16 +731,15 @@ func buildLogWindow(swaps []swapRow, proofs []interface{}) map[string]interface{
         if !haveFirst {
                 return emptyLogWindow()
         }
-        uptime := readProcUptime()
-        now := float64(time.Now().Unix())
-        oldestWall := int64(now - uptime + oldest)
+        // v0.9.65: use epochOf() helper
+        oldestWall := epochOf(oldest)
         var newestWall int64
-        if newest > uptime {
+        if newest > readProcUptime() {
                 newestWall = readLogFileMtime()
         } else {
-                newestWall = int64(now - uptime + newest)
+                newestWall = epochOf(newest)
         }
-        ageMin := round1((now - float64(newestWall)) / 60.0)
+        ageMin := round1((float64(time.Now().Unix()) - float64(newestWall)) / 60.0)
         return map[string]interface{}{
                 "oldest_ts":  oldestWall,
                 "newest_ts":  newestWall,
@@ -894,6 +881,19 @@ func readLogTail(budget int64) string {
                 remaining -= take
         }
         return sb.String()
+}
+
+// bootEpoch returns the wall-clock epoch time of the system boot.
+// Used by all timestamp conversions: epoch_of_event = bootEpoch() + bpf_ktime.
+// v0.9.65: single helper replaces 3 copies of the formula across log_parsing.go + singlepass.go.
+func bootEpoch() float64 {
+        return float64(time.Now().Unix()) - readProcUptime()
+}
+
+// epochOf converts a BPF ktime timestamp (seconds since boot) to wall-clock epoch.
+// All swap/proof timestamps go through this single function.
+func epochOf(bpfKtime float64) int64 {
+        return int64(bootEpoch() + bpfKtime)
 }
 
 // readProcUptime returns /proc/uptime seconds (or 0 on error).
