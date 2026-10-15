@@ -108,7 +108,9 @@ func (rm *RouteMonitor) cycle() {
 }
 
 // discoverDestinations finds dual-stack destinations from BPF map + aliases.
-// NO DNS lookups — only uses the aliases file and BPF map entries.
+// v0.9.72: also links v4 and v6 entries via ctrld DNS cache — if the
+// same domain resolves to both v4 and v6 IPs, the BPF map entries
+// are linked as dual-stack even without aliases.
 func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[string]interface{}) {
         aliasLabels := loadAliasesLabelsMap()
         type protoAddrs struct{ v4, v6 string }
@@ -119,6 +121,32 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 if strings.Contains(ip, ":") { pa.v6 = ip } else { pa.v4 = ip }
         }
 
+        // v0.9.72: Build a domain→{v4prefix, v6prefix} map from ctrld cache.
+        // This lets us link v4 BPF entries like "130.61.0.0" with v6 entries
+        // like "v6:26061a40" when they belong to the same domain.
+        type domPrefixes struct{ v4, v6 string }
+        domainMap := map[string]*domPrefixes{}
+        ctrldState.mu.RLock()
+        if ctrldState.available {
+                for ip, domain := range ctrldState.ipToDomain {
+                        dp, ok := domainMap[domain]
+                        if !ok { dp = &domPrefixes{}; domainMap[domain] = dp }
+                        if strings.Contains(ip, ":") {
+                                // IPv6 — extract first 4 bytes as hex prefix
+                                // e.g. "2606:1a40:3::1" → "26061a40" → "v6:26061a40"
+                                hex := ipv6ToBpfHex(ip)
+                                if hex != "" { dp.v6 = "v6:" + hex }
+                        } else {
+                                // IPv4 — extract /16 prefix
+                                parts := strings.Split(ip, ".")
+                                if len(parts) >= 2 {
+                                        dp.v4 = parts[0] + "." + parts[1] + ".0.0"
+                                }
+                        }
+                }
+        }
+        ctrldState.mu.RUnlock()
+
         byLabel := map[string][]hostEntry{}
         for _, h := range hosts {
                 if h.Inst < 2 { continue }
@@ -128,6 +156,54 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 lbl := labelFor(addr)
                 if lbl == "" { lbl = addr }
                 byLabel[lbl] = append(byLabel[lbl], h)
+        }
+
+        // v0.9.72: Also link v4 and v6 entries via domain matching.
+        // For each v4-only entry, check if ctrld knows a v6 counterpart.
+        // For each v6-only entry, check if ctrld knows a v4 counterpart.
+        for lbl, entries := range byLabel {
+                hasV4, hasV6 := false, false
+                for _, h := range entries {
+                        if strings.Contains(h.Addr, ":") || strings.HasPrefix(h.Addr, "v6:") {
+                                hasV6 = true
+                        } else {
+                                hasV4 = true
+                        }
+                }
+                // If only v4, try to find v6 counterpart via domain
+                if hasV4 && !hasV6 {
+                        for _, domain := range []string{} {
+                                _ = domain
+                        }
+                        // Look up domain for this v4 label
+                        domain := getDomainForBucket(lbl)
+                        if domain != "" {
+                                if dp, ok := domainMap[domain]; ok && dp.v6 != "" {
+                                        // Check if the v6 BPF entry exists in hosts
+                                        for _, h := range hosts {
+                                                if h.Addr == dp.v6 && h.Inst >= 2 {
+                                                        // Found the v6 counterpart — add it
+                                                        byLabel[lbl] = append(byLabel[lbl], h)
+                                                        break
+                                                }
+                                        }
+                                }
+                        }
+                }
+                // If only v6, try to find v4 counterpart via domain
+                if hasV6 && !hasV4 {
+                        domain := getDomainForBucket(lbl)
+                        if domain != "" {
+                                if dp, ok := domainMap[domain]; ok && dp.v4 != "" {
+                                        for _, h := range hosts {
+                                                if h.Addr == dp.v4 && h.Inst >= 2 {
+                                                        byLabel[lbl] = append(byLabel[lbl], h)
+                                                        break
+                                                }
+                                        }
+                                }
+                        }
+                }
         }
 
         allLabels := map[string]bool{}
@@ -169,6 +245,20 @@ func (rm *RouteMonitor) discoverDestinations(hosts []hostEntry, bpfHealth map[st
                 if hasV6 { state.IPv6Addr = v6Addr }
                 state.mu.Unlock()
         }
+}
+
+// ipv6ToBpfHex converts a full IPv6 address to the BPF map's 8-hex-char
+// prefix format. e.g. "2606:1a40:3::1" → "26061a40"
+func ipv6ToBpfHex(ip string) string {
+        // Take the first two hextets: "2606:1a40:..." → "2606" + "1a40"
+        parts := strings.Split(ip, ":")
+        if len(parts) < 2 { return "" }
+        h1 := parts[0]
+        h2 := parts[1]
+        // Pad to 4 chars each
+        for len(h1) < 4 { h1 = "0" + h1 }
+        for len(h2) < 4 { h2 = "0" + h2 }
+        return h1 + h2
 }
 
 // evaluateDestination uses BPF data with minimal ICMP fallback.
