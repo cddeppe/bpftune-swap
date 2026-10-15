@@ -3065,7 +3065,95 @@ function _populateBucketSelect(desiredBucket) {
 })();
 
   /* ---- Label Editor Modal (reads /etc/bpftune/aliases groups) ---- */
+  // v0.9.66: moved from index.html inline script to here (was duplicated)
   function _le_esc(s) { return String(s==null?'':s).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+
+  /* ---- Inline IP label edit (click on a bucket name) ---- */
+  function ipLabelEdit(el) {
+    var ip = el.getAttribute('data-ip');
+    if (!ip) return;
+    var old = el.textContent;
+    var input = document.createElement('input');
+    input.type = 'text'; input.className = 'ip-edit';
+    input.value = el.getAttribute('data-label') || '';
+    input.placeholder = 'label...';
+    input.style.width = Math.max(80, old.length * 8 + 20) + 'px';
+    el.textContent = '';
+    el.appendChild(input);
+    input.focus(); input.select();
+    var done = false;
+    function save() {
+      if (done) return; done = true;
+      var label = input.value.trim();
+      fetch('/api/labels', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ip: ip, label: label})})
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.ok) {
+            el.textContent = label || ip;
+            el.setAttribute('data-label', label);
+            if (window.__liveFetch) window.__liveFetch();
+          } else {
+            el.textContent = old;
+          }
+        })
+        .catch(function() { el.textContent = old; });
+    }
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); save(); }
+      if (e.key === 'Escape') { done = true; el.textContent = old; }
+    });
+    input.addEventListener('blur', save);
+  }
+  document.addEventListener('click', function(e) {
+    var el = e.target.closest('.ip-label');
+    if (el && !el.querySelector('input')) ipLabelEdit(el);
+  });
+
+  /* ---- Bucket IPs (individual IPs inside masked buckets) ---- */
+  var _bucketIps = null;
+  var _allLabels = [];
+
+  function loadBucketIps() {
+    fetch('current.json', {cache: 'no-store'}).then(function(r) { return r.json(); }).then(function(doc) {
+      var buckets = doc.bucket_ips || {};
+      fetch('/api/labels').then(function(r) { return r.json(); }).then(function(ld) {
+        var labels = ld.labels || {};
+        _allLabels = Object.keys(labels).map(function(ip) { return labels[ip]; }).filter(function(l,i,a){ return a.indexOf(l)===i; }).sort();
+        renderBucketIps(buckets, labels);
+      }).catch(function() { renderBucketIps(buckets, {}); });
+    }).catch(function() {
+      document.getElementById('bucket-ips-list').innerHTML = '<div style="font-size:11px;color:var(--muted)">Could not fetch current.json</div>';
+    });
+  }
+
+  function renderBucketIps(buckets, labels) {
+    var unlabeled = {};
+    Object.keys(buckets).forEach(function(m) { if (!labels[m]) unlabeled[m] = buckets[m]; });
+    buckets = unlabeled;
+    var html = '';
+    Object.keys(buckets).sort(function(a,b) { return (labels[a]||a).localeCompare(labels[b]||b); }).forEach(function(masked) {
+      var ips = buckets[masked];
+      var label = labels[masked] || masked;
+      var count = ips.length;
+      html += '<div style="margin-bottom:8px"><b style="font-size:12px">' + _le_esc(label) + '</b>';
+      html += ' <span style="color:var(--muted);font-size:10px">' + count + ' IPs</span>';
+      html += ' <button onclick="_bi_toggle(\'' + _le_esc(masked) + '\')" style="font-size:10px;padding:0 4px;cursor:pointer">show</button>';
+      html += '</div>';
+      html += '<div id="bi-' + _le_esc(masked) + '" style="display:none;margin-left:16px">';
+      ips.forEach(function(ip) {
+        var opts = '<option value="">move to...</option>';
+        _allLabels.forEach(function(l) { opts += '<option value="' + _le_esc(l) + '">' + _le_esc(l) + '</option>'; });
+        opts += '<option value="__new__">new label...</option>';
+        html += '<div style="font-size:11px;padding:2px 0">' + _le_esc(ip) + ' ';
+        html += '<select onchange="_bi_move(\'' + ip + '\',\'' + _le_esc(masked) + '\',this.value)" style="font-size:10px;border:1px solid var(--muted);border-radius:3px">' + opts + '</select>';
+        html += '</div>';
+      });
+      html += '</div>';
+    });
+    document.getElementById('bucket-ips-list').innerHTML = html || '<div class="placeholder" style="font-size:11px;color:var(--muted)">All IPs are labeled</div>';
+  }
+
   function openLabelEditor() {
     fetch('/api/labels').then(function(r) { return r.json(); }).then(function(d) {
       _le_render(d.labels || {}, d.groups || {});
