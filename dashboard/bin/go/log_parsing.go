@@ -153,33 +153,12 @@ func buildLogPanels(swaps []swapRow,
         pl := currentParsedLog
 
         // ----- recent_swaps (newest-first, last 18) --------------------------
+        // v0.9.58: Don't merge CSV fallback for recent swaps — same as proofs.
+        // The CSV fallback used collected_ts (collector read time) as epoch_ts,
+        // which is NOT the swap event time. This caused swaps to show wrong ages
+        // ("1h ago" etc). Just show whatever live swaps are available.
         allSwaps := buildRecentSwapRows(swaps, metByCookie, srateByCookie, cdest)
         topSwapsSlice := lastN(allSwaps, 18)
-        // v0.9.13: MERGE live + CSV instead of replacing. The old code
-        // did topSwapsSlice = csvSwaps which LOST all live swaps when
-        // the log had fewer than 18. Now we merge both sources, dedup
-        // by boot_ts+cookie, and take the newest 18.
-        // v0.9.44: Only merge CSV swaps from the last 24 hours. The old
-        // code read the last 18 rows of swaps.csv regardless of age,
-        // which showed swaps from 2-3 days ago in the "recent swaps" panel.
-        if len(topSwapsSlice) < 18 {
-                csvSwaps := readRecentSwapsFromCSV(50) // read more, then filter by age
-                if len(csvSwaps) > 0 {
-                        // Filter to last 24 hours only
-                        var recentCsvSwaps []interface{}
-                        cutoff := now - 24*3600
-                        for _, s := range csvSwaps {
-                                if m, ok := s.(map[string]interface{}); ok {
-                                        if ts, ok := m["epoch_ts"].(int64); ok && ts >= cutoff {
-                                                recentCsvSwaps = append(recentCsvSwaps, s)
-                                        }
-                                }
-                        }
-                        if len(recentCsvSwaps) > 0 {
-                                topSwapsSlice = mergeSwapsNewestFirst(topSwapsSlice, recentCsvSwaps, 18)
-                        }
-                }
-        }
         topSwaps = topSwapsSlice
 
         // ----- recent_proofs (newest-first, last 18) --------------------------
