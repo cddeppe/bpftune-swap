@@ -2445,16 +2445,30 @@
       return;
     }
 
-    // Sort: dual-stack first (most interesting), then by label
+    // v0.9.80: Sort by DATA presence first (entries with v4 or v6 RTT data
+    // show before "no data" entries), then dual-stack first, then by label.
+    // Previously sorted dual-stack first then by label — but with a 10-entry
+    // limit, the v6-only entries (like 2a00:1450::, 2001:4860::, 2603:c020::)
+    // were sorted to the bottom and cut off, making it look like "IPv6 is
+    // missing" when the v6 buckets actually existed in the BPF map.
     var sorted = rm.slice().sort(function(a, b) {
+      var aHas = (a.v4_has_data !== false && a.v4_rtt_ms > 0) ||
+                 (a.v6_has_data !== false && a.v6_rtt_ms > 0) ||
+                 (a.v4_in_rtt_ms > 0) || (a.v4_out_rtt_ms > 0) ||
+                 (a.v6_in_rtt_ms > 0) || (a.v6_out_rtt_ms > 0);
+      var bHas = (b.v4_has_data !== false && b.v4_rtt_ms > 0) ||
+                 (b.v6_has_data !== false && b.v6_rtt_ms > 0) ||
+                 (b.v4_in_rtt_ms > 0) || (b.v4_out_rtt_ms > 0) ||
+                 (b.v6_in_rtt_ms > 0) || (b.v6_out_rtt_ms > 0);
+      if (aHas !== bHas) return aHas ? -1 : 1;
       var aDual = (a.has_ipv4 && a.has_ipv6) ? 0 : 1;
       var bDual = (b.has_ipv4 && b.has_ipv6) ? 0 : 1;
       if (aDual !== bDual) return aDual - bDual;
       return (a.label || "").localeCompare(b.label || "");
     });
 
-    // Show up to 10
-    var shown = sorted.slice(0, 10);
+    // v0.9.80: show up to 25 (was 10) so v6-only entries aren't cut off.
+    var shown = sorted.slice(0, 25);
 
     var html = '<div class="route-health origin-grid">';
     shown.forEach(function(r) {
