@@ -26,8 +26,30 @@ import (
         "os/exec"
         "strconv"
         "strings"
+        "sync"
         "time"
 )
+
+// v0.9.76: Escalation state for the trace capture service health check.
+// When the log goes stale, the health monitor used to just restart the
+// trace service every 5 minutes — which doesn't help if the kernel's
+// tracing subsystem itself is broken (BPF programs loaded but not
+// writing to trace_pipe). The user had to manually reboot the machine.
+//
+// Now we escalate:
+//   Level 1: log stale → restart trace service (up to 3 times in 15 min)
+//   Level 2: still stale after 3 trace restarts → restart bpftune
+//   Level 3: still stale after bpftune restart → set needs_reboot=true,
+//            alert the user via service_health["needs_reboot"]
+//
+// Only a full machine reboot can fix Level 3 (kernel tracing subsystem
+// is broken). The health monitor can DETECT this but cannot FIX it.
+var traceEscalation struct {
+        mu                  sync.Mutex
+        traceRestarts       []time.Time // timestamps of recent trace service restarts
+        bpftuneRestartTried time.Time   // when we last restarted bpftune
+        needsReboot        bool         // Level 3: kernel tracing is broken, needs manual reboot
+}
 
 // ensureSystemHealth runs on collector startup and fixes system-level
 // settings that the bpftune tuner needs. All idempotent — safe to run
@@ -183,30 +205,26 @@ func checkBPFPrograms() {
 }
 
 // ensureTraceCaptureService ensures the bpftune-met-trace service is
-// running. This service reads from /sys/kernel/debug/tracing/trace_pipe
-// and writes to /var/log/bpftune-met-live.log. When it dies, the log
-// goes stale and the dashboard shows no recent swaps even though the
-// tuner is actively swapping.
+// running AND that events are actually flowing through the trace_pipe.
 //
-// v0.9.46: This is the #1 cause of "dashboard shows no swaps".
-// The service can die from OOM, kernel updates, or manual stop.
-// The collector now auto-restarts it.
+// v0.9.76: Complete rewrite of the stale-log handling. The old code
+// just restarted the trace service every 5 minutes when the log was
+// stale — which created an infinite loop when the kernel's tracing
+// subsystem itself was broken (BPF programs loaded but not writing
+// to trace_pipe). The user had to manually reboot the machine to fix
+// it, and the health monitor never alerted them.
 //
-// v0.9.54: Also clears stale log entries from previous boots.
-// When bpftune restarts, the log file still has events from the previous
-// boot. These old events have BPF timestamps from the old boot, causing
-// the dashboard to show wrong ages (e.g. "1 hour ago" when swaps are
-// actually happening now). The collector now clears the log on startup
-// and when it detects events from a previous boot.
+// Now we escalate through three levels:
+//   Level 1: log stale → restart trace service (up to 3 times in 15 min)
+//   Level 2: still stale after 3 trace restarts → restart bpftune
+//   Level 3: still stale after bpftune restart → set needs_reboot=true
+//
+// Only a full machine reboot can fix Level 3. The health monitor sets
+// needs_reboot in service_health so the dashboard can display a warning.
 func ensureTraceCaptureService() {
         const serviceName = "bpftune-met-trace"
         const serviceFilePath = "/etc/systemd/system/bpftune-met-trace.service"
         const logPath = "/var/log/bpftune-met-live.log"
-
-        // v0.9.54: Clear the log on collector startup to remove events
-        // from previous boots. This prevents stale swap events from
-        // showing in the dashboard with wrong ages.
-        clearStaleLogEntries(logPath)
 
         // Check if the service file exists; create it if missing
         if _, err := os.Stat(serviceFilePath); os.IsNotExist(err) {
@@ -218,41 +236,97 @@ func ensureTraceCaptureService() {
         out, err := exec.Command("systemctl", "is-active", serviceName).Output()
         status := strings.TrimSpace(string(out))
         if err == nil && status == "active" {
-                // Service is running — verify the log file is fresh
+                // Service is running — check if the log file is fresh
+                logStale := false
+                var logAge time.Duration
                 if fi, err := os.Stat(logPath); err == nil {
-                        age := time.Since(fi.ModTime())
-                        if age > 5*time.Minute {
-                                fmt.Fprintf(os.Stderr, "  trace service: running but log file is %v old — restarting\n", age.Round(time.Minute))
-                                exec.Command("systemctl", "restart", serviceName).Run()
-                        } else {
-                                fmt.Fprintf(os.Stderr, "  trace service: active (log file %v old) (OK)\n", age.Round(time.Second))
+                        logAge = time.Since(fi.ModTime())
+                        if logAge > 5*time.Minute {
+                                logStale = true
                         }
-                } else {
-                        fmt.Fprintf(os.Stderr, "  trace service: active (log file not found yet) (OK)\n")
                 }
+
+                if !logStale {
+                        // Log is fresh — reset escalation state
+                        traceEscalation.mu.Lock()
+                        traceEscalation.traceRestarts = nil
+                        traceEscalation.bpftuneRestartTried = time.Time{}
+                        traceEscalation.needsReboot = false
+                        traceEscalation.mu.Unlock()
+                        fmt.Fprintf(os.Stderr, "  trace service: active (log file %v old) (OK)\n", logAge.Round(time.Second))
+                        return
+                }
+
+                // Log is stale — escalate
+                traceEscalation.mu.Lock()
+                defer traceEscalation.mu.Unlock()
+
+                // Clean up old restart timestamps (> 15 min ago)
+                now := time.Now()
+                var recent []time.Time
+                for _, t := range traceEscalation.traceRestarts {
+                        if now.Sub(t) < 15*time.Minute {
+                                recent = append(recent, t)
+                        }
+                }
+                traceEscalation.traceRestarts = recent
+
+                if len(recent) < 3 && traceEscalation.bpftuneRestartTried.IsZero() {
+                        // Level 1: restart trace service (haven't tried 3 times yet)
+                        fmt.Fprintf(os.Stderr, "  trace service: log file is %v old — restarting trace service (attempt %d/3)\n",
+                                logAge.Round(time.Minute), len(recent)+1)
+                        exec.Command("systemctl", "restart", serviceName).Run()
+                        traceEscalation.traceRestarts = append(traceEscalation.traceRestarts, now)
+                        return
+                }
+
+                if !traceEscalation.bpftuneRestartTried.IsZero() && now.Sub(traceEscalation.bpftuneRestartTried) > 5*time.Minute {
+                        // Level 3: bpftune was restarted > 5 min ago and log is STILL stale.
+                        // The kernel's tracing subsystem is broken. Only a reboot can fix it.
+                        if !traceEscalation.needsReboot {
+                                traceEscalation.needsReboot = true
+                                fmt.Fprintf(os.Stderr, "  trace service: CRITICAL — log still stale after bpftune restart. Kernel tracing may be broken. MANUAL REBOOT RECOMMENDED.\n")
+                        }
+                        return
+                }
+
+                if traceEscalation.bpftuneRestartTried.IsZero() {
+                        // Level 2: 3 trace service restarts didn't fix it — restart bpftune
+                        fmt.Fprintf(os.Stderr, "  trace service: log still stale after %d trace restarts — escalating: restarting bpftune\n", len(recent))
+                        exec.Command("systemctl", "restart", "bpftune").Run()
+                        traceEscalation.bpftuneRestartTried = now
+                        // Also restart the trace service to pick up the new trace context
+                        time.Sleep(3 * time.Second)
+                        exec.Command("systemctl", "restart", serviceName).Run()
+                        return
+                }
+
+                // Between Level 2 and Level 3 — bpftune was restarted recently,
+                // waiting to see if it fixed the log. Will be checked again next cycle.
+                fmt.Fprintf(os.Stderr, "  trace service: waiting for bpftune restart to take effect (log still %v old)\n", logAge.Round(time.Minute))
                 return
         }
 
         // Service is not running — start it
+        traceEscalation.mu.Lock()
+        traceEscalation.traceRestarts = nil
+        traceEscalation.bpftuneRestartTried = time.Time{}
+        traceEscalation.needsReboot = false
+        traceEscalation.mu.Unlock()
+
         fmt.Fprintf(os.Stderr, "  trace service: %s (status=%s), starting...\n", serviceName, status)
-
-        // Reload systemd to pick up the service file if it was just created
         exec.Command("systemctl", "daemon-reload").Run()
-
-        // Enable and start
         exec.Command("systemctl", "enable", serviceName).Run()
         err = exec.Command("systemctl", "start", serviceName).Run()
         if err != nil {
                 fmt.Fprintf(os.Stderr, "  trace service: WARNING could not start: %v\n", err)
                 return
         }
-
-        // Verify it started
         time.Sleep(1 * time.Second)
         out, _ = exec.Command("systemctl", "is-active", serviceName).Output()
         status = strings.TrimSpace(string(out))
         if status == "active" {
-                fmt.Fprintf(os.Stderr, "  trace service: started (was %s) (OK)\n", status)
+                fmt.Fprintf(os.Stderr, "  trace service: started (OK)\n")
         } else {
                 fmt.Fprintf(os.Stderr, "  trace service: WARNING still %s after start attempt\n", status)
         }
@@ -355,12 +429,21 @@ func getServiceHealth() map[string]interface{} {
         health["trace_buffer_kb"] = bufSize
         health["trace_buffer_ok"] = bufSize >= 65536 // 64MB minimum
 
+        // 7. v0.9.76: needs_reboot — set by the escalation logic in
+        // ensureTraceCaptureService when the kernel's tracing subsystem is
+        // broken and only a full machine reboot can fix it. The dashboard
+        // should display a prominent warning when this is true.
+        traceEscalation.mu.Lock()
+        health["needs_reboot"] = traceEscalation.needsReboot
+        traceEscalation.mu.Unlock()
+
         // Overall health
         allOk := health["bpf_programs_ok"].(bool) &&
                 health["bpftune_service_ok"].(bool) &&
                 health["trace_service_ok"].(bool) &&
                 health["log_fresh_ok"].(bool) &&
-                health["explore_pct_ok"].(bool)
+                health["explore_pct_ok"].(bool) &&
+                !health["needs_reboot"].(bool)
         health["all_ok"] = allOk
 
         return health
