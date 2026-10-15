@@ -153,12 +153,30 @@ func buildLogPanels(swaps []swapRow,
         pl := currentParsedLog
 
         // ----- recent_swaps (newest-first, last 18) --------------------------
-        // v0.9.58: Don't merge CSV fallback for recent swaps — same as proofs.
-        // The CSV fallback used collected_ts (collector read time) as epoch_ts,
-        // which is NOT the swap event time. This caused swaps to show wrong ages
-        // ("1h ago" etc). Just show whatever live swaps are available.
+        // v0.9.59: RESTORE CSV fallback — was removed in v0.9.58 which left
+        // the panel empty when the log was sparse. The "1h ago" bug was never
+        // caused by CSV fallback — it was caused by v0.9.56's epoch_ts = nowEpoch
+        // (read time), which was fixed in v0.9.57. The CSV fallback uses
+        // collected_ts (wall-clock, within 30s of actual swap time) which is correct.
         allSwaps := buildRecentSwapRows(swaps, metByCookie, srateByCookie, cdest)
         topSwapsSlice := lastN(allSwaps, 18)
+        if len(topSwapsSlice) < 18 {
+                csvSwaps := readRecentSwapsFromCSV(50)
+                if len(csvSwaps) > 0 {
+                        var recentCsvSwaps []interface{}
+                        cutoff := now - 24*3600
+                        for _, s := range csvSwaps {
+                                if m, ok := s.(map[string]interface{}); ok {
+                                        if ts, ok := m["epoch_ts"].(int64); ok && ts >= cutoff {
+                                                recentCsvSwaps = append(recentCsvSwaps, s)
+                                        }
+                                }
+                        }
+                        if len(recentCsvSwaps) > 0 {
+                                topSwapsSlice = mergeSwapsNewestFirst(topSwapsSlice, recentCsvSwaps, 18)
+                        }
+                }
+        }
         topSwaps = topSwapsSlice
 
         // ----- recent_proofs (newest-first, last 18) --------------------------
