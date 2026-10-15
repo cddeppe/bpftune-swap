@@ -13,7 +13,6 @@ package main
 // Pick chart, following the same bucket/range selectors.
 
 import (
-        "fmt"
         "strings"
 )
 
@@ -164,29 +163,3 @@ func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) 
         return out
 }
 
-// routeHealthForBucket returns the health entry for a specific bucket,
-// or nil if not available. Used by the HTTP handler.
-func routeHealthForBucket(all map[string]interface{}, bucketID string) interface{} {
-        if all == nil {
-                return nil
-        }
-        // Try exact match
-        if entry, ok := all[bucketID]; ok {
-                return entry
-        }
-        // Try label match
-        for addr, entry := range all {
-                if labelFor(addr) == bucketID {
-                        return entry
-                }
-        }
-        // Try finding the other protocol version
-        for addr, entry := range all {
-                lbl := labelFor(addr)
-                if lbl != "" && lbl == bucketID {
-                        return entry
-                }
-        }
-        _ = fmt.Sprintf("")  // suppress unused import
-        return nil
-}

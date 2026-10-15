@@ -247,64 +247,6 @@ func (h *historyStore) renderMetaToDisk(buckets []map[string]interface{}) {
 }
 
 // ============================================================================
-// renderSwapsToDisk — writes swaps.json (per-range binned)
-// ============================================================================
-
-func (h *historyStore) renderSwapsToDisk(so map[string]interface{}) {
-        sl, _ := so["swaps_list"].([]interface{})
-        if len(sl) == 0 {
-                writeJSONToDisk("swaps.json", map[string]interface{}{})
-                return
-        }
-        uptime := readProcUptime()
-        nowEpoch := float64(time.Now().Unix())
-        doc := map[string]interface{}{}
-        for rngName, rngCfg := range ranges {
-                span, _ := rngCfg[0].(int)
-                width, _ := rngCfg[1].(int)
-                if width == 0 {
-                        width = 60
-                }
-                var cutoff float64
-                if span > 0 {
-                        cutoff = nowEpoch - float64(span)
-                }
-                binCounts := map[int64]int{}
-                for _, s := range sl {
-                        sm, ok := s.(map[string]interface{})
-                        if !ok {
-                                continue
-                        }
-                        ts, ok := sm["ts"].(float64)
-                        if !ok {
-                                continue
-                        }
-                        epochTs := nowEpoch - uptime + ts
-                        if span > 0 && epochTs < cutoff {
-                                continue
-                        }
-                        binIdx := int64(epochTs / float64(width))
-                        binCounts[binIdx]++
-                }
-                var binIdxs []int64
-                for bi := range binCounts {
-                        binIdxs = append(binIdxs, bi)
-                }
-                sort.Slice(binIdxs, func(i, j int) bool { return binIdxs[i] < binIdxs[j] })
-                swapsArr := make([]interface{}, len(binIdxs))
-                tsArr := make([]interface{}, len(binIdxs))
-                for i, bi := range binIdxs {
-                        swapsArr[i] = binCounts[bi]
-                        tsArr[i] = bi*int64(width) + int64(width)/2
-                }
-                doc[rngName] = map[string]interface{}{
-                        "ts":    tsArr,
-                        "swaps": swapsArr,
-                }
-        }
-        writeJSONToDisk("swaps.json", doc)
-}
-
 // ============================================================================
 // renderFleetToDisk — writes fleet.json (top 25 by 24h coverage)
 // ============================================================================
@@ -799,58 +741,6 @@ func buildLastSnapshotMap(last bucketSnapshot) map[string]interface{} {
                 "bs":           bsMap,
                 "ns":           nsMap,
         }
-}
-
-// countSwapsPerBin counts swap events per time bin for a specific bucket.
-func countSwapsPerBin(swapOutcomes interface{}, bucketID string, width int, span int) []interface{} {
-        so, ok := swapOutcomes.(map[string]interface{})
-        if !ok {
-                return []interface{}{}
-        }
-        sl, _ := so["swaps_list"].([]interface{})
-        if !ok {
-                _ = sl
-                return []interface{}{}
-        }
-        now := time.Now().Unix()
-        uptime := readProcUptime()
-        nowEpoch := float64(now)
-        var cutoff int64
-        if span > 0 {
-                cutoff = now - int64(span)
-        }
-        binCounts := map[int64]int{}
-        for _, s := range sl {
-                sm, ok := s.(map[string]interface{})
-                if !ok {
-                        continue
-                }
-                dest, _ := sm["dest"].(string)
-                if dest != bucketID {
-                        continue
-                }
-                ts, ok := sm["ts"].(float64)
-                if !ok {
-                        continue
-                }
-                epochTs := nowEpoch - uptime + ts
-                tsInt := int64(epochTs)
-                if span > 0 && tsInt < cutoff {
-                        continue
-                }
-                binIdx := tsInt / int64(width)
-                binCounts[binIdx]++
-        }
-        var binIdxs []int64
-        for bi := range binCounts {
-                binIdxs = append(binIdxs, bi)
-        }
-        sort.Slice(binIdxs, func(i, j int) bool { return binIdxs[i] < binIdxs[j] })
-        result := make([]interface{}, len(binIdxs))
-        for i, bi := range binIdxs {
-                result[i] = binCounts[bi]
-        }
-        return result
 }
 
 // ============================================================================

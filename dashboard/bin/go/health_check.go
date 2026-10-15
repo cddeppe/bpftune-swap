@@ -208,14 +208,6 @@ func ensureTraceCaptureService() {
         // if uptime > 0 && ts > uptime+300 { continue }). Clearing the log
         // on startup was too aggressive — it wiped all accumulated events
         // and left the dashboard empty until enough new events accumulated.
-        // clearStaleLogEntries(logPath)
-
-        // Check if the service file exists; create it if missing
-        if _, err := os.Stat(serviceFilePath); os.IsNotExist(err) {
-                fmt.Fprintf(os.Stderr, "  trace service: service file missing, creating it...\n")
-                createTraceServiceFile(serviceFilePath)
-        }
-
         // Check if the service is running
         out, err := exec.Command("systemctl", "is-active", serviceName).Output()
         status := strings.TrimSpace(string(out))

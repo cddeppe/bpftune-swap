@@ -1025,63 +1025,6 @@ type proofSample struct {
         sampMax int64
 }
 
-// buildProofsRawEvents builds the proofs_raw list (one entry per proof
-// event, with cookie→dest resolution).  v0.9.0: takes cdest as a
-// parameter instead of re-parsing the log on every cycle — the prior
-// implementation called cookieDestMap(text) a SECOND time per cycle,
-// duplicating the work already done in collect.go.  For a 2 MB log tail
-// with ~10k lines, that was ~5ms of wasted regex per cycle.
-func buildProofsRawEvents(text string, cdest map[string]cdestEntry) []interface{} {
-        var out []interface{}
-        for _, line := range strings.Split(text, "\n") {
-                if !strings.Contains(line, "proof cookie=") {
-                        continue
-                }
-                m := rxProof.FindStringSubmatch(line)
-                if m == nil {
-                        continue
-                }
-                ts, _ := strconv.ParseFloat(m[1], 64)
-                cookie := m[2]
-                alg, _ := strconv.Atoi(m[3])
-                rate, _ := strconv.ParseInt(m[4], 10, 64)
-                tier := m[5]
-                tierLabel := "good"
-                if tier == "2" {
-                        tierLabel = "proved"
-                }
-                dest := ""
-                // v0.9.2: prefer the proof's own dest fields (new in
-                // tuner 0.4.98 — proof printk now carries dest=/dest6=/dest6b=).
-                // This fixes the '(unknown)' issue for passive connections
-                // which fire proofs but never fire estab (so cdest has no
-                // entry for their cookie). Fall back to cdest for older BPF
-                // that doesn't have dest= in the proof line.
-                v4, v6, v6b := m[6], m[7], m[8]
-                if v4 != "" || v6 != "" || v6b != "" {
-                        ds := destStr(v4, v6, v6b)
-                        dest = labelFor(ds)
-                        if dest == "" {
-                                dest = ds
-                        }
-                } else if d, ok := cdest[cookie]; ok {
-                        ds := destStr(d[0], d[1], d[2])
-                        dest = labelFor(ds)
-                        if dest == "" {
-                                dest = ds
-                        }
-                }
-                out = append(out, map[string]interface{}{
-                        "ts":   ts,
-                        "alg":  algName(alg),
-                        "rate": round1(float64(rate) / bpsToMbps),
-                        "tier": tierLabel,
-                        "dest": dest,
-                })
-        }
-        return out
-}
-
 func proofEvents(text string) (map[int]proofEvent, map[int]proofSample) {
         events := map[int]proofEvent{}
         samples := map[int]proofSample{}
@@ -1307,54 +1250,6 @@ func readLogFileMtime() int64 {
                 return time.Now().Unix()
         }
         return fi.ModTime().Unix()
-}
-
-// readBPFClock returns the current BPF clock time (seconds since boot,
-// same scale as bpf_ktime_get_ns / trace_pipe timestamps).
-//
-// We extract this by finding the max timestamp in the log tail. This is
-// more reliable than /proc/uptime on cloud VMs (Oracle Cloud, AWS, etc.)
-// that get live-migrated or suspended/resumed — /proc/uptime resets but
-// the BPF clock keeps counting from the original boot, causing
-// now_mono < boot_ts (massively negative age labels).
-//
-// Falls back to /proc/uptime if the log is empty.
-func readBPFClock(text string) float64 {
-        var maxTs float64
-        for _, line := range strings.Split(text, "\n") {
-                // trace_pipe format: "  <comm>-pid [cpu] flags TIMESTAMP: bpf_trace_printk: ..."
-                // Extract the timestamp (float before the ": bpf_trace_printk:")
-                idx := strings.Index(line, ": bpf_trace_printk:")
-                if idx < 0 {
-                        continue
-                }
-                // Walk backwards from idx to find the start of the timestamp
-                start := idx
-                for start > 0 {
-                        c := line[start-1]
-                        if (c >= '0' && c <= '9') || c == '.' {
-                                start--
-                        } else {
-                                break
-                        }
-                }
-                if start >= idx {
-                        continue
-                }
-                tsStr := line[start:idx]
-                ts, err := strconv.ParseFloat(tsStr, 64)
-                if err != nil {
-                        continue
-                }
-                if ts > maxTs {
-                        maxTs = ts
-                }
-        }
-        if maxTs > 0 {
-                return maxTs
-        }
-        // Fallback: /proc/uptime (correct on non-migrated hosts)
-        return readProcUptime()
 }
 
 // nowMono returns the BPF clock, falling back to /proc/uptime when the

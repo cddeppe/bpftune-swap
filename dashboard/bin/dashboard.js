@@ -58,16 +58,6 @@
     _loadingOverlayHidden = true;
   }
 
-  function loadScript(url) {
-    return new Promise(function (resolve, reject) {
-      var s = document.createElement("script");
-      s.src = url;
-      s.onload = resolve;
-      s.onerror = function () { reject(new Error("failed to load " + url)); };
-      document.head.appendChild(s);
-    });
-  }
-
   function applyChartDefaults() {
     var dark = window.matchMedia &&
                window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -1410,25 +1400,6 @@
         renderLiveState(_pendingDoc);
         _pendingDoc = null;
       }
-    });
-  }
-
-  // v0.9.43: throttled refreshNowCardAndChart — was firing on every SSE
-  // push (every 30s), doing synchronous chart renders (loadBucket →
-  // renderBucket, renderNow, renderScoreNow) that blocked the main
-  // thread and prevented scrolling. Now it goes through a 2s minimum
-  // interval throttle so the browser can handle input between renders.
-  var _refreshNowPending = false;
-  var _lastRefreshNowTs = 0;
-  function throttledRefreshNow() {
-    if (_refreshNowPending) return;
-    var now = Date.now();
-    if (now - _lastRefreshNowTs < 2000) return; // min 2s between refreshes
-    _refreshNowPending = true;
-    requestAnimationFrame(function() {
-      _refreshNowPending = false;
-      _lastRefreshNowTs = Date.now();
-      try { refreshNowCardAndChart(); } catch(e) { console.error('refreshNow:', e); }
     });
   }
 
