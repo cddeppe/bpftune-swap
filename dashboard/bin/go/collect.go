@@ -73,11 +73,20 @@ func (c *Collector) collect() {
         // cookies established before the 2 MB log tail still get a dest.
         cdest := persistCookieDest(pl.Cdest)
 
+        // v0.9.69: set currentParsedLog BEFORE buildRouteHealth so the
+        // RttByDest map (RTT from met log lines) is available.
+        // Was set at line 124 (after buildRouteHealth), so RTT-from-log
+        // never fired — route health always fell back to BPF map min_rtt
+        // which is 0 for receive-only connections (no v4 data).
+        currentParsedLog = pl
+        defer func() { currentParsedLog = nil }()
+
         // ----- Build live buckets + metric_by_bucket + bucket_live ---------
         buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
 
         // v0.9.36: build route health ONCE — was called twice (line 97 + line 104).
         // This halves the work for the route health panel which iterates all hosts.
+        // v0.9.69: now has access to currentParsedLog.RttByDest (RTT from met lines)
         routeHealth := buildRouteHealth(hosts, metricByBucket)
 
         // ----- Build current.json document -----------------------------------
@@ -119,10 +128,7 @@ func (c *Collector) collect() {
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------
-        // v0.9.9: set currentParsedLog so buildLogPanels uses the single-pass
-        // parsed data instead of re-scanning text 4 more times.
-        currentParsedLog = pl
-        defer func() { currentParsedLog = nil }()
+        // v0.9.69: currentParsedLog already set at line 81 (before buildRouteHealth)
 
         topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText, now)
 
