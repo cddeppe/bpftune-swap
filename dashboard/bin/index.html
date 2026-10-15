@@ -54,14 +54,14 @@
       <span class="k">Rate EMA</span>
       <span class="v" id="n_rates">-</span>
     </div>
-    <h3 style="margin: 12px 0 10px; font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">Swap Target Pick <span style="color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">penalty-weighted &middot; higher = picker would choose</span> <span style="margin-left: auto; color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">live</span></h3>
+    <h3 class="panel-title first">Swap Target Pick <span class="panel-subtitle">penalty-weighted &middot; higher = picker would choose</span> <span class="panel-badge">live</span></h3>
       <div class="chart-box h-lg"><canvas id="score-now"></canvas></div>
-    <h3 style="margin: 8px 0 6px; font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">Route Health <span class="bucket-tag" id="bucket-tag-route"></span> <span style="color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">rtt &middot; loss &middot; throughput</span> <span style="margin-left: auto; color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">live</span></h3>
-    <div id="lv-route-health" style="margin-bottom: 8px;"><div class="placeholder">loading&hellip;</div></div>
-    <h3 style="margin: 8px 0 6px; font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">Origin Health <span style="color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">top incoming traffic &middot; v4/v6 comparison</span> <span style="margin-left: auto; color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">live</span></h3>
-    <div id="lv-origin-health" style="margin-bottom: 8px;"><div class="placeholder">loading&hellip;</div></div>
-    <h3 style="margin: 8px 0 6px; font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">Service Health <span style="color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">tuner &middot; trace capture &middot; log freshness &middot; explore</span> <span style="margin-left: auto; color: var(--muted-2); font-family: var(--mono); font-size: 10.5px; font-weight: 500; letter-spacing: 0; text-transform: none;">live</span></h3>
-    <div id="lv-service-health" style="margin-bottom: 8px;"><div class="placeholder">loading&hellip;</div></div>
+    <h3 class="panel-title">Route Health <span class="bucket-tag" id="bucket-tag-route"></span> <span class="panel-subtitle">rtt &middot; loss &middot; throughput</span> <span class="panel-badge">live</span></h3>
+    <div id="lv-route-health" class="panel-pad"><div class="placeholder">loading&hellip;</div></div>
+    <h3 class="panel-title">Origin Health <span class="panel-subtitle">top incoming traffic &middot; v4/v6 comparison</span> <span class="panel-badge">live</span></h3>
+    <div id="lv-origin-health" class="panel-pad"><div class="placeholder">loading&hellip;</div></div>
+    <h3 class="panel-title">Service Health <span class="panel-subtitle">tuner &middot; trace capture &middot; log freshness &middot; explore</span> <span class="panel-badge">live</span></h3>
+    <div id="lv-service-health" class="panel-pad"><div class="placeholder">loading&hellip;</div></div>
   </section>
 
   <div class="lv-grid" id="live">
@@ -174,24 +174,24 @@
   <div class="modal">
     <div class="modal-header">
       <h2>Edit IP Labels</h2>
-      <button type="button" onclick="closeLabelEditor()" style="font-size:18px;background:none;border:none;cursor:pointer;color:var(--muted)">&times;</button>
+      <button type="button" class="modal-close" onclick="closeLabelEditor()">&times;</button>
     </div>
     <div class="modal-body">
-      <table id="label-table" style="width:100%;border-collapse:collapse">
-        <thead><tr><th style="text-align:left;padding:6px 8px">Label</th><th style="text-align:left;padding:6px 8px">IP(s)</th><th></th></tr></thead>
+      <table id="label-table" class="modal-table">
+        <thead><tr><th>Label</th><th>IP(s)</th><th></th></tr></thead>
         <tbody id="label-rows"></tbody>
       </table>
-      <div class="label-add" style="display:flex;gap:8px;margin-top:12px">
-        <input type="text" id="new-ip" placeholder="IP(s) — space or comma separated, e.g. 76.76.2.0 76.76.10.0" style="flex:2;font-size:11px;border:1px solid var(--muted);padding:4px 8px;border-radius:3px">
-        <input type="text" id="new-label" placeholder="Label (e.g. home)" style="flex:1;font-size:11px;border:1px solid var(--muted);padding:4px 8px;border-radius:3px">
-        <button type="button" onclick="addLabel()" style="font-size:11px;padding:4px 12px;border:1px solid var(--muted);border-radius:3px;cursor:pointer;background:var(--good);color:#fff;font-weight:600">Add</button>
+      <div class="modal-add">
+        <input type="text" id="new-ip" class="modal-input flex2" placeholder="IP(s) — space or comma separated, e.g. 76.76.2.0 76.76.10.0">
+        <input type="text" id="new-label" class="modal-input flex1" placeholder="Label (e.g. home)">
+        <button type="button" class="modal-btn-add" onclick="addLabel()">Add</button>
       </div>
-      <div id="bucket-ips-section" style="margin-top:20px;border-top:1px solid var(--subtle);padding-top:12px">
-        <h3 style="font-size:12px;margin:0 0 8px">Individual IPs in masked buckets</h3>
-        <div id="bucket-ips-list" style="max-height:300px;overflow-y:auto"><div class="placeholder" style="font-size:11px;color:var(--muted)">Click "Edit Labels" to load...</div></div>
+      <div id="bucket-ips-section" class="modal-section">
+        <h3>Individual IPs in masked buckets</h3>
+        <div id="bucket-ips-list" class="modal-iplist"><div class="placeholder" style="font-size:11px;color:var(--muted)">Click "Edit Labels" to load...</div></div>
       </div>
 
-      <div style="margin-top:16px;font-size:11px;color:var(--muted)">
+      <div class="modal-tip">
         Tip: to group IPs, use the same label for multiple IPs.
       </div>
     </div>
