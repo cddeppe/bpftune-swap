@@ -99,6 +99,26 @@
     return (row.ts || 0) + monoOffset;
   }
 
+  // v0.9.68: Look up domain name from ctrld DNS cache for a bucket IP.
+  // The bucket is a /16 masked IP (e.g. "142.250.0.0"). We check if any
+  // cached IP matches the first two octets.
+  function getDomainForBucketDisplay(bucketAddr) {
+    var domains = window.__current_doc && window.__current_doc.ctrld_domains;
+    if (!domains) return "";
+
+    // Try exact match first
+    if (domains[bucketAddr]) return domains[bucketAddr];
+
+    // For /16 masked IPs like "142.250.0.0", match first two octets
+    var parts = bucketAddr.split(".");
+    if (parts.length !== 4) return "";
+    var prefix = parts[0] + "." + parts[1] + ".";
+    for (var ip in domains) {
+      if (ip.indexOf(prefix) === 0) return domains[ip];
+    }
+    return "";
+  }
+
   // v0.9.20: ageLabel accepts optional epoch_ts (wall-clock).
   // When boot_ts is from a PREVIOUS boot (age < 0), fall back to
   // epoch_ts so ages display correctly after a reboot.
@@ -371,8 +391,17 @@
         cell = '<td class="mono"><span class="covbar"><i style="width:' +
                pct.toFixed(0) + '%"></i></span>' + pct.toFixed(0) + '%</td>';
       }
+      // v0.9.68: show domain name from ctrld DNS cache if available
+      var destDisplay = esc(shortAddr(r.dest));
+      var sh = window.__current_doc && window.__current_doc.service_health;
+      if (sh && sh.ctrld_available) {
+        var domain = getDomainForBucketDisplay(r.dest);
+        if (domain) {
+          destDisplay = '<span style="color:var(--good)">' + esc(domain) + '</span> <span class="dim">' + destDisplay + '</span>';
+        }
+      }
       html += '<tr>' +
-        '<td class="mono name">' + esc(shortAddr(r.dest)) + '</td>' +
+        '<td class="mono name">' + destDisplay + '</td>' +
         '<td class="mono">' + fmtN(r.inst) + '</td>' +
         '<td class="mono dim">' + (r.rtt_us / 1000).toFixed(1) + ' ms</td>' +
         '<td class="mono">' + r.ref_mbps.toFixed(1) + '</td>' +
@@ -2460,6 +2489,7 @@
       { label: "Log Freshness", value: sh.log_age + " old", ok: sh.log_fresh_ok },
       { label: "Explore %", value: sh.explore_pct + "%", ok: sh.explore_pct_ok },
       { label: "Trace Buffer", value: (sh.trace_buffer_kb >= 1024 ? Math.round(sh.trace_buffer_kb/1024) + "MB" : sh.trace_buffer_kb + "KB"), ok: sh.trace_buffer_ok },
+      { label: "ctrld DNS", value: sh.ctrld_available ? (sh.ctrld_entry_count + " domains") : "not installed", ok: sh.ctrld_ok },
     ];
 
     var allOk = sh.all_ok;

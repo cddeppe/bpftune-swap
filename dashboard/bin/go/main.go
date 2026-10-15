@@ -675,6 +675,9 @@ func main() {
         // v0.9.33: start route monitor goroutine (if enabled via --route-monitor)
         go runRouteMonitor()
 
+        // v0.9.68: start ctrld DNS cache poller (optional, silent if not running)
+        startCtrldPoller()
+
         // Synchronous first collect — current.json populated before HTTP starts.
         collector.collect()
         // COL-002: refresh sentinel after first collect

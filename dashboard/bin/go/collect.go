@@ -107,6 +107,7 @@ func (c *Collector) collect() {
                 "route_health":     routeHealth,
                 "route_monitor":    routeMonitor.getState(),
                 "service_health":   getServiceHealth(),
+                "ctrld_domains":    getCtrldDomainMap(),
         }
 
         // v0.9.34: save snapshots for the route monitor goroutine to reuse.

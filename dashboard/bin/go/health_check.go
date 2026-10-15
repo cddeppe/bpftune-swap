@@ -349,6 +349,13 @@ func getServiceHealth() map[string]interface{} {
         health["trace_buffer_kb"] = bufSize
         health["trace_buffer_ok"] = bufSize >= 65536 // 64MB minimum
 
+        // v0.9.68: ctrld DNS cache integration status
+        ctrldStatus := getCtrldStatus()
+        health["ctrld_available"] = ctrldStatus["available"]
+        health["ctrld_entry_count"] = ctrldStatus["entry_count"]
+        health["ctrld_last_fetch"] = ctrldStatus["last_fetch"]
+        health["ctrld_ok"] = true // always OK — ctrld is optional, not a failure if absent
+
         // Overall health
         allOk := health["bpf_programs_ok"].(bool) &&
                 health["bpftune_service_ok"].(bool) &&
