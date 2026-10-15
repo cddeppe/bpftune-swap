@@ -2410,6 +2410,10 @@
     var html = '<div class="route-health origin-grid">';
     shown.forEach(function(r) {
       var label = r.label || "?";
+      // v0.9.71: show domain from ctrld DNS cache for origin IPs
+      if (r.domain) {
+        label = r.domain + ' (' + label + ')';
+      }
       var hasV4 = r.has_ipv4;
       var hasV6 = r.has_ipv6;
       var preferred = r.preferred || "";

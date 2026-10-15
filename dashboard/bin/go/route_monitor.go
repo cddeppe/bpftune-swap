@@ -68,6 +68,9 @@ func runRouteMonitor() {
         if !routeMonitorEnabled {
                 return
         }
+        // v0.9.71: run an immediate cycle on startup so destinations
+        // appear instantly instead of waiting 5 minutes.
+        routeMonitor.cycle()
         // v0.9.35: 5 minute interval — minimal ICMP footprint
         ticker := time.NewTicker(300 * time.Second)
         defer ticker.Stop()
@@ -373,12 +376,16 @@ func (rm *RouteMonitor) getState() []interface{} {
         out := make([]interface{}, 0, len(states))
         for _, state := range states {
                 state.mu.Lock()
-                // v0.9.37: has_data flags so frontend can show "no data"
+                // v0.9.71: look up domain from ctrld DNS cache for origin IPs.
+                // For unlabeled destinations (raw IPs like "130.61.0.0"),
+                // the label IS the IP — look it up directly.
+                domain := getDomainForBucket(state.Label)
                 // instead of misleading "0.0ms 100% loss"
                 v4HasData := state.V4RTT > 0
                 v6HasData := state.V6RTT > 0
                 entry := map[string]interface{}{
                         "label": state.Label,
+                        "domain": domain, // v0.9.71: from ctrld DNS cache
                         "has_ipv4": state.HasIPv4,
                         "has_ipv6": state.HasIPv6,
                         "preferred": state.PreferredProto,
