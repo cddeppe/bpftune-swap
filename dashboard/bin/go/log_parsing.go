@@ -1487,24 +1487,21 @@ func emptyLogWindow() map[string]interface{} {
 func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
         seen := make(map[string]bool)
         var merged []interface{}
-        // getTs reads boot_ts, falling back to ts (v0.9.14 fix: live rows
-        // historically used "ts" while CSV rows used "boot_ts" — the merge
-        // sort read boot_ts for all rows, giving live rows a 0.0 timestamp
-        // and sorting them to the bottom).
-        getTs := func(m map[string]interface{}) float64 {
-                if ts, ok := m["boot_ts"].(float64); ok && ts > 0 {
-                        return ts
-                }
-                if ts, ok := m["ts"].(float64); ok {
+        // v0.9.61: sort by epoch_ts (wall-clock) instead of boot_ts (BPF ktime).
+        // boot_ts is not comparable across boots — CSV swaps from a previous boot
+        // have higher ktime values than current-boot live swaps, pushing live swaps
+        // to the bottom of the list. epoch_ts is wall-clock and always comparable.
+        getEpochTs := func(m map[string]interface{}) int64 {
+                if ts, ok := m["epoch_ts"].(int64); ok && ts > 0 {
                         return ts
                 }
                 return 0
         }
         add := func(row interface{}) {
                 if m, ok := row.(map[string]interface{}); ok {
-                        ts := getTs(m)
+                        ts := getEpochTs(m)
                         cookie, _ := m["dest"].(string)
-                        key := fmt.Sprintf("%.3f:%s", ts, cookie)
+                        key := fmt.Sprintf("%d:%s", ts, cookie)
                         if !seen[key] {
                                 seen[key] = true
                                 merged = append(merged, row)
@@ -1517,10 +1514,10 @@ func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
         for _, r := range csv {
                 add(r)
         }
-        // Sort by timestamp descending (newest first)
+        // Sort by epoch_ts descending (newest first)
         sort.Slice(merged, func(i, j int) bool {
-                ti := getTs(merged[i].(map[string]interface{}))
-                tj := getTs(merged[j].(map[string]interface{}))
+                ti := getEpochTs(merged[i].(map[string]interface{}))
+                tj := getEpochTs(merged[j].(map[string]interface{}))
                 return ti > tj
         })
         if len(merged) > n {
