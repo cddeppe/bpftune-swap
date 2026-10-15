@@ -21,6 +21,7 @@ package main
 //   5. Logs warnings if anything is wrong
 
 import (
+        "encoding/binary"
         "fmt"
         "os"
         "os/exec"
@@ -28,6 +29,8 @@ import (
         "strings"
         "sync"
         "time"
+
+        "golang.org/x/sys/unix"
 )
 
 // v0.9.76: Escalation state for the trace capture service health check.
@@ -129,38 +132,45 @@ func syncExplorePctToBPF() {
         // (pinned by the tuner on startup)
         pinPath := "/sys/fs/bpftune/tcp_conn/explore"
 
-        // Use bpftool to read current value
-        out, err := exec.Command("bpftool", "map", "lookup", "pinned", pinPath,
-                "key", "hex", "00 00 00 00").Output()
-        if err != nil {
-                // Map not pinned or bpftool not available — non-fatal
-                // The tuner itself reads EXPLORE_STATE on startup, so this is
-                // just a safety net.
-                fmt.Fprintf(os.Stderr, "  explore_pct: could not read BPF map (non-fatal): %v\n", err)
-                return
+        // v0.9.86: use raw BPF syscall instead of forking bpftool.
+        // The map key is 4 bytes (uint32 = 0), value is 4 bytes (uint32 = explore_pct).
+        var currentPct int = -1
+        fd, err := bpfOpenPinnedMap(pinPath)
+        if err == nil {
+                key := []byte{0, 0, 0, 0}
+                value := make([]byte, 4)
+                if err := bpfMapLookupElem(fd, key, value); err == nil {
+                        currentPct = int(binary.LittleEndian.Uint32(value))
+                }
+                unix.Close(fd)
         }
 
-        // Parse current value from bpftool output
-        // Output looks like: "00 00 00 00\nvalue: 0x05 0x00 0x00 0x00"
-        currentPct := -1
-        lines := strings.Split(string(out), "\n")
-        for _, line := range lines {
-                if strings.Contains(line, "value:") {
-                        // Extract hex bytes after "value:"
-                        parts := strings.SplitN(line, "value:", 2)
-                        if len(parts) == 2 {
-                                hexStr := strings.TrimSpace(parts[1])
-                                hexParts := strings.Fields(hexStr)
-                                if len(hexParts) > 0 {
-                                        // First byte is the value (little-endian, single byte for 0-100)
-                                        hexVal := hexParts[0]
-                                        hexVal = strings.TrimPrefix(hexVal, "0x")
-                                        if v, err := strconv.ParseUint(hexVal, 16, 32); err == nil {
-                                                currentPct = int(v)
+        if currentPct < 0 {
+                // Fall back to bpftool if the syscall path failed
+                out, err := exec.Command("bpftool", "map", "lookup", "pinned", pinPath,
+                        "key", "hex", "00 00 00 00").Output()
+                if err != nil {
+                        fmt.Fprintf(os.Stderr, "  explore_pct: could not read BPF map (non-fatal): %v\n", err)
+                        return
+                }
+                // Parse current value from bpftool output
+                lines := strings.Split(string(out), "\n")
+                for _, line := range lines {
+                        if strings.Contains(line, "value:") {
+                                parts := strings.SplitN(line, "value:", 2)
+                                if len(parts) == 2 {
+                                        hexStr := strings.TrimSpace(parts[1])
+                                        hexParts := strings.Fields(hexStr)
+                                        if len(hexParts) > 0 {
+                                                hexVal := hexParts[0]
+                                                hexVal = strings.TrimPrefix(hexVal, "0x")
+                                                if v, err := strconv.ParseUint(hexVal, 16, 32); err == nil {
+                                                        currentPct = int(v)
+                                                }
                                         }
                                 }
+                                break
                         }
-                        break
                 }
         }
 
@@ -169,15 +179,29 @@ func syncExplorePctToBPF() {
                 return
         }
 
-        // Write saved value to BPF map
-        hexVal := fmt.Sprintf("%02x %02x %02x %02x",
-                byte(saved), byte(saved>>8), byte(saved>>16), byte(saved>>24))
-        err = exec.Command("bpftool", "map", "update", "pinned", pinPath,
-                "key", "hex", "00 00 00 00",
-                "value", "hex", hexVal).Run()
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "  explore_pct: WARNING could not sync %d%% to BPF map: %v\n", saved, err)
-                return
+        // Write saved value to BPF map via raw syscall
+        written := false
+        fd2, err := bpfOpenPinnedMap(pinPath)
+        if err == nil {
+                key := []byte{0, 0, 0, 0}
+                value := make([]byte, 4)
+                binary.LittleEndian.PutUint32(value, uint32(saved))
+                if err := bpfMapUpdateElem(fd2, key, value, 0); err == nil {
+                        written = true
+                }
+                unix.Close(fd2)
+        }
+        if !written {
+                // Fall back to bpftool
+                hexVal := fmt.Sprintf("%02x %02x %02x %02x",
+                        byte(saved), byte(saved>>8), byte(saved>>16), byte(saved>>24))
+                err = exec.Command("bpftool", "map", "update", "pinned", pinPath,
+                        "key", "hex", "00 00 00 00",
+                        "value", "hex", hexVal).Run()
+                if err != nil {
+                        fmt.Fprintf(os.Stderr, "  explore_pct: WARNING could not sync %d%% to BPF map: %v\n", saved, err)
+                        return
+                }
         }
 
         if currentPct >= 0 {

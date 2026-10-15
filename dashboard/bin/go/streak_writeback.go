@@ -158,8 +158,17 @@ func detectMask(mapID int) {
         maskCacheMu.Unlock()
 }
 
-// detectMaskUncached does the actual bpftool dump + mask detection.
+// detectMaskUncached does the actual mask detection.
+// v0.9.86: uses BPF_MAP_GET_NEXT_KEY to iterate keys via raw syscall
+// (no bpftool fork). Falls back to bpftool dump if the syscall path fails.
 func detectMaskUncached(mapID int) {
+        // v0.9.86: try raw syscall path first.
+        if v4Keys, v6Keys, ok := detectMaskSyscall(mapID); ok {
+                applyMaskDetection(v4Keys, v6Keys)
+                return
+        }
+
+        // Fallback: bpftool dump
         out, err := exec.Command("bpftool", "--json", "map", "dump", "id", strconv.Itoa(mapID)).Output()
         if err != nil {
                 return
@@ -196,6 +205,37 @@ func detectMaskUncached(mapID int) {
                         v6 = append(v6, b)
                 }
         }
+        applyMaskDetection(v4, v6)
+}
+
+// detectMaskSyscall iterates BPF map keys via raw syscall and separates
+// them into v4 (4-byte) and v6 (16-byte) slices. Returns (v4Keys, v6Keys, ok).
+func detectMaskSyscall(mapID int) (v4, v6 [][]byte, ok bool) {
+        fd, err := getMapFD(mapID)
+        if err != nil {
+                return nil, nil, false
+        }
+        curKey := make([]byte, 16)
+        nextKey := make([]byte, 16)
+        for {
+                hasMore, err := bpfMapGetNextKey(fd, curKey, nextKey)
+                if err != nil || !hasMore {
+                        break
+                }
+                key := make([]byte, 16)
+                copy(key, nextKey)
+                if key[10] == 0xff && key[11] == 0xff {
+                        v4 = append(v4, append([]byte(nil), key[12:16]...))
+                } else {
+                        v6 = append(v6, key)
+                }
+                curKey = nextKey
+        }
+        return v4, v6, true
+}
+
+// applyMaskDetection runs the mask detection algorithm on the extracted keys.
+func applyMaskDetection(v4, v6 [][]byte) {
         if len(v4) > 0 {
                 for _, bits := range []int{8, 16, 24, 32} {
                         idx := bits / 8

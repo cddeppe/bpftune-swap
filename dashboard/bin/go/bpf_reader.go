@@ -64,8 +64,21 @@ var (
 )
 
 func readBPFMap() ([]hostEntry, error) {
+        // v0.9.86: try raw BPF syscalls first (no fork), fall back to bpftool.
+        // The syscall path uses BPF_MAP_GET_NEXT_KEY + BPF_MAP_LOOKUP_ELEM to
+        // iterate the map and parse raw bytes. Identical output to bpftool dump.
+        if raw, err := readBPFMapSyscall(); err == nil && len(raw) >= 0 {
+                // Check cache: if entry count matches, return cache.
+                if collectorMode.CacheBPFMap && bpfMapCache != nil && len(raw) == bpfMapCacheSize {
+                        return bpfMapCache, bpfMapCacheErr
+                }
+                bpfMapCacheSize = len(raw)
+                return mergeBPFMapEntries(raw)
+        }
+
+        // Fallback: bpftool fork path (used when syscalls fail — e.g.,
+        // kernel < 4.4 without BPF_MAP_GET_FD_BY_ID, or map FD is stale).
         // v0.9.33: check if the map size changed since last call.
-        // If CacheBPFMap is enabled and the size is the same, return cache.
         if collectorMode.CacheBPFMap && bpfMapCache != nil {
                 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
                 defer cancel()
@@ -103,6 +116,17 @@ func readBPFMap() ([]hostEntry, error) {
                 }
                 return nil, fmt.Errorf("bpftool json: %w", err)
         }
+        if collectorMode.CacheBPFMap {
+                bpfMapCacheSize = len(raw)
+        }
+        return mergeBPFMapEntries(raw)
+}
+
+// mergeBPFMapEntries takes raw bpftool-formatted entries (either from
+// bpftool JSON or from raw-syscall parsing) and merges them into
+// []hostEntry. This is the common merge logic extracted from readBPFMap
+// so both code paths share it.
+func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
         // Merge by final labeled addr: sum instances, keep the entry
         // with more instances for the other fields (matches Python).
         merged := map[string]*hostEntry{}

@@ -18,104 +18,153 @@ package main
 // for the duration of the syscall (they do — the buffers are local vars).
 
 import (
-	"fmt"
-	"unsafe"
+        "fmt"
+        "unsafe"
 
-	"golang.org/x/sys/unix"
+        "golang.org/x/sys/unix"
 )
 
 // BPF syscall command numbers (from include/uapi/linux/bpf.h enum bpf_cmd)
 const (
-	bpfCmdMapLookupElem = 1
-	bpfCmdMapUpdateElem = 2
-	bpfCmdMapGetFDByID  = 12
+        bpfCmdMapLookupElem = 1
+        bpfCmdMapUpdateElem = 2
+        bpfCmdMapGetNextKey = 4
+        bpfCmdMapGetFDByID  = 12
 )
 
 // bpfMapLookupElemAttr matches the kernel's MAP_LOOKUP_ELEM attr.
 type bpfMapLookupElemAttr struct {
-	MapFd uint32
-	Pad   uint32 // explicit padding for alignment
-	Key   unsafe.Pointer
-	Value unsafe.Pointer
-	Flags uint64
+        MapFd uint32
+        Pad   uint32 // explicit padding for alignment
+        Key   unsafe.Pointer
+        Value unsafe.Pointer
+        Flags uint64
 }
 
 // bpfMapUpdateElemAttr matches the kernel's MAP_UPDATE_ELEM attr.
 type bpfMapUpdateElemAttr struct {
-	MapFd uint32
-	Pad   uint32
-	Key   unsafe.Pointer
-	Value unsafe.Pointer
-	Flags uint64
+        MapFd uint32
+        Pad   uint32
+        Key   unsafe.Pointer
+        Value unsafe.Pointer
+        Flags uint64
 }
 
 // bpfMapGetFDByIDAttr matches the kernel's MAP_GET_FD_BY_ID attr.
 type bpfMapGetFDByIDAttr struct {
-	ID  uint32
-	Pad uint32
+        ID  uint32
+        Pad uint32
+}
+
+// bpfMapGetNextKeyAttr matches the kernel's MAP_GET_NEXT_KEY attr.
+type bpfMapGetNextKeyAttr struct {
+        MapFd   uint32
+        Pad     uint32
+        Key     unsafe.Pointer
+        NextKey unsafe.Pointer
+        Flags   uint64
 }
 
 // bpfMapGetFDByID converts a BPF map ID to a file descriptor.
 // The caller must close the FD when done (or cache it — the FD stays
 // valid until the map is destroyed, which only happens on bpftune reload).
 func bpfMapGetFDByID(mapID uint32) (int, error) {
-	attr := bpfMapGetFDByIDAttr{ID: mapID}
-	fd, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		bpfCmdMapGetFDByID,
-		uintptr(unsafe.Pointer(&attr)),
-		unsafe.Sizeof(attr),
-	)
-	if errno != 0 {
-		return -1, fmt.Errorf("BPF_MAP_GET_FD_BY_ID(%d): %w", mapID, errno)
-	}
-	return int(fd), nil
+        attr := bpfMapGetFDByIDAttr{ID: mapID}
+        fd, _, errno := unix.Syscall(
+                unix.SYS_BPF,
+                bpfCmdMapGetFDByID,
+                uintptr(unsafe.Pointer(&attr)),
+                unsafe.Sizeof(attr),
+        )
+        if errno != 0 {
+                return -1, fmt.Errorf("BPF_MAP_GET_FD_BY_ID(%d): %w", mapID, errno)
+        }
+        return int(fd), nil
 }
 
 // bpfMapLookupElem reads a single BPF map entry.
 // key must be the exact key bytes (e.g., 4 bytes for v4 /16, 16 for v6 /32).
 // value must be pre-allocated to the map's value size (1016 for remote_host_map).
 func bpfMapLookupElem(mapFD int, key, value []byte) error {
-	if len(key) == 0 || len(value) == 0 {
-		return fmt.Errorf("key and value must be non-empty")
-	}
-	attr := bpfMapLookupElemAttr{
-		MapFd: uint32(mapFD),
-		Key:   unsafe.Pointer(&key[0]),
-		Value: unsafe.Pointer(&value[0]),
-	}
-	_, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		bpfCmdMapLookupElem,
-		uintptr(unsafe.Pointer(&attr)),
-		unsafe.Sizeof(attr),
-	)
-	if errno != 0 {
-		return fmt.Errorf("BPF_MAP_LOOKUP_ELEM: %w", errno)
-	}
-	return nil
+        if len(key) == 0 || len(value) == 0 {
+                return fmt.Errorf("key and value must be non-empty")
+        }
+        attr := bpfMapLookupElemAttr{
+                MapFd: uint32(mapFD),
+                Key:   unsafe.Pointer(&key[0]),
+                Value: unsafe.Pointer(&value[0]),
+        }
+        _, _, errno := unix.Syscall(
+                unix.SYS_BPF,
+                bpfCmdMapLookupElem,
+                uintptr(unsafe.Pointer(&attr)),
+                unsafe.Sizeof(attr),
+        )
+        if errno != 0 {
+                return fmt.Errorf("BPF_MAP_LOOKUP_ELEM: %w", errno)
+        }
+        return nil
 }
 
 // bpfMapUpdateElem writes a single BPF map entry.
 // flags: 0 = any (create or update), BPF_ANY = 0, BPF_NOEXIST = 1, BPF_EXIST = 2.
 func bpfMapUpdateElem(mapFD int, key, value []byte, flags uint64) error {
-	if len(key) == 0 || len(value) == 0 {
-		return fmt.Errorf("key and value must be non-empty")
-	}
-	attr := bpfMapUpdateElemAttr{
-		MapFd: uint32(mapFD),
-		Key:   unsafe.Pointer(&key[0]),
-		Value: unsafe.Pointer(&value[0]),
-		Flags: flags,
-	}
-	_, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		bpfCmdMapUpdateElem,
-		uintptr(unsafe.Pointer(&attr)),
-		unsafe.Sizeof(attr),
-	)
-	if errno != 0 {
-		return fmt.Errorf("BPF_MAP_UPDATE_ELEM: %w", errno)
-	}
-	return nil
+        if len(key) == 0 || len(value) == 0 {
+                return fmt.Errorf("key and value must be non-empty")
+        }
+        attr := bpfMapUpdateElemAttr{
+                MapFd: uint32(mapFD),
+                Key:   unsafe.Pointer(&key[0]),
+                Value: unsafe.Pointer(&value[0]),
+                Flags: flags,
+        }
+        _, _, errno := unix.Syscall(
+                unix.SYS_BPF,
+                bpfCmdMapUpdateElem,
+                uintptr(unsafe.Pointer(&attr)),
+                unsafe.Sizeof(attr),
+        )
+        if errno != 0 {
+                return fmt.Errorf("BPF_MAP_UPDATE_ELEM: %w", errno)
+        }
+        return nil
+}
+
+// bpfMapGetNextKey iterates BPF map keys. Pass nil key to get the first key,
+// then pass the returned key to get the next one. Returns false when there
+// are no more keys (ENOENT).
+func bpfMapGetNextKey(mapFD int, key, nextKey []byte) (bool, error) {
+        var keyPtr unsafe.Pointer
+        if len(key) > 0 {
+                keyPtr = unsafe.Pointer(&key[0])
+        }
+        attr := bpfMapGetNextKeyAttr{
+                MapFd:   uint32(mapFD),
+                Key:     keyPtr,
+                NextKey: unsafe.Pointer(&nextKey[0]),
+        }
+        _, _, errno := unix.Syscall(
+                unix.SYS_BPF,
+                bpfCmdMapGetNextKey,
+                uintptr(unsafe.Pointer(&attr)),
+                unsafe.Sizeof(attr),
+        )
+        if errno == unix.ENOENT {
+                return false, nil // no more keys
+        }
+        if errno != 0 {
+                return false, fmt.Errorf("BPF_MAP_GET_NEXT_KEY: %w", errno)
+        }
+        return true, nil
+}
+
+// bpfOpenPinnedMap opens a pinned BPF map file and returns the FD.
+// Equivalent to BPF_OBJ_GET — just an open() syscall on the pin path.
+// The caller should close the FD when done (or cache it).
+func bpfOpenPinnedMap(pinPath string) (int, error) {
+        fd, err := unix.Open(pinPath, unix.O_RDWR, 0)
+        if err != nil {
+                return -1, fmt.Errorf("open pinned map %s: %w", pinPath, err)
+        }
+        return fd, nil
 }
