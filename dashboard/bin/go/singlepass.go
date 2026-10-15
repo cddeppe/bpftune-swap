@@ -381,7 +381,14 @@ func parseLogSinglePass(text string) *parsedLog {
 // extractBucketIPs extracts dest= / dest6= / dest6b= from a line and
 // adds them to pl.BucketIPs. This is the same logic as buildBucketIPs
 // but operates on a single line instead of the full text.
+// v0.9.84: fast-path with strings.Contains check before regex. Most log
+// lines (midsamp, met, srate, proof without dest=) don't contain "dest="
+// at all — the regex was being invoked on every line for nothing.
 func (pl *parsedLog) extractBucketIPs(line string, p4, p6 int) {
+        // v0.9.84: cheap byte-check before expensive regex. Skips ~80% of lines.
+        if !strings.Contains(line, "dest=") {
+                return
+        }
         if m := rxDestInt.FindStringSubmatch(line); m != nil && len(m) > 1 {
                 n, err := strconv.ParseUint(m[1], 10, 64)
                 if err == nil && n != 0 {

@@ -94,11 +94,14 @@ func (c *Collector) writeCurrentJSON() {
 // MD5 overhead. The SSE delta for these keys will be delayed by up to 2 min,
 // which is fine since they rarely change.
 var slowChangingKeys = map[string]bool{
-        "build":     true, // version info — never changes during a session
-        "system":    true, // uptime ticks once per minute, 2-min delay is fine
-        "hostname":  true, // never changes
-        "tunables":  true, // changes only on sysctl writes
-        "log_window": true, // changes only when log range shifts
+        "build":       true, // version info — never changes during a session
+        "system":      true, // uptime ticks once per minute, 2-min delay is fine
+        "hostname":    true, // never changes
+        "tunables":    true, // changes only on sysctl writes
+        "log_window":  true, // changes only when log range shifts
+        "bucket_live": true, // v0.9.84: large object (8 buckets × 16 algs × 120 points),
+                             // only needs 2-min freshness for chart updates; the frontend's
+                             // _appendLiveMetrics already appends one new point per SSE push
 }
 
 func computeKeyHashes(doc map[string]interface{}, fullHash bool) map[string]string {

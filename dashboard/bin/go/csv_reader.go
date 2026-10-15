@@ -59,7 +59,7 @@ func readCSVTail(span int64) map[string][]bucketSnapshot {
         if err != nil {
                 return nil
         }
-        readSize := int64(20 * 1024 * 1024) // 8MB
+        readSize := int64(8 * 1024 * 1024) // 8MB — v0.9.84: was 20MB, aligned with comment
         if readSize > fi.Size() {
                 readSize = fi.Size()
         }
