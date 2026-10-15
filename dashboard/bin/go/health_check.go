@@ -203,10 +203,12 @@ func ensureTraceCaptureService() {
         const serviceFilePath = "/etc/systemd/system/bpftune-met-trace.service"
         const logPath = "/var/log/bpftune-met-live.log"
 
-        // v0.9.54: Clear the log on collector startup to remove events
-        // from previous boots. This prevents stale swap events from
-        // showing in the dashboard with wrong ages.
-        clearStaleLogEntries(logPath)
+        // v0.9.59: REMOVED log clearing. The single-pass parser already
+        // filters events from previous boots (line 139 in singlepass.go:
+        // if uptime > 0 && ts > uptime+300 { continue }). Clearing the log
+        // on startup was too aggressive — it wiped all accumulated events
+        // and left the dashboard empty until enough new events accumulated.
+        // clearStaleLogEntries(logPath)
 
         // Check if the service file exists; create it if missing
         if _, err := os.Stat(serviceFilePath); os.IsNotExist(err) {
