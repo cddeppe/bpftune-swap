@@ -39,6 +39,10 @@ import (
         "time"
 )
 
+// v0.9.90: cache buckets.v2.csv mtime to skip readCSVTail when unchanged
+var lastBucketsMtime int64
+
+
 // ============================================================================
 // renderToDisk — entry point.  Called every 5 min + on labels change.
 // ============================================================================
@@ -62,7 +66,16 @@ func (c *Collector) renderToDisk() {
 
         // v0.7.4: renderToDisk is always fast — read only CSV tail (~8MB, 24h).
         // renderSlowToDisk reads the full CSV (for 7d+30d+all, daily at 4am).
-        hist.csvAll = readCSVTail(86400)     // last 24h only — 8MB not 60MB
+        // v0.9.90: skip readCSVTail if buckets.v2.csv mtime unchanged
+        // since last render — saves reading 432K lines when no new data.
+        bucketsMtime := int64(0)
+        if fi, err := os.Stat("/var/lib/bpftune/history/buckets.v2.csv"); err == nil {
+            bucketsMtime = fi.ModTime().Unix()
+        }
+        if bucketsMtime != lastBucketsMtime {
+            hist.csvAll = readCSVTail(86400)     // last 24h only — 8MB not 60MB
+            lastBucketsMtime = bucketsMtime
+        }
         defer func() { hist.csvAll = nil }() // free after rendering
 
         // Write meta.json

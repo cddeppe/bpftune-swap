@@ -784,7 +784,7 @@ func main() {
         // v0.9.35: every 2 min (was 5 min) so 24h charts show fresh accumulated data
         // v0.9.33: skip when no new swaps (SkipRenderWhenIdle mode)
         go func() {
-                ticker := time.NewTicker(2 * time.Minute)
+                ticker := time.NewTicker(5 * time.Minute)
                 defer ticker.Stop()
                 lastSwapCount := 0
                 for range ticker.C {
