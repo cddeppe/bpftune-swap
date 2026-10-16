@@ -1330,11 +1330,21 @@ func emptyLogWindow() map[string]interface{} {
 func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
         seen := make(map[string]bool)
         var merged []interface{}
-        // getTs reads boot_ts, falling back to ts (v0.9.14 fix: live rows
-        // historically used "ts" while CSV rows used "boot_ts" — the merge
-        // sort read boot_ts for all rows, giving live rows a 0.0 timestamp
-        // and sorting them to the bottom).
+        // v0.9.92: getTs reads epoch_ts (wall-clock) first, falling back to
+        // boot_ts (BPF ktime) for legacy rows. This mirrors the v0.9.73
+        // proofs fix: sorting by boot_ts means stale CSV swaps from a
+        // long-running previous bpftune run (with high boot_ts values like
+        // 52768) dominate the top of the panel and hide fresh live swaps
+        // (with small boot_ts values like 2332 from a recently-restarted
+        // bpftune). epoch_ts is wall-clock so it correctly orders swaps
+        // from any bpftune run.
         getTs := func(m map[string]interface{}) float64 {
+                if ts, ok := m["epoch_ts"].(int64); ok && ts > 0 {
+                        return float64(ts)
+                }
+                if ts, ok := m["epoch_ts"].(float64); ok && ts > 0 {
+                        return ts
+                }
                 if ts, ok := m["boot_ts"].(float64); ok && ts > 0 {
                         return ts
                 }
