@@ -20,6 +20,7 @@ import (
         "path/filepath"
         "regexp"
         "sort"
+	"sync"
         "strconv"
         "strings"
         "time"
@@ -275,6 +276,39 @@ var currentParsedLog *parsedLog
 // ============================================================================
 // buildRecentSwapRows — derive outcome per swap, return dashboard rows
 // ============================================================================
+
+// v0.9.88: sustained outcome cache — persists computed outcomes across
+// collect cycles so they don't get lost when srate events scroll out of
+// the log tail. Keyed by "cookie:ts" (unique per swap event).
+var sustainedOutcomeCache = map[string]string{}
+var sustainedOutcomeMu sync.RWMutex
+
+// getCachedOutcome returns a cached sustained outcome for a swap, or "".
+func getCachedOutcome(cookie int64, ts float64) string {
+    sustainedOutcomeMu.RLock()
+    defer sustainedOutcomeMu.RUnlock()
+    return sustainedOutcomeCache[fmt.Sprintf("%d:%.6f", cookie, ts)]
+}
+
+// setCachedOutcome stores a computed sustained outcome (only if non-empty).
+func setCachedOutcome(cookie int64, ts float64, outcome string) {
+    if outcome == "" {
+        return
+    }
+    sustainedOutcomeMu.Lock()
+    defer sustainedOutcomeMu.Unlock()
+    key := fmt.Sprintf("%d:%.6f", cookie, ts)
+    sustainedOutcomeCache[key] = outcome
+    // Evict old entries to prevent unbounded growth (keep last 1000)
+    if len(sustainedOutcomeCache) > 1000 {
+        for k := range sustainedOutcomeCache {
+            delete(sustainedOutcomeCache, k)
+            if len(sustainedOutcomeCache) <= 1000 {
+                break
+            }
+        }
+    }
+}
 
 func buildRecentSwapRows(swaps []swapRow,
         metByCookie map[int64][]metEntry,

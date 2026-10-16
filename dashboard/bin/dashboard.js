@@ -776,7 +776,16 @@
       var pill = o
         ? '<span class="sp ' + pillClass + '">' + pillLabel + '</span>'
         : (function() {
-            var age = (r.boot_ts && SERVER_NOW_MONO) ? (SERVER_NOW_MONO - r.boot_ts) : 0;
+            // v0.9.88: use epoch_ts (wall-clock) as fallback when
+            // boot_ts/SERVER_NOW_MONO (BPF ktime) is unavailable.
+            // This happens for CSV-derived swaps where boot_ts=0 or
+            // when the live log is sparse (SERVER_NOW_MONO=0).
+            var age = 0;
+            if (r.boot_ts && SERVER_NOW_MONO) {
+              age = SERVER_NOW_MONO - r.boot_ts;
+            } else if (r.epoch_ts) {
+              age = Math.floor(Date.now()/1000) - r.epoch_ts;
+            }
             if (age < 60) return '<span class="sp wait">wait</span>';
             return '<span class="sp void">void</span>';
           })();
