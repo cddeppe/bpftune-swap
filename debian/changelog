@@ -1,3 +1,31 @@
+bpftune (0.4.106) unstable; urgency=medium
+
+  * net_buffer_tuner: fix aggressive netdev_budget_usecs increases on
+    latency-sensitive workloads (xray/v2ray/nginx proxy servers).
+    - Fix 1: Reordered cap check so the correlation-based decrease
+      path runs BEFORE the cap break. Previously the cap check
+      short-circuited the handler before the decrease logic could
+      run, making it effectively dead code at exactly the moment
+      you need it.
+    - Fix 2: Rate-limited the "at cap" log to once per minute
+      (was spamming every 2-4 minutes forever). Demoted from
+      LOG_NOTICE to LOG_INFO.
+    - Fix 3: Made the cap configurable via env var
+      BPFTUNE_NETDEV_BUDGET_USECS_MAX (default 50000 usec).
+    - Fix 4: Added workload detection — scans /proc/*/comm at init
+      for xray/v2ray/nginx/sing-box/haproxy. If found, caps
+      netdev_budget_usecs at 8000 usec (8ms) instead of 50000
+      to avoid NAPI softirq monopolizing the CPU and causing
+      jitter in proxied video streams.
+    - Fix 6: Shrunk step size when close to cap (halved the step
+      when budget_usecs > cap/2) to avoid overshoot.
+    - When at cap, the tuner now actively SHRINKS the value
+      instead of logging and breaking (walks it back down).
+    - For latency-sensitive workloads, increases are suppressed
+      once at the 8ms cap.
+
+ -- cddeppe <cddeppe@users.noreply.github.com>  Thu, 16 Oct 2026 16:50:00 +0000
+
 bpftune (0.4.100) unstable; urgency=medium
 
   * Fix: all proofs misattributed to cubic (alg=0).

@@ -18,21 +18,26 @@
 #include <bpftune/bpftune.h>
 
 enum net_buffer_tunables {
-	NETDEV_MAX_BACKLOG,
-	FLOW_LIMIT_CPU_BITMAP,
-	NETDEV_BUDGET,
-	NETDEV_BUDGET_USECS,
-	HIGH_ORDER_ALLOC_DISABLE,
-	NET_BUFFER_NUM_TUNABLES,
+        NETDEV_MAX_BACKLOG,
+        FLOW_LIMIT_CPU_BITMAP,
+        NETDEV_BUDGET,
+        NETDEV_BUDGET_USECS,
+        HIGH_ORDER_ALLOC_DISABLE,
+        NET_BUFFER_NUM_TUNABLES,
 };
 
 enum net_buffer_scenarios {
-	NETDEV_MAX_BACKLOG_INCREASE,	
-	FLOW_LIMIT_CPU_SET,
-	NETDEV_BUDGET_INCREASE,
-	NETDEV_BUDGET_DECREASE,
-	HIGH_ORDER_ALLOC_ENABLE,
+        NETDEV_MAX_BACKLOG_INCREASE,    
+        FLOW_LIMIT_CPU_SET,
+        NETDEV_BUDGET_INCREASE,
+        NETDEV_BUDGET_DECREASE,
+        HIGH_ORDER_ALLOC_ENABLE,
 };
 
-/* above 50msec is too high */
-#define NETDEV_BUDGET_USECS_MAX	(1000 * 50)
+/* above 50msec is too high (default for bulk-transfer workloads) */
+#define NETDEV_BUDGET_USECS_MAX (1000 * 50)
+
+/* v0.4.106: latency-sensitive workloads (xray, v2ray, nginx streaming)
+ * should cap at 8ms to avoid NAPI softirq monopolizing the CPU and
+ * causing jitter in proxied video streams. */
+#define NETDEV_BUDGET_USECS_LATENCY_MAX (1000 * 8)
