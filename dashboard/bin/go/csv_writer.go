@@ -410,6 +410,21 @@ func writeProofsCSVFromInterface(proofs []interface{}, now int64) {
                 mbps, _ := row["mbps"].(float64)
                 tier, _ := row["tier"].(string)
                 dest, _ := row["dest"].(string)
+                // v0.9.93: skip rows with empty dest. This happens when:
+                //   - The proof line had no dest=/dest6=/dest6b= fields
+                //     (old BPF binary pre-v0.4.98 — proofs from rotated
+                //     log files like bpftune-met-live.log.1 still have
+                //     this old format)
+                //   - The cdest[cookie] lookup also failed (cookie from
+                //     previous bpftune run isn't in current cdest map)
+                // Writing these to proofs.csv creates the (unknown) dest
+                // feedback loop: CSV fallback rows with empty dest get
+                // read back next cycle and shown in the panel as (unknown).
+                // Skip them entirely — better to have fewer proofs in the
+                // panel than to pollute the CSV with (unknown) rows.
+                if dest == "" {
+                        continue
+                }
                 // Convert tier label back to numeric for CSV
                 tierNum := "1"
                 if tier == "proved" {
