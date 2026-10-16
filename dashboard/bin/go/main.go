@@ -711,6 +711,17 @@ func main() {
         // because it's always running and knows the tuner's needs.
         ensureSystemHealth()
 
+        // v0.9.89: clear stale log content from a previous boot.
+        // This is the permanent fix for the recurring "BPF events not
+        // showing" issue after a reboot. The log file persists across
+        // reboots (not in /tmp), so after a reboot it contains events
+        // from the previous boot (ktime > current uptime). The
+        // previous-boot filter drops these, but the health check was
+        // fooled by the file's mtime (always fresh because the trace
+        // service touches the file). clearStaleLog checks the CONTENT's
+        // ktime and truncates if stale.
+        clearStaleLog("/var/log/bpftune-met-live.log")
+
         collector := NewCollector()
 
         // v0.9.81: route monitor goroutine removed (was --route-monitor flag).

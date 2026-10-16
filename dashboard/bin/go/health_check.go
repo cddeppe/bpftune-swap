@@ -245,6 +245,75 @@ func checkBPFPrograms() {
 //
 // Only a full machine reboot can fix Level 3. The health monitor sets
 // needs_reboot in service_health so the dashboard can display a warning.
+// v0.9.89: isLogContentStale checks if the log's NEWEST line has a ktime
+// from a previous boot (ktime > uptime + 300). This is the REAL freshness
+// check — the old mtime-based check was fooled because the trace service
+// touches the file every cycle even when trace_pipe is empty.
+//
+// Returns true if:
+//   - The log file doesn't exist (no events at all)
+//   - The log file is empty
+//   - The newest line's ktime > uptime + 300 (from a previous boot)
+//
+// Returns false if the newest line's ktime <= uptime + 300 (current boot).
+func isLogContentStale(logPath string) bool {
+    data, err := os.ReadFile(logPath)
+    if err != nil || len(data) == 0 {
+        return true // no file or empty = stale
+    }
+    // Get the last non-empty line
+    lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+    var lastLine string
+    for i := len(lines) - 1; i >= 0; i-- {
+        if strings.TrimSpace(lines[i]) != "" {
+            lastLine = lines[i]
+            break
+        }
+    }
+    if lastLine == "" {
+        return true
+    }
+    // Extract ktime from the line (format: ... <secs>.<usecs>: bpf_trace_printk: ...)
+    // Use a simple string search: find the last numeric prefix before ":"
+    idx := strings.Index(lastLine, ": bpf_trace_printk:")
+    if idx < 0 {
+        return true // not a trace_pipe line
+    }
+    // Walk backwards from idx to find the start of the timestamp
+    start := idx
+    for start > 0 {
+        c := lastLine[start-1]
+        if (c >= '0' && c <= '9') || c == '.' {
+            start--
+        } else {
+            break
+        }
+    }
+    tsStr := lastLine[start:idx]
+    ts, err := strconv.ParseFloat(tsStr, 64)
+    if err != nil {
+        return true
+    }
+    uptime := readProcUptime()
+    if uptime <= 0 {
+        return false // can't read uptime, assume not stale
+    }
+    // Stale if ktime > uptime + 300 (from a previous boot)
+    return ts > uptime+300
+}
+
+// v0.9.89: clearStaleLog truncates the log file if its content is from a
+// previous boot. Called on collector startup to ensure fresh content.
+func clearStaleLog(logPath string) {
+    if !isLogContentStale(logPath) {
+        return
+    }
+    fmt.Fprintf(os.Stderr, "  log: content is from a previous boot — truncating %s\n", logPath)
+    if err := os.Truncate(logPath, 0); err != nil {
+        fmt.Fprintf(os.Stderr, "  log: truncate failed: %v\n", err)
+    }
+}
+
 func ensureTraceCaptureService() {
         const serviceName = "bpftune-met-trace"
         const serviceFilePath = "/etc/systemd/system/bpftune-met-trace.service"
@@ -260,28 +329,27 @@ func ensureTraceCaptureService() {
         out, err := exec.Command("systemctl", "is-active", serviceName).Output()
         status := strings.TrimSpace(string(out))
         if err == nil && status == "active" {
-                // Service is running — check if the log file is fresh
-                logStale := false
+                // v0.9.89: check CONTENT freshness, not just mtime.
+                // The old mtime check was fooled because the trace service
+                // touches the file every cycle even when trace_pipe is empty.
                 var logAge time.Duration
                 if fi, err := os.Stat(logPath); err == nil {
                         logAge = time.Since(fi.ModTime())
-                        if logAge > 5*time.Minute {
-                                logStale = true
-                        }
                 }
+                logStale := isLogContentStale(logPath)
 
                 if !logStale {
-                        // Log is fresh — reset escalation state
+                        // Log content is fresh — reset escalation state
                         traceEscalation.mu.Lock()
                         traceEscalation.traceRestarts = nil
                         traceEscalation.bpftuneRestartTried = time.Time{}
                         traceEscalation.needsReboot = false
                         traceEscalation.mu.Unlock()
-                        fmt.Fprintf(os.Stderr, "  trace service: active (log file %v old) (OK)\n", logAge.Round(time.Second))
+                        fmt.Fprintf(os.Stderr, "  trace service: active (log content fresh, file %v old) (OK)\n", logAge.Round(time.Second))
                         return
                 }
 
-                // Log is stale — escalate
+                // Log content is stale — escalate
                 traceEscalation.mu.Lock()
                 defer traceEscalation.mu.Unlock()
 
@@ -438,7 +506,8 @@ func getServiceHealth() map[string]interface{} {
         }
         health["log_age"] = logAge
         health["log_age_sec"] = logAgeSec
-        health["log_fresh_ok"] = logAgeSec >= 0 && logAgeSec < 120 // fresh if <2 min old
+        // v0.9.89: use content-based freshness, not just mtime
+        health["log_fresh_ok"] = logAgeSec >= 0 && logAgeSec < 120 && !isLogContentStale("/var/log/bpftune-met-live.log")
 
         // 5. Explore_pct
         expPct := explorePctValue()
