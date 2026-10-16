@@ -769,7 +769,10 @@
        * sustained window is still open.  Show "pending" until the
        * collector has classified the swap on the sustained ruler
        * (T+60..T+300 after the swap). */
-      var o = r.outcome_sustained || "";
+      // v0.9.88: fall back through outcome hierarchy. Sustained uses srate
+      // events which may not be emitted; composite uses met events which are
+      // always available. If sustained is empty, try srate, then composite.
+      var o = r.outcome_sustained || r.outcome_srate || r.outcome || "";
       // v0.9.28: display no_post as "nopost" with faded style
       var pillLabel = o === 'no_post' ? 'no post' : o;
       var pillClass = o === 'no_post' ? 'null' : o;  // reuse null pill style
@@ -786,7 +789,9 @@
             } else if (r.epoch_ts) {
               age = Math.floor(Date.now()/1000) - r.epoch_ts;
             }
-            if (age < 60) return '<span class="sp wait">wait</span>';
+            // v0.9.88: show "wait" for first 5 min (sustained window is 60-300s).
+            // After 5 min, if outcome is still empty, show "void".
+            if (age < 300) return '<span class="sp wait">wait</span>';
             return '<span class="sp void">void</span>';
           })();
       // v0.9.0: show "(unknown)" instead of a bare middot when dest is empty.
