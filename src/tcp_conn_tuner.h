@@ -232,7 +232,7 @@ struct remote_host {
 #define LOSS_CAP_BP   200
 #define LOSS_SCALE    8000000
 #define METRIC_MIN_SEGS 100
-#define METRIC_TRIGGER_SEGS 10000
+#define METRIC_TRIGGER_SEGS 1000  // v0.9.90: was 10000, lowered so short connections reach the proof check
 #define METRIC_AVG_CAP 32
 
 /* 0.4.51: if a socket delivers under SLOW_VS_REF_PCT percent of the
