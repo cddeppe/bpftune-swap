@@ -224,7 +224,20 @@ func (c *Collector) collect() {
                 }
 
                 // v0.9.5: write proofs.csv for the recent-proofs panel fallback
-                writeProofsCSVFromInterface(topProofs, now)
+                // v0.9.91: write ONLY the log-derived proofs to proofs.csv. Previously
+                // we wrote topProofs (the merged list of log proofs + CSV fallback),
+                // which created a feedback loop: empty-dest entries from the CSV
+                // fallback (proofs that had (unknown) dest) were written back to the
+                // CSV with empty dest, then re-merged in next cycle, persisting
+                // forever. Now we write only the log-derived proofs. When pl is nil
+                // (fallback path), write an empty slice — the CSV retains its
+                // existing entries and just doesn't get new ones this cycle. The BPF
+                // tuner is working correctly; this is purely a dashboard code issue.
+                var logProofs []interface{}
+                if pl != nil {
+                        logProofs = pl.GetProofRows(cdest)
+                }
+                writeProofsCSVFromInterface(logProofs, now)
         }
 
         // v0.9.7: write midsamp.csv for the rate progression panel fallback
