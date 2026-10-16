@@ -148,6 +148,18 @@ func readRecentProofsFromCSV(n int) []interface{} {
                         tierLabel = "proved"
                 }
                 dest := fields[7]
+                // v0.9.94: skip rows with empty dest. These are legacy rows
+                // written by older dashboard versions (pre-v0.9.91) that used
+                // the merged topProofs list — they include CSV fallback proofs
+                // with no dest= field. v0.9.93 prevents NEW empty-dest rows
+                // from being written, but the existing ones in proofs.csv
+                // would still show as (unknown) in the panel without this
+                // filter. Skipping them here means the panel never shows
+                // (unknown) — even if the CSV still has legacy empty-dest
+                // rows, they're silently filtered out at read time.
+                if dest == "" {
+                        continue
+                }
                 destLabel := labelFor(dest)
                 if destLabel == "" {
                         destLabel = dest
