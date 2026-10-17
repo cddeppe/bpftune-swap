@@ -12,6 +12,7 @@ package main
 
 import (
         "bufio"
+        "fmt"
         "os"
         "strconv"
         "strings"
@@ -52,6 +53,16 @@ func readRecentSwapsFromCSV(n int) []interface{} {
         }
 
         out := make([]interface{}, 0, len(lines))
+        // v0.9.95 (AUDIT-SWAPS-1 + AUDIT-PROOFS-1): dedup at read time by
+        // boot_ts+cookie. After a dashboard restart, writtenSwaps is empty so
+        // the same swap event gets re-written to CSV with a new collected_ts
+        // (T2) alongside the original (T1). Without this dedup, both rows
+        // would appear in the panel as duplicates. With it, the FIRST seen
+        // (which is the NEWEST because the loop below iterates newest-first)
+        // wins and the duplicate is dropped. Keyed by boot_ts:cookie — both
+        // fields uniquely identify the underlying swap event (cookie is
+        // kernel-assigned, boot_ts is BPF ktime at the event).
+        seen := make(map[string]bool)
         // Reverse so newest-first (CSV is oldest-first)
         for i := len(lines) - 1; i >= 0; i-- {
                 fields := strings.Split(lines[i], ",")
@@ -66,6 +77,12 @@ func readRecentSwapsFromCSV(n int) []interface{} {
                         collectedTs = 0
                 }
                 bootTs, _ := strconv.ParseFloat(fields[1], 64)
+                cookieStr := fields[2]
+                dedupKey := fmt.Sprintf("%.3f:%s", bootTs, cookieStr)
+                if seen[dedupKey] {
+                        continue
+                }
+                seen[dedupKey] = true
                 fromAlg := fields[3]
                 toAlg := fields[4]
                 d, _ := strconv.Atoi(fields[5])
@@ -129,6 +146,16 @@ func readRecentProofsFromCSV(n int) []interface{} {
         }
 
         out := make([]interface{}, 0, len(lines))
+        // v0.9.95 (AUDIT-PROOFS-1): dedup at read time by boot_ts+alg. After
+        // a dashboard restart, writtenProofs is empty so the same proof event
+        // gets re-written to CSV with a new collected_ts (T2) alongside the
+        // original (T1). Without this dedup, both rows would appear in the
+        // panel as duplicates. With it, the FIRST seen (which is the NEWEST
+        // because the loop below iterates newest-first) wins and the duplicate
+        // is dropped. Keyed by boot_ts:alg — both fields uniquely identify
+        // the underlying proof event (alg is the algorithm, boot_ts is BPF
+        // ktime at the event).
+        seen := make(map[string]bool)
         // Reverse so newest-first
         for i := len(lines) - 1; i >= 0; i-- {
                 fields := strings.Split(lines[i], ",")
@@ -141,6 +168,11 @@ func readRecentProofsFromCSV(n int) []interface{} {
                 }
                 ts, _ := strconv.ParseFloat(fields[1], 64)
                 alg := fields[3]
+                dedupKey := fmt.Sprintf("%.3f:%s", ts, alg)
+                if seen[dedupKey] {
+                        continue
+                }
+                seen[dedupKey] = true
                 mbps, _ := strconv.ParseFloat(fields[5], 64)
                 tier := fields[6]
                 tierLabel := "good"

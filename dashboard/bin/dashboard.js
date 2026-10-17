@@ -103,9 +103,27 @@
   // When boot_ts is from a PREVIOUS boot (age < 0), fall back to
   // epoch_ts so ages display correctly after a reboot.
   // Backward compat: if epoch_ts is missing, returns '' (same as before).
+  // v0.9.95 (AUDIT-SWAPS-1 LEAK #1): prefer epoch_ts (wall-clock) when
+  // available. boot_ts (BPF ktime) is only valid within a single kernel
+  // boot; after bpftune restart within the same boot, ktime CONTINUES (does
+  // NOT reset) so a stale CSV swap from the previous bpftune run has boot_ts
+  // only slightly less than current SERVER_NOW_MONO, producing a small
+  // positive age that masquerades as 'fresh' (e.g. '1h') when the swap is
+  // actually hours old (per its epoch_ts / collected_ts). epoch_ts is
+  // wall-clock so it's always correct.
   function ageLabel(boot_ts, epoch_ts) {
-    if (!boot_ts) return '';
-    if (SERVER_NOW_MONO) {
+    var nowSec = Math.floor(Date.now() / 1000);
+    if (epoch_ts) {
+      var eAge = nowSec - epoch_ts;
+      if (eAge >= 0) {
+        if (eAge < 60)    return Math.round(eAge) + 's';
+        if (eAge < 3600)  return Math.round(eAge/60) + 'm';
+        if (eAge < 86400) return Math.round(eAge/3600) + 'h';
+        return Math.round(eAge/86400) + 'd';
+      }
+    }
+    // Fallback: boot_ts when epoch_ts missing or in the future (clock skew)
+    if (boot_ts && SERVER_NOW_MONO) {
       var age = SERVER_NOW_MONO - boot_ts;
       if (age >= 0) {
         if (age < 60)    return Math.round(age) + 's';
@@ -113,16 +131,6 @@
         if (age < 86400) return Math.round(age/3600) + 'h';
         return Math.round(age/86400) + 'd';
       }
-    }
-    // boot_ts is from a different boot (age < 0) — use epoch_ts
-    if (epoch_ts) {
-      var nowSec = Math.floor(Date.now() / 1000);
-      var eAge = nowSec - epoch_ts;
-      if (eAge < 0) return '';
-      if (eAge < 60)    return Math.round(eAge) + 's';
-      if (eAge < 3600)  return Math.round(eAge/60) + 'm';
-      if (eAge < 86400) return Math.round(eAge/3600) + 'h';
-      return Math.round(eAge/86400) + 'd';
     }
     return '';
   }
@@ -682,7 +690,11 @@
   }
 
   function renderRecentProofs(rows) {
-    rows = (rows || []).slice(0, 18);
+    // v0.9.95 (AUDIT-PROOFS-1 LEAK #6): last-line-of-defence filter. The
+    // backend GetProofRows/buildRecentProofRows/mergeProofsNewestFirst should
+    // all filter empty-dest rows, but if any of them regress we'd rather show
+    // fewer proofs than pollute the panel with (unknown).
+    rows = (rows || []).filter(function(r) { return r && r.dest; }).slice(0, 18);
     if (!rows.length) {
       setHTML("lv-proofs", '<div class="placeholder">(none)</div>');
       return;
@@ -754,6 +766,10 @@
   }
 
   function renderRecentSwaps(rows) {
+    // v0.9.95 (AUDIT-SWAPS-1): last-line-of-defence filter — drop rows with
+    // no dest so the panel never shows (unknown) even if a backend regression
+    // lets an empty-dest swap through.
+    rows = (rows || []).filter(function(r) { return r && r.dest; });
     if (!rows.length) {
       setHTML("lv-swaps", '<div class="placeholder">(none in tail)</div>');
       return;
@@ -783,11 +799,15 @@
             // boot_ts/SERVER_NOW_MONO (BPF ktime) is unavailable.
             // This happens for CSV-derived swaps where boot_ts=0 or
             // when the live log is sparse (SERVER_NOW_MONO=0).
+            // v0.9.95 (AUDIT-SWAPS-1 LEAK #1): prefer epoch_ts (wall-clock) so
+            // stale CSV swaps after bpftune restart (which have boot_ts only
+            // slightly less than SERVER_NOW_MONO due to ktime continuing)
+            // don't masquerade as 'fresh' for the wait/void pill logic.
             var age = 0;
-            if (r.boot_ts && SERVER_NOW_MONO) {
-              age = SERVER_NOW_MONO - r.boot_ts;
-            } else if (r.epoch_ts) {
+            if (r.epoch_ts) {
               age = Math.floor(Date.now()/1000) - r.epoch_ts;
+            } else if (r.boot_ts && SERVER_NOW_MONO) {
+              age = SERVER_NOW_MONO - r.boot_ts;
             }
             // v0.9.88: show "wait" for first 5 min (sustained window is 60-300s).
             // After 5 min, if outcome is still empty, show "void".

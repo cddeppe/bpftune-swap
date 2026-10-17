@@ -194,27 +194,50 @@ func persistCookieDest(fresh map[string]cdestEntry) map[string]cdestEntry {
                 merged[k] = cur
         }
 
-        // Eviction: FIFO cap at cookieDestMaxEntries.  Sort by cookie (numeric
-        // string → int64) ascending and drop the smallest.  Cookies are
-        // monotonically increasing per boot, so oldest cookies have smallest
-        // numbers.  This is approximate (cookie numbers wrap and reset on
-        // reboot) but good enough — the alternative is per-entry timestamps
-        // which doubles the memory footprint.
+        // v0.9.95 (AUDIT-PROOFS-1 LEAK #5): FIFO cap. Cookies are monotonically
+        // increasing per boot, but on bpftune restart (without kernel reboot)
+        // OR on kernel reboot, the new boot's cookies start at 0 again. The old
+        // 'sort by cookie numeric ascending and drop smallest' rule would drop
+        // the NEW boot's small cookies (1-100) instead of the OLD boot's large
+        // ones (40000-50000), breaking cdest lookups for all new proofs and
+        // producing (unknown) dest in the panel. The fix: prefer dropping
+        // entries that are NOT in the fresh set (i.e. haven't been seen in the
+        // current log tail — they're disk-only and stale). Among disk-only
+        // candidates, sort by cookie numeric ascending and drop smallest (still
+        // correct within a single previous boot). Only if fresh itself exceeds
+        // the cap do we drop the smallest fresh cookies as a last resort.
         if len(merged) > cookieDestMaxEntries {
                 type ck struct {
                         k string
                         n int64
                 }
-                keys := make([]ck, 0, len(merged))
+                var diskOnly []ck
                 for k := range merged {
-                        var n int64
-                        fmt.Sscanf(k, "%d", &n)
-                        keys = append(keys, ck{k, n})
+                        if _, wasFresh := fresh[k]; !wasFresh {
+                                var n int64
+                                fmt.Sscanf(k, "%d", &n)
+                                diskOnly = append(diskOnly, ck{k, n})
+                        }
                 }
-                sort.Slice(keys, func(i, j int) bool { return keys[i].n < keys[j].n })
+                sort.Slice(diskOnly, func(i, j int) bool { return diskOnly[i].n < diskOnly[j].n })
                 drop := len(merged) - cookieDestMaxEntries
-                for i := 0; i < drop; i++ {
-                        delete(merged, keys[i].k)
+                for i := 0; i < drop && i < len(diskOnly); i++ {
+                        delete(merged, diskOnly[i].k)
+                }
+                // If we still need to drop more (rare: fresh set itself is over
+                // cap), drop the smallest fresh cookies as a last resort.
+                if drop > len(diskOnly) {
+                        var freshKeys []ck
+                        for k := range fresh {
+                                var n int64
+                                fmt.Sscanf(k, "%d", &n)
+                                freshKeys = append(freshKeys, ck{k, n})
+                        }
+                        sort.Slice(freshKeys, func(i, j int) bool { return freshKeys[i].n < freshKeys[j].n })
+                        remaining := drop - len(diskOnly)
+                        for i := 0; i < remaining && i < len(freshKeys); i++ {
+                                delete(merged, freshKeys[i].k)
+                        }
                 }
         }
 

@@ -498,6 +498,16 @@ func (pl *parsedLog) GetProofRows(cdest map[string]cdestEntry) []interface{} {
                                 dest = ds
                         }
                 }
+                // v0.9.95 (AUDIT-PROOFS-1 LEAK #1): skip rows with empty dest.
+                // The live path was the last remaining leak — v0.9.93/v0.9.94
+                // only filtered the CSV round-trip. Without this, passive
+                // connections (no estab -> no cdest entry) and pre-v0.4.98 BPF
+                // binaries (no dest= in proof line) still leak (unknown) into
+                // the panel. The row is unusable anyway (frontend renders
+                // "(unknown)"); better to show fewer rows than pollute the panel.
+                if dest == "" {
+                        continue
+                }
                 // v0.9.31 (Bug 1): add epoch_ts for age label (was missing)
                 uptime := readProcUptime()
                 nowEpoch := float64(time.Now().Unix())
@@ -609,6 +619,13 @@ func (pl *parsedLog) GetProofsRawEvents(cdest map[string]cdestEntry) []interface
                         if dest == "" {
                                 dest = ds
                         }
+                }
+                // v0.9.95 (AUDIT-PROOFS-1 LEAK #4): defence-in-depth — same
+                // filter as GetProofRows above. proofs_raw is consumed by the
+                // frontend's _filterByBucket which already drops empty-dest
+                // rows, but we shouldn't ship them at all.
+                if dest == "" {
+                        continue
                 }
                 out = append(out, map[string]interface{}{
                         "ts":   ts,

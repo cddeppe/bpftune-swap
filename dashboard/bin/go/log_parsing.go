@@ -15,6 +15,7 @@ package main
 
 import (
         "fmt"
+        "math"
         "net"
         "os"
         "path/filepath"
@@ -767,6 +768,12 @@ func buildRecentProofRows(text string, cdest map[string]cdestEntry) []interface{
                                 dest = ds
                         }
                 }
+                // v0.9.95 (AUDIT-PROOFS-1 LEAK #2): skip empty-dest rows. Mirror
+                // the filter in singlepass.go:GetProofRows so the fallback path
+                // (used by tests and by backfillProofsFromLog) can't leak.
+                if dest == "" {
+                        continue
+                }
                 out = append(out, map[string]interface{}{
                         "boot_ts":  ts,
                         "epoch_ts": int64(bootEpoch + ts),
@@ -1339,19 +1346,23 @@ func mergeSwapsNewestFirst(live, csv []interface{}, n int) []interface{} {
         // bpftune). epoch_ts is wall-clock so it correctly orders swaps
         // from any bpftune run.
         getTs := func(m map[string]interface{}) float64 {
+                // v0.9.95 (AUDIT-SWAPS-1 LEAK #3): epoch_ts is the wall-clock
+                // timestamp — always comparable across boots/restarts. If it's
+                // missing/0, the row is unsortable by wall-clock; return -Inf
+                // so it sinks to the bottom (newest-first = highest first),
+                // never above a fresh swap with a valid epoch_ts. Previously
+                // fell back to boot_ts (BPF ktime), which is wrong across
+                // kernel boots: a stale CSV swap with high boot_ts (e.g.
+                // 52768 from a previous long-running boot) sorted above a
+                // fresh live swap with small boot_ts (e.g. 100 from a recently
+                // rebooted kernel), letting stale swaps dominate the panel.
                 if ts, ok := m["epoch_ts"].(int64); ok && ts > 0 {
                         return float64(ts)
                 }
                 if ts, ok := m["epoch_ts"].(float64); ok && ts > 0 {
                         return ts
                 }
-                if ts, ok := m["boot_ts"].(float64); ok && ts > 0 {
-                        return ts
-                }
-                if ts, ok := m["ts"].(float64); ok {
-                        return ts
-                }
-                return 0
+                return math.Inf(-1)
         }
         add := func(row interface{}) {
                 if m, ok := row.(map[string]interface{}); ok {
@@ -1399,13 +1410,26 @@ func mergeProofsNewestFirst(live, csv []interface{}, n int) []interface{} {
         seen := make(map[string]bool)
         var merged []interface{}
         getEpochTs := func(m map[string]interface{}) int64 {
+                // v0.9.95 (AUDIT-SWAPS-1 LEAK #3 + AUDIT-PROOFS-1 LEAK #3):
+                // return MinInt64 (sorts to bottom) when epoch_ts is missing,
+                // mirroring mergeSwapsNewestFirst's -Inf return. Was: return 0,
+                // which let stale rows with high boot_ts dominate.
                 if ts, ok := m["epoch_ts"].(int64); ok && ts > 0 {
                         return ts
                 }
-                return 0
+                return math.MinInt64
         }
         add := func(row interface{}) {
                 if m, ok := row.(map[string]interface{}); ok {
+                        // v0.9.95 (AUDIT-PROOFS-1 LEAK #3): drop empty-dest
+                        // rows. The two producers (GetProofRows,
+                        // readRecentProofsFromCSV) are supposed to filter
+                        // already, but defence-in-depth: if either regresses,
+                        // the merge must not let rows through.
+                        dest, _ := m["dest"].(string)
+                        if dest == "" {
+                                return
+                        }
                         ts := getEpochTs(m)
                         alg, _ := m["alg"].(string)
                         key := fmt.Sprintf("%d:%s", ts, alg)
