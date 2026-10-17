@@ -37,8 +37,10 @@ package main
 //   - Each test asserts SPECIFIC expectations, not just len() > 0.
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -61,19 +63,21 @@ func pinBootUptime(value float64) {
 	bootUptime.mu.Unlock()
 }
 
-// resetDedupMaps clears the in-memory writtenSwaps/writtenProofs/etc. maps
-// so tests that exercise writeProofsCSVFromInterface / writeSwapsCSV start
-// from a clean state. (Production code never resets these maps; they
+// resetDedupMaps clears the in-memory writtenSwapsFlat/writtenProofsFlat/etc.
+// maps so tests that exercise writeProofsCSVFromInterface / writeSwapsCSV
+// start from a clean state. (Production code never resets these maps; they
 // persist for the lifetime of the process. Tests need to reset because
 // Go runs tests in one binary.)
+//
+// v0.9.96: reset to flat maps (was nested map[int64]map[float64]bool).
 func resetDedupMaps() {
 	dedupMu.Lock()
 	defer dedupMu.Unlock()
-	writtenSwaps = map[int64]map[float64]bool{}
-	writtenSrates = map[int64]map[float64]bool{}
-	writtenTruth = map[int64]map[float64]bool{}
-	writtenProofs = map[int64]map[float64]bool{}
-	writtenMidsamps = map[int64]map[float64]bool{}
+	writtenSwapsFlat = map[string]bool{}
+	writtenSratesFlat = map[string]bool{}
+	writtenTruthFlat = map[string]bool{}
+	writtenProofsFlat = map[float64]bool{}
+	writtenMidsampsFlat = map[string]bool{}
 }
 
 // resetCookieDestState clears the cookie_dest disk map + path so tests
@@ -1015,4 +1019,249 @@ func TestProofsMergeDedupByBootTsNotEpochTs(t *testing.T) {
 		t.Fatalf("expected kept row epoch_ts=1700000010 (newer duplicate), got %d — kept OLDER?", firstTs)
 	}
 	t.Logf("MergeDedupByBootTsNotEpochTs: reader deduped duplicate proofs, kept newer ✓")
+}
+
+// ============================================================================
+// v0.9.96: Memory-leak regression tests (MEMFIX-1)
+//
+// These tests verify the 4 memory-waste fixes do not regress:
+//   1. writtenProofsFlat stays bounded under load (was: nested map leaked).
+//   2. writtenSwapsFlat stays bounded under load (was: nested map leaked).
+//   3. bucketSnapshot with int16 Ss/Bs/Ns serializes/deserializes correctly.
+//   4. mtimeCache.get skips os.Stat when lastStat < 30s.
+// ============================================================================
+
+// TestProofsDedupMapDoesNotLeak: MEMFIX-1 Fix 1 regression test.
+// Simulate 1000 collect cycles × 10 proofs = 10,000 unique proof events
+// over a ts range that exceeds the 1-hour prune cutoff (ts goes
+// 1..10000, so by cycle 1000 the prune cutoff is ts-3600 = 6400, and
+// only the most recent 3600 entries survive).
+//
+// OLD CODE: writtenProofs was map[int64]map[float64]bool keyed by
+// (int64(ts), ts). cookieFake = int64(ts) is derived from ts, so the
+// outer map grew ONE OUTER ENTRY PER PROOF EVENT and the outer map was
+// never pruned. After 10,000 proofs the outer map had ~10,000 entries,
+// each holding an empty/1-entry inner map header (~150 B) — ~1.5 MB of
+// dead state. After a week (~600k proofs): ~90 MB.
+//
+// With the flat map + 1h prune, steady-state size at 1 proof/sec
+// (this test's density) = ~3600 entries. Asserting <5000 proves the
+// prune is working (without prune, len would be 10000 = total proofs
+// written; with the OLD nested form, len(outer) would be 10000 = total
+// unique cookies).
+func TestProofsDedupMapDoesNotLeak(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup(t)
+	resetDedupMaps()
+	pinBootUptime(1_000_000_000)
+
+	now := int64(1792000000)
+	// 1000 cycles × 10 proofs. ts = cycle*10 + i + 1, so ts spans 1..10000.
+	// By cycle 1000, the prune cutoff (ts - 3600) = 6400, so entries with
+	// ts > 6400 survive = 3600 entries.
+	for cycle := 0; cycle < 1000; cycle++ {
+		proofs := make([]interface{}, 0, 10)
+		for i := 0; i < 10; i++ {
+			ts := float64(cycle*10 + i + 1)
+			proofs = append(proofs, proofRow(ts, "bbr", "1.0", "proved", "82.43.215.97", now+int64(cycle)))
+		}
+		writeProofsCSVFromInterface(proofs, now+int64(cycle))
+	}
+	dedupMu.Lock()
+	n := len(writtenProofsFlat)
+	dedupMu.Unlock()
+	// We wrote 10,000 proofs. Steady-state at 1/sec density with 1h
+	// prune = ~3600 entries. Allow up to 5000 for prune-overhead margin.
+	// (OLD nested form: len(outer) = 10000 — would fail this bound.)
+	if n > 5000 {
+		t.Errorf("writtenProofsFlat leaked: len=%d (expected <5000 after 10000 proofs with 1h prune; steady state should be ~3600)", n)
+	}
+	// Sanity: must be > 0 (we wrote proofs).
+	if n == 0 {
+		t.Errorf("writtenProofsFlat empty after 10000 proofs — dedup map never populated?")
+	}
+	// Sanity: must be < total proofs written (proves prune ran).
+	if n >= 10000 {
+		t.Errorf("writtenProofsFlat len=%d == total proofs written — prune never ran", n)
+	}
+	t.Logf("ProofsDedupMapDoesNotLeak: %d entries after 10000 proofs (steady-state ~3600, prune-at-1000+1h-window) ✓", n)
+}
+
+// TestSwapsDedupMapDoesNotLeak: MEMFIX-1 Fix 2 regression test.
+// Simulate 1000 cycles × 10 swaps = 10,000 unique swap events with
+// DIFFERENT cookies each cycle (to exercise the outer-map leak path
+// of the old code). The flat map prunes entries with ts < current_ts -
+// 3600 once len > 5000, so steady-state stays bounded.
+//
+// OLD CODE: writtenSwaps was map[int64]map[float64]bool keyed by
+// (cookie, ts). Outer map grew ONE ENTRY PER UNIQUE COOKIE, never pruned.
+// With 10,000 unique cookies, outer map had 10,000 entries × ~150 B per
+// inner-map-header = ~1.5 MB. After a week on a busy host (~70k unique
+// cookies): ~10 MB just for the headers, plus the per-cookie inner maps
+// (mostly empty after their 1000-cap prune): ~50 MB total.
+func TestSwapsDedupMapDoesNotLeak(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup(t)
+	resetDedupMaps()
+	pinBootUptime(1_000_000_000)
+
+	now := int64(1792000000)
+	// 1000 cycles × 10 swaps. Each cycle uses cookies 1000*cycle + i
+	// (10,000 unique cookies total — exercises the outer-map leak path).
+	// Each cycle uses ts = cycle*10 + i + 1 so the prune window
+	// (ts - 3600) eventually rolls old entries out.
+	for cycle := 0; cycle < 1000; cycle++ {
+		swaps := make([]swapRow, 0, 10)
+		for i := 0; i < 10; i++ {
+			sw := swapRow{
+				Ts:     float64(cycle*10 + i + 1),
+				Cookie: int64(cycle*10 + i + 1),
+				From:   1,
+				To:     2,
+				D:      "2",
+				Dest:   "1.2.3.4",
+			}
+			// Mark as resolved so writeTruthRow is called
+			// (exercise both code paths).
+			sw.Outcome = "win"
+			sw.DestResolved = "1.2.3.4"
+			swaps = append(swaps, sw)
+		}
+		writeSwapsCSV(swaps, now+int64(cycle))
+	}
+	dedupMu.Lock()
+	n := len(writtenSwapsFlat)
+	dedupMu.Unlock()
+	// We wrote 10,000 swaps with 10,000 unique cookies. Flat map with
+	// prune-at-5000 + 1h window should stay < 6000. Allow up to 7000
+	// for safety.
+	if n > 7000 {
+		t.Errorf("writtenSwapsFlat leaked: len=%d (expected <7000 after 10000 swaps with 1h prune)", n)
+	}
+	t.Logf("SwapsDedupMapDoesNotLeak: %d entries after 10000 swaps (cap=5000+overhead) ✓", n)
+}
+
+// TestBucketSnapshotInt16Roundtrip: MEMFIX-1 Fix 4 regression test.
+// Verifies bucketSnapshot with int16 Ss/Bs/Ns fields serializes and
+// deserializes correctly via JSON, preserving the full value range
+// (0-1024 for Ss, 0-255 for Bs/Ns).
+//
+// This catches:
+//   - Accidental truncation (int8 instead of int16 would lose Ss values
+//     > 255).
+//   - JSON encoding issues (json package handles int16 fine, but verify).
+//   - Sign-extension bugs (if Ss were uint16 vs int16 the max would
+//     differ).
+func TestBucketSnapshotInt16Roundtrip(t *testing.T) {
+	snap := bucketSnapshot{
+		Ts:      1792000000,
+		BestAlg: "bbr",
+		BestI:   2,
+		// Ss covers the full kernel range (0-1024) including the max.
+		Ss: [16]int16{0, 1, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1024, 0, 0, 0},
+		// Bs covers 0-255 (u8 range).
+		Bs: [16]int16{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100, 200, 255, 0, 0},
+		// Ns covers 0-255.
+		Ns: [16]int16{0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 255, 0, 0},
+		Mv: [16]float64{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0},
+		Re: [16]float64{1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5, 14.5, 15.5, 16.5},
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var snap2 bucketSnapshot
+	if err := json.Unmarshal(data, &snap2); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	// Verify max-value preservation (the most likely failure mode for an
+	// accidental int8 or sign-extension bug).
+	if snap2.Ss[12] != 1024 {
+		t.Errorf("Ss[12] = %d, want 1024 (int16 max-value preservation)", snap2.Ss[12])
+	}
+	if snap2.Bs[13] != 255 {
+		t.Errorf("Bs[13] = %d, want 255 (u8 max preserved through int16)", snap2.Bs[13])
+	}
+	if snap2.Ns[13] != 255 {
+		t.Errorf("Ns[13] = %d, want 255 (u8 max preserved through int16)", snap2.Ns[13])
+	}
+	// Verify zero values too (no spurious non-zero after roundtrip).
+	if snap2.Ss[0] != 0 {
+		t.Errorf("Ss[0] = %d, want 0", snap2.Ss[0])
+	}
+	// Verify the JSON actually contains 1024 (not a wrapped/truncated value).
+	if !strings.Contains(string(data), "1024") {
+		t.Errorf("JSON output missing 1024 — serialization regression: %s", string(data))
+	}
+	t.Logf("BucketSnapshotInt16Roundtrip: Ss[12]=1024, Bs[13]=255, Ns[13]=255 preserved ✓")
+}
+
+// TestMtimeCacheSkipsRecentStats: MEMFIX-1 Fix 3 regression test.
+// Verifies the 30s TTL on mtimeCache.get — calling get(path) twice within
+// 30s returns the same cached val without re-stat'ing the file.
+//
+// We can't directly count os.Stat calls without instrumentation, so we
+// verify the BEHAVIORAL contract: two calls within 30s return the same
+// value, and a third call after the file is modified within the 30s
+// window STILL returns the cached value (proving the TTL is in effect —
+// without TTL, the third call would re-stat, see the new mtime, and
+// re-read the file).
+func TestMtimeCacheSkipsRecentStats(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "labels.json")
+	// Write initial labels.
+	initial := []byte(`{"1.2.3.4": "home-sco"}`)
+	if err := os.WriteFile(path, initial, 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+
+	// Point the package-level labelsFile at our temp file (loadLabels
+	// reads labelsFile). Save+restore so other tests aren't affected.
+	oldLabelsFile := labelsFile
+	labelsFile = path
+	defer func() { labelsFile = oldLabelsFile }()
+
+	// Use the package-level labelsHolder directly (it's a mtimeCache).
+	// First call: stat + read + cache.
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+
+	v1 := loadLabels()
+	if lbl, ok := v1["1.2.3.4"]; !ok || lbl != "home-sco" {
+		t.Fatalf("first loadLabels returned %v, want {1.2.3.4: home-sco}", v1)
+	}
+
+	// Modify the file. Without the TTL, the next get() would stat,
+	// see the new mtime, and reload — returning the new label.
+	// WITH the TTL (lastStat < 30s ago), get() returns the cached val
+	// and the modification is invisible until the TTL expires.
+	updated := []byte(`{"1.2.3.4": "home-sco-CHANGED"}`)
+	if err := os.WriteFile(path, updated, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	v2 := loadLabels()
+	// With the TTL active, we expect the OLD (cached) value.
+	if lbl, ok := v2["1.2.3.4"]; ok && lbl == "home-sco-CHANGED" {
+		t.Errorf("loadLabels saw the file change within 30s TTL — TTL is NOT working (got updated value %q)", lbl)
+	}
+	if lbl, ok := v2["1.2.3.4"]; !ok || lbl != "home-sco" {
+		t.Errorf("loadLabels returned %v, want cached {1.2.3.4: home-sco} (TTL should hide the file change)", v2)
+	}
+
+	// Verify the lastStat field was set (TTL is in effect).
+	labelsHolder.mu.Lock()
+	ls := labelsHolder.lastStat
+	labelsHolder.mu.Unlock()
+	if ls.IsZero() {
+		t.Errorf("mtimeCache.lastStat is zero — TTL was never enabled")
+	}
+	if time.Since(ls) >= 30*time.Second {
+		t.Errorf("mtimeCache.lastStat = %v ago, expected <30s (TTL window)", time.Since(ls))
+	}
+	t.Logf("MtimeCacheSkipsRecentStats: file change within 30s TTL was hidden by cache ✓ (lastStat=%v ago)", time.Since(ls))
 }

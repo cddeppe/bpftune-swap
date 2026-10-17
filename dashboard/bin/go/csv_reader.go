@@ -115,15 +115,15 @@ func readCSVTail(span int64) map[string][]bucketSnapshot {
                         }
                         if idx, ok := colIdx["ss_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
                                 v, _ := strconv.Atoi(cols[idx])
-                                snap.Ss[i] = v
+                                snap.Ss[i] = int16(v) // v0.9.96: bucketSnapshot.Ss is int16
                         }
                         if idx, ok := colIdx["bs_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
                                 v, _ := strconv.Atoi(cols[idx])
-                                snap.Bs[i] = v
+                                snap.Bs[i] = int16(v) // v0.9.96: bucketSnapshot.Bs is int16
                         }
                         if idx, ok := colIdx["ns_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
                                 v, _ := strconv.Atoi(cols[idx])
-                                snap.Ns[i] = v
+                                snap.Ns[i] = int16(v) // v0.9.96: bucketSnapshot.Ns is int16
                         }
                 }
                 result[addr] = append(result[addr], snap)
@@ -247,15 +247,15 @@ func readBucketCSV(bucketID string, span int64) []bucketSnapshot {
                         }
                         if idx, ok := colIdx["ss_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
                                 v, _ := strconv.Atoi(cols[idx])
-                                snap.Ss[i] = v
+                                snap.Ss[i] = int16(v) // v0.9.96: bucketSnapshot.Ss is int16
                         }
                         if idx, ok := colIdx["bs_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
                                 v, _ := strconv.Atoi(cols[idx])
-                                snap.Bs[i] = v
+                                snap.Bs[i] = int16(v) // v0.9.96: bucketSnapshot.Bs is int16
                         }
                         if idx, ok := colIdx["ns_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
                                 v, _ := strconv.Atoi(cols[idx])
-                                snap.Ns[i] = v
+                                snap.Ns[i] = int16(v) // v0.9.96: bucketSnapshot.Ns is int16
                         }
                 }
                 snaps = append(snaps, snap)

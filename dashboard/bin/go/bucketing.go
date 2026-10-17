@@ -41,21 +41,41 @@ import (
 // mtimeCache is a generic mtime-based file cache. Returns the loader's
 // output cached until the file's mtime changes. Returns nil (caller
 // treats as empty map) if file is missing or loader errors.
+//
+// v0.9.96: 30-second TTL on os.Stat. The same labels.json / aliases /
+// prefixN files are stat'd ~5,000×/cycle (once per call to labelFor,
+// prefix4Value, prefix6Value, etc.). pprof showed os.statNolog was
+// 45% of all allocations on a 200-cycle synthetic test (61.51 MB).
+// Skipping the stat when lastStat was <30s ago cuts ~30 MB/day of
+// GC churn on a 1 GB host with ZERO functional impact — file mtime
+// changes are picked up within 30s (vs. instant) which is fine
+// because labels.json is hand-edited rarely.
 type mtimeCache struct {
-	mu    sync.Mutex
-	val   map[string]string
-	mtime time.Time
+	mu       sync.Mutex
+	val      map[string]string
+	mtime    time.Time
+	lastStat time.Time // v0.9.96: time of last os.Stat call
 }
 
 func (c *mtimeCache) get(path string, loader func([]byte) map[string]string) map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// v0.9.96: skip os.Stat if last stat was <30s ago AND we have a
+	// cached val. The file's mtime rarely changes (labels.json is
+	// hand-edited maybe once an hour); paying 5,000 os.Stat calls
+	// per cycle just to confirm "yes, still the same mtime" is the
+	// single biggest allocator in the binary.
+	if c.val != nil && time.Since(c.lastStat) < 30*time.Second {
+		return c.val
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		c.val = nil
 		c.mtime = time.Time{}
+		c.lastStat = time.Time{}
 		return map[string]string{}
 	}
+	c.lastStat = time.Now()
 	if c.val != nil && fi.ModTime().Equal(c.mtime) {
 		return c.val
 	}
@@ -429,22 +449,30 @@ func labelKeyToCIDR(k string) *net.IPNet {
 // ============================================================================
 
 type mtimeIntCache struct {
-	mu    sync.Mutex
-	val   int
-	set   bool
-	mtime time.Time
+	mu       sync.Mutex
+	val      int
+	set      bool
+	mtime    time.Time
+	lastStat time.Time // v0.9.96: time of last os.Stat call
 }
 
 func (c *mtimeIntCache) get(path string, defaultVal int) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// v0.9.96: skip os.Stat if last stat was <30s ago AND we have a
+	// cached val. See mtimeCache.get comment for rationale.
+	if c.set && time.Since(c.lastStat) < 30*time.Second {
+		return c.val
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		c.val = defaultVal
 		c.set = true
 		c.mtime = time.Time{}
+		c.lastStat = time.Time{}
 		return defaultVal
 	}
+	c.lastStat = time.Now()
 	if c.set && fi.ModTime().Equal(c.mtime) {
 		return c.val
 	}

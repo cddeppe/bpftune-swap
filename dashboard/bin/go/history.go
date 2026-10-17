@@ -28,6 +28,16 @@ import (
 // v0.7.2: arrays instead of maps — saves ~1.5GB memory on 104-bucket hosts.
 // Each map has ~150 bytes overhead; 1.5M maps × 150B = 225MB just for empty
 // map headers.  Arrays are inline in the struct — zero overhead.
+//
+// v0.9.96: Ss/Bs/Ns changed from [16]int to [16]int16. swap_score range
+// is 0-1024 (kernel bpftune defines it as u16 capped at 1024), bad_streak
+// and null_streak are 0-255 (u8). All fit comfortably in int16 (max 32767).
+// Saves 96 bytes per snapshot (3 × 16 × 4B → 3 × 16 × 2B = 96B saved) which
+// is ~3.4 MB on the 1h ring buffer (120 cycles × ~104 buckets × 96 B =
+// ~1.2 MB on a 104-bucket host; up to ~3.4 MB on busier hosts).
+//
+// IMPORTANT: aggregation MUST be done in int (not int16) to avoid overflow
+// when summing many snapshots — see aggregateSnapshots.
 type bucketSnapshot struct {
         Ts         int64       `json:"ts"` // wall-clock collected_ts
         BestAlg    string      `json:"best_alg"`
@@ -39,9 +49,9 @@ type bucketSnapshot struct {
         RateBestV  float64     `json:"rate_best_v"`
         TcpRmemMax int         `json:"tcp_rmem_max"`
         Re         [16]float64 `json:"re"` // rate_ema per alg index
-        Ss         [16]int     `json:"ss"` // swap_score per alg index
-        Bs         [16]int     `json:"bs"` // bad_streak per alg index
-        Ns         [16]int     `json:"ns"` // null_streak per alg index
+        Ss         [16]int16   `json:"ss"` // v0.9.96: was [16]int — swap_score (0-1024), fits in int16
+        Bs         [16]int16   `json:"bs"` // v0.9.96: was [16]int — bad_streak (0-255), fits in int16
+        Ns         [16]int16   `json:"ns"` // v0.9.96: was [16]int — null_streak (0-255), fits in int16
         Mv         [16]float64 `json:"mv"` // metric_value per alg index
 }
 
@@ -106,6 +116,10 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
         var sumTs int64
         var sumInst, sumRBI int
         var sumRR, sumMinRtt, sumRBV float64
+        // v0.9.96: Ss/Bs/Ns are int16 in the struct but sum in int to avoid
+        // overflow (120 snapshots × 1024 max swap_score = 122,880 > int16
+        // max of 32,767). Convert back to int16 at the end after averaging.
+        var sumSs, sumBs, sumNs [16]int
         for _, s := range snaps {
                 sumTs += s.Ts
                 sumInst += s.Instances
@@ -116,9 +130,9 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
                 // v0.7.2: array index instead of map key
                 for i := 0; i < 16; i++ {
                         out.Re[i] += s.Re[i]
-                        out.Ss[i] += s.Ss[i]
-                        out.Bs[i] += s.Bs[i]
-                        out.Ns[i] += s.Ns[i]
+                        sumSs[i] += int(s.Ss[i])
+                        sumBs[i] += int(s.Bs[i])
+                        sumNs[i] += int(s.Ns[i])
                         out.Mv[i] += s.Mv[i]
                 }
         }
@@ -132,9 +146,9 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
         // v0.7.2: divide arrays by n
         for i := 0; i < 16; i++ {
                 out.Re[i] /= float64(n)
-                out.Ss[i] /= n
-                out.Bs[i] /= n
-                out.Ns[i] /= n
+                out.Ss[i] = int16(sumSs[i] / n)
+                out.Bs[i] = int16(sumBs[i] / n)
+                out.Ns[i] = int16(sumNs[i] / n)
                 out.Mv[i] /= float64(n)
         }
         return out
@@ -195,10 +209,12 @@ func captureSnapshotsFromBPF(hosts []hostEntry, now int64) {
                                 continue
                         }
                         // v0.7.2: array index instead of map key
+                        // v0.9.96: cast int → int16 (swap_score 0-1024,
+                        // bad_streak/null_streak 0-255 — all fit in int16).
                         snap.Re[i] = toFloat(mi["rate_ema"])
-                        snap.Ss[i] = toInt(mi["swap_score"])
-                        snap.Bs[i] = toInt(mi["bad_streak"])
-                        snap.Ns[i] = toInt(mi["null_streak"])
+                        snap.Ss[i] = int16(toInt(mi["swap_score"]))
+                        snap.Bs[i] = int16(toInt(mi["bad_streak"]))
+                        snap.Ns[i] = int16(toInt(mi["null_streak"]))
                         snap.Mv[i] = toFloat(mi["metric_value"])
                 }
                 hist.addSnapshot(h.Addr, snap)

@@ -25,8 +25,12 @@ import (
 )
 
 // midsampCSVPath is set in csv_writer.go's var block (added by v0.9.7).
-// writtenMidsamps is the dedup set for midsamp.csv.
-var writtenMidsamps = map[int64]map[float64]bool{}
+// v0.9.96: writtenMidsampsFlat is the flat dedup set for midsamp.csv —
+// keyed by "cookie:ts" string. Was: nested map[int64]map[float64]bool
+// keyed by (cookie, ts) where the outer map was never pruned, leaking
+// ~1 outer entry per unique cookie. Now flat with a 5000-entry cap that
+// prunes entries older than 1 hour.
+var writtenMidsampsFlat = map[string]bool{}
 
 // midsampCSVHeader returns the CSV header for midsamp.csv.
 // Columns: collected_ts, boot_ts, cookie, rport, alg, thr, srate
@@ -108,18 +112,20 @@ func writeMidsampCSV(events []midsampEvent, now int64) {
 	defer f.Close()
 
 	for _, e := range events {
-		if writtenMidsamps[e.Cookie] == nil {
-			writtenMidsamps[e.Cookie] = map[float64]bool{}
-		}
-		if writtenMidsamps[e.Cookie][e.Ts] {
+		// v0.9.96: flat map keyed by "cookie:ts" (was nested
+		// map[int64]map[float64]bool — outer never pruned).
+		key := fmt.Sprintf("%d:%.6f", e.Cookie, e.Ts)
+		if writtenMidsampsFlat[key] {
 			continue
 		}
-		writtenMidsamps[e.Cookie][e.Ts] = true
+		writtenMidsampsFlat[key] = true
 
-		if len(writtenMidsamps[e.Cookie]) > 1000 {
-			for k := range writtenMidsamps[e.Cookie] {
-				if k < e.Ts-3600 {
-					delete(writtenMidsamps[e.Cookie], k)
+		if len(writtenMidsampsFlat) > 5000 {
+			for k := range writtenMidsampsFlat {
+				if idx := strings.Index(k, ":"); idx >= 0 {
+					if kts, err := strconv.ParseFloat(k[idx+1:], 64); err == nil && kts < e.Ts-3600 {
+						delete(writtenMidsampsFlat, k)
+					}
 				}
 			}
 		}
@@ -256,20 +262,20 @@ var backfillDone sync.Once
 // when the file's mtime changes. Most cycles the file hasn't been written
 // to yet (writes happen at the end of collect()).
 var (
-        rateCSVCache     []interface{}
-        rateCSVCacheMtime int64
+	rateCSVCache     []interface{}
+	rateCSVCacheMtime int64
 )
 
 func buildRateFromCSVCached() []interface{} {
-        fi, err := os.Stat(midsampCSVPath)
-        if err != nil {
-                return []interface{}{}
-        }
-        mtime := fi.ModTime().Unix()
-        if rateCSVCache != nil && mtime == rateCSVCacheMtime {
-                return rateCSVCache
-        }
-        rateCSVCache = buildRateFromCSV()
-        rateCSVCacheMtime = mtime
-        return rateCSVCache
+	fi, err := os.Stat(midsampCSVPath)
+	if err != nil {
+		return []interface{}{}
+	}
+	mtime := fi.ModTime().Unix()
+	if rateCSVCache != nil && mtime == rateCSVCacheMtime {
+		return rateCSVCache
+	}
+	rateCSVCache = buildRateFromCSV()
+	rateCSVCacheMtime = mtime
+	return rateCSVCache
 }

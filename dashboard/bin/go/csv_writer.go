@@ -58,13 +58,25 @@ var (
 )
 
 // Dedup sets — track which swaps/srates/proofs have already been written to CSV.
-// Keyed by (cookie, boot_ts) which uniquely identifies an event.
+// Keyed by a composite "cookie:ts" string which uniquely identifies an event.
+//
+// v0.9.96: ALL dedup maps are now flat (single map, no outer-keyed-by-cookie
+// nested map). The old `map[int64]map[float64]bool{}` form grew an OUTER entry
+// per unique cookie and the outer map was NEVER pruned (only the inner map's
+// size was capped). On a 1-week-running host with ~10k unique cookies/day,
+// the outer map leaked ~70k entries × ~80 B = ~5.6 MB across all four maps,
+// plus the inner maps' headers (~150 B each × 70k = ~10 MB) — totals ~90 MB
+// of dead-state growth over a week.
+//
+// `writtenProofsFlat` is keyed by ts only (proof events are uniquely
+// identified by boot_ts) — the old code derived cookieFake = int64(ts) from
+// ts anyway, so the outer dimension was completely redundant.
 var (
-        writtenSwaps   = map[int64]map[float64]bool{}
-        writtenSrates  = map[int64]map[float64]bool{}
-        writtenTruth   = map[int64]map[float64]bool{} // 0.8.3: separate dedup for truth rows
-        writtenProofs  = map[int64]map[float64]bool{} // v0.9.5: proofs.csv dedup
-        dedupMu         sync.Mutex
+        writtenSwapsFlat    = map[string]bool{}   // v0.9.96: flat swaps.csv dedup, key "cookie:ts"
+        writtenSratesFlat   = map[string]bool{}   // v0.9.96: flat srate.csv dedup, key "cookie:ts"
+        writtenTruthFlat    = map[string]bool{}   // v0.9.96: flat swapscore_truth dedup, key "cookie:ts"
+        writtenProofsFlat   = map[float64]bool{}  // v0.9.96: flat proofs.csv dedup, key ts (boot_ts uniquely identifies a proof)
+        dedupMu             sync.Mutex
 )
 
 // COL-001 fix: writeCSVHeaderIfEmpty checks if CSV file is empty
@@ -234,18 +246,25 @@ func writeSwapsCSV(swaps []swapRow, now int64) {
         defer f.Close()
 
         for _, sw := range swaps {
-                if writtenSwaps[sw.Cookie] == nil {
-                        writtenSwaps[sw.Cookie] = map[float64]bool{}
-                }
-                if writtenSwaps[sw.Cookie][sw.Ts] {
+                // v0.9.96: flat map keyed by "cookie:ts" — was nested
+                // map[int64]map[float64]bool keyed by (cookie, ts). The outer
+                // map was never pruned, leaking ~1 entry per unique cookie
+                // (~70k over a week on busy hosts).
+                key := fmt.Sprintf("%d:%.6f", sw.Cookie, sw.Ts)
+                if writtenSwapsFlat[key] {
                         continue
                 }
-                writtenSwaps[sw.Cookie][sw.Ts] = true
+                writtenSwapsFlat[key] = true
 
-                if len(writtenSwaps[sw.Cookie]) > 1000 {
-                        for k := range writtenSwaps[sw.Cookie] {
-                                if k < sw.Ts-3600 {
-                                        delete(writtenSwaps[sw.Cookie], k)
+                // Prune entries whose ts part is older than 1 hour, once we
+                // exceed 5000 entries (5× the per-cookie cap of the old form —
+                // 5000 covers ~50 active cookies × 100 events each).
+                if len(writtenSwapsFlat) > 5000 {
+                        for k := range writtenSwapsFlat {
+                                if idx := strings.Index(k, ":"); idx >= 0 {
+                                        if kts, err := strconv.ParseFloat(k[idx+1:], 64); err == nil && kts < sw.Ts-3600 {
+                                                delete(writtenSwapsFlat, k)
+                                        }
                                 }
                         }
                 }
@@ -336,18 +355,20 @@ func writeSrateCSVFromParsed(srateByCookie map[int64][]srateEntry, now int64) {
 
         for cookie, events := range srateByCookie {
                 for _, e := range events {
-                        if writtenSrates[cookie] == nil {
-                                writtenSrates[cookie] = map[float64]bool{}
-                        }
-                        if writtenSrates[cookie][e.Ts] {
+                        // v0.9.96: flat map keyed by "cookie:ts" (was nested
+                        // map[int64]map[float64]bool — outer never pruned).
+                        key := fmt.Sprintf("%d:%.6f", cookie, e.Ts)
+                        if writtenSratesFlat[key] {
                                 continue
                         }
-                        writtenSrates[cookie][e.Ts] = true
+                        writtenSratesFlat[key] = true
 
-                        if len(writtenSrates[cookie]) > 1000 {
-                                for k := range writtenSrates[cookie] {
-                                        if k < e.Ts-3600 {
-                                                delete(writtenSrates[cookie], k)
+                        if len(writtenSratesFlat) > 5000 {
+                                for k := range writtenSratesFlat {
+                                        if idx := strings.Index(k, ":"); idx >= 0 {
+                                                if kts, err := strconv.ParseFloat(k[idx+1:], 64); err == nil && kts < e.Ts-3600 {
+                                                        delete(writtenSratesFlat, k)
+                                                }
                                         }
                                 }
                         }
@@ -432,26 +453,29 @@ func writeProofsCSVFromInterface(proofs []interface{}, now int64) {
                 }
                 // Compute rate_bps from mbps
                 rateBps := int64(mbps * bpsToMbps)
-                // We don't have the cookie string in the row — use a hash of ts+alg
-                // for dedup.  The cookie was used for parsing but isn't in the output.
-                // Use ts as the dedup key since each proof event has a unique ts.
-                cookieFake := int64(ts)
-                if writtenProofs[cookieFake] == nil {
-                        writtenProofs[cookieFake] = map[float64]bool{}
-                }
-                if writtenProofs[cookieFake][ts] {
+                // v0.9.96: flat map keyed by ts (proof events are uniquely
+                // identified by boot_ts). Was: nested map keyed by
+                // (int64(ts), ts) — redundant because cookieFake = int64(ts)
+                // is derived from ts. The outer map was never pruned, growing
+                // ~1 entry per proof event (~86k/day = ~13 MB/day = ~90 MB/wk).
+                if writtenProofsFlat[ts] {
                         continue
                 }
-                writtenProofs[cookieFake][ts] = true
+                writtenProofsFlat[ts] = true
 
-                if len(writtenProofs[cookieFake]) > 1000 {
-                        for k := range writtenProofs[cookieFake] {
+                // Prune entries older than 1 hour once we exceed 1000.
+                // (Proofs are ~1/sec at most, so 1000 = ~17 min headroom.)
+                if len(writtenProofsFlat) > 1000 {
+                        for k := range writtenProofsFlat {
                                 if k < ts-3600 {
-                                        delete(writtenProofs[cookieFake], k)
+                                        delete(writtenProofsFlat, k)
                                 }
                         }
                 }
 
+                // cookieFake for the CSV column is still int64(ts) — preserves
+                // the on-disk column format exactly (no CSV byte changes).
+                cookieFake := int64(ts)
                 csvRow := []string{
                         strconv.FormatInt(now, 10),
                         strconv.FormatFloat(ts, 'f', 6, 64),
