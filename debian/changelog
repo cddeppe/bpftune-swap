@@ -1,3 +1,20 @@
+bpftune (0.4.107) unstable; urgency=medium
+
+  * net_buffer_tuner: actively shrink netdev_budget_usecs on startup if above cap
+    - v0.4.106 only set the cap; didn't bring the value back down to 8000.
+    - On hosts previously running pre-v0.4.106 bpftune, the value stayed
+      at ~50000 forever (no INCREASE event triggered the shrink path).
+    - Now proactively shrinks on init when latency_sensitive=true and
+      current value > cap.
+  * net_buffer_tuner: add verbose logging to workload detection
+    - Now logs how many processes it checked, and which one matched
+    - Silent failures are now diagnosable
+  * net_buffer_tuner: expand process name list
+    - Added: caddy, traefik, envoy
+    - Existing: xray, v2ray, sing-box, nginx, haproxy
+
+ -- Z User <z@container>  Sun, 18 Oct 2026 20:17:08 +0000
+
 bpftune (0.4.106) unstable; urgency=medium
 
   * net_buffer_tuner: fix aggressive netdev_budget_usecs increases on

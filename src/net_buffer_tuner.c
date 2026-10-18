@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <time.h>
+#include <errno.h>
 
 struct tcp_buffer_tuner_bpf *skel;
 
@@ -59,7 +60,7 @@ static struct bpftunable_scenario scenarios[] = {
         "On pre-5.14 kernels setting net.core.high_order_alloc_disable=1 reduced contention, but disabling high-order allocations lowers performance with little benefit now that frags are allocated on a pre-cpu basis and contention is minimized." }
 };
 
-/* v0.4.106: workload detection — scan /proc/*/comm for known
+/* v0.4.106: workload detection — scan /proc/<pid>/comm for known
  * latency-sensitive proxy processes. If found, the tuner caps
  * netdev_budget_usecs at NETDEV_BUDGET_USECS_LATENCY_MAX (8ms)
  * instead of the default 50ms, to prevent NAPI softirq from
@@ -71,10 +72,13 @@ static bool workload_is_latency_sensitive(void)
         DIR *d;
         struct dirent *e;
         bool found = false;
+        int checked = 0;
 
         d = opendir("/proc");
-        if (!d)
+        if (!d) {
+                bpftune_log(LOG_INFO, "net_buffer: workload detection: opendir(/proc) failed: %s\n", strerror(errno));
                 return false;
+        }
 
         while ((e = readdir(d)) != NULL) {
                 char path[64];
@@ -94,16 +98,30 @@ static bool workload_is_latency_sensitive(void)
                 if (n <= 0)
                         continue;
                 buf[n] = '\0';
+                /* strip trailing newline for cleaner logging */
+                if (n > 0 && buf[n-1] == '\n')
+                        buf[n-1] = '\0';
+                checked++;
 
                 /* check for known latency-sensitive proxy processes */
                 if (strstr(buf, "xray") || strstr(buf, "v2ray") ||
                     strstr(buf, "sing-box") || strstr(buf, "nginx") ||
-                    strstr(buf, "haproxy")) {
+                    strstr(buf, "haproxy") || strstr(buf, "caddy") ||
+                    strstr(buf, "traefik") || strstr(buf, "envoy")) {
+                        bpftune_log(LOG_INFO,
+                            "net_buffer: workload detection: matched '%s' in /proc/%s/comm (latency-sensitive proxy)\n",
+                            buf, e->d_name);
                         found = true;
                         break;
                 }
         }
         closedir(d);
+        /* v0.4.107: log summary so silent failures are diagnosable */
+        if (!found) {
+                bpftune_log(LOG_INFO,
+                    "net_buffer: workload detection: checked %d processes, no latency-sensitive proxy found (looking for: xray, v2ray, sing-box, nginx, haproxy, caddy, traefik, envoy)\n",
+                    checked);
+        }
         return found;
 }
 
@@ -139,6 +157,25 @@ int init(struct bpftuner *tuner)
         bpftune_sysctl_read(0, "net.core.netdev_budget", &budget);
         bpftune_sysctl_read(0, "net.core.netdev_budget_usecs", &budget_usecs);
         bpftune_sysctl_read(0, "net.core.high_order_alloc_disable", &high_order_alloc_disable);
+
+        /* v0.4.107: if workload is latency-sensitive and current value exceeds cap,
+         * shrink it NOW at startup. The v0.4.106 fix only set the cap; it didn't
+         * bring the value back DOWN to the cap. On hosts that were running
+         * pre-v0.4.106 bpftune (which pushed the value to ~50000 under the old
+         * 50000 cap), restarting with v0.4.106+ didn't shrink it back to 8000 --
+         * the value stayed high until an INCREASE event triggered the shrink
+         * path. This proactively shrinks on startup. */
+        if (latency_sensitive && budget_usecs > netdev_budget_usecs_max) {
+                long orig = budget_usecs;
+                budget_usecs = netdev_budget_usecs_max;
+                bpftuner_tunable_sysctl_write(tuner, NETDEV_BUDGET_USECS,
+                        NETDEV_BUDGET_DECREASE, 0, 1, &budget_usecs,
+                        "net_buffer: shrinking netdev_budget_usecs from %ld to %ld at startup (latency-sensitive workload detected)\n",
+                        orig, budget_usecs);
+                bpftune_log(LOG_INFO,
+                    "net_buffer: shrunk netdev_budget_usecs from %ld to %ld at startup (latency-sensitive workload)\n",
+                    orig, budget_usecs);
+        }
 
         err = bpftuner_bpf_open(net_buffer, tuner);
         if (err)
