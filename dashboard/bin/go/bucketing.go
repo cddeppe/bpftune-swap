@@ -102,6 +102,21 @@ var (
 	aliasesLabelsHolder mtimeCache
 )
 
+// labelsMu serializes POST /api/labels handler flows (loadLabels ->
+// mutate -> saveLabels) so concurrent POSTs don't lose updates
+// (lost-update problem) and don't race with the COLLECT pipeline's
+// longestPrefixLabel iteration of the cached map.
+//
+// LABEL-SANDBOX-1: without this lock, 10 concurrent POSTs would each
+// loadLabels (returning the cached map reference), mutate it, and the
+// last saveLabels to finish would clobber the others' writes — silent
+// label loss after restart. loadLabels now returns a COPY so the POST
+// handler's mutation doesn't race with saveLabels's json.MarshalIndent
+// (which iterates the map). But copies alone don't prevent lost
+// updates from concurrent POSTs; this mutex makes the load+mutate+save
+// sequence atomic.
+var labelsMu sync.Mutex
+
 // labelsFileMtime tracks the last-seen mtime of labels.json.  When it
 // changes, markLabelsChanged() sets staticFilesDirty=true so the next
 // renderToDisk cycle deletes all bucket_*.json + meta.json + fleet.json +
@@ -154,14 +169,42 @@ func ClearStaticFilesDirty() {
 }
 
 // loadLabels reads labelsFile (/var/lib/bpftune/aliases.labels.json).
+//
+// LABEL-SANDBOX-1: returns a COPY of the cached labels map, not the
+// cached map reference itself. Callers may mutate the returned map
+// freely; saveLabels writes it back to disk + updates the cache
+// atomically. The copy is essential to avoid concurrent map
+// read+write races:
+//
+//   - The POST handler does `labels[ip] = label` (a WRITE) on the
+//     returned map.
+//   - Concurrently, saveLabels's json.MarshalIndent ITERATES the
+//     map (a READ).
+//   - The COLLECT pipeline's longestPrefixLabel also ITERATES the
+//     returned map.
+//
+// Without the copy, all three operate on the SAME cached map
+// reference (c.val). Go's race detector confirms this is a
+// concurrent map read+write — the runtime may silently produce
+// partial JSON on disk, and the new label disappears after restart.
+//
+// The copy is cheap (labels.json is typically <100 entries, <2 KB).
+// Callers that need to mutate+save should acquire labelsMu to make
+// the load+mutate+save sequence atomic (prevents lost updates from
+// concurrent POSTs).
 func loadLabels() map[string]string {
-	return labelsHolder.get(labelsFile, func(data []byte) map[string]string {
+	src := labelsHolder.get(labelsFile, func(data []byte) map[string]string {
 		var m map[string]string
 		if err := json.Unmarshal(data, &m); err != nil {
 			return map[string]string{}
 		}
 		return m
 	})
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // loadFoldMap reads /etc/bpftune/aliases and extracts {v6:hex: canonical_v4}.

@@ -44,6 +44,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -1264,4 +1266,318 @@ func TestMtimeCacheSkipsRecentStats(t *testing.T) {
 		t.Errorf("mtimeCache.lastStat = %v ago, expected <30s (TTL window)", time.Since(ls))
 	}
 	t.Logf("MtimeCacheSkipsRecentStats: file change within 30s TTL was hidden by cache ✓ (lastStat=%v ago)", time.Since(ls))
+}
+
+// TestLabelsPersistAcrossSaveAndLoad (LABEL-PERSIST-1): regression test
+// verifying that a label assignment made via saveLabels() actually:
+//   1. writes the new key to disk (file content includes it),
+//   2. is returned by the next loadLabels() call in the SAME process
+//      (cache-miss path),
+//   3. is returned by loadLabels() after a SIMULATED RESTART (cache
+//      reset to val=nil/mtime=zero, mirroring a fresh process).
+//
+// Background: the user reports label assignments made via the dashboard UI
+// don't persist across dashboard restarts. The save flow is
+// handleLabels(POST) -> loadLabels() -> mutate map -> saveLabels() ->
+// os.WriteFile(labelsFile, ...). The load flow on restart is
+// loadLabels() -> mtimeCache.get(labelsFile, ...) -> cache miss -> read
+// from disk. This test isolates the save+load mechanism from the rest of
+// the collector pipeline so we can prove (or disprove) that the bug is
+// in saveLabels/loadLabels themselves vs. in a different code path that
+// runs at startup.
+func TestLabelsPersistAcrossSaveAndLoad(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "labels.json")
+
+	// Initial labels (mimics "home-sco" already on disk from a prior
+	// session — those are the ones the user says DO persist).
+	initial := []byte(`{"82.43.0.0": "home-sco", "89.168.0.0": "vps-de"}`)
+	if err := os.WriteFile(path, initial, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Point the package-level labelsFile at our temp file. loadLabels
+	// reads labelsFile; saveLabels writes to labelsFile. Save+restore
+	// so other tests (and the running collector) aren't affected.
+	oldLabelsFile := labelsFile
+	labelsFile = path
+	defer func() { labelsFile = oldLabelsFile }()
+
+	// Reset the package-level labelsHolder cache so we start with a
+	// guaranteed cache miss on the first loadLabels() — mimics a
+	// freshly-started collector process.
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+
+	// --- Step 1: loadLabels() reads the initial file from disk. ----------
+	loaded := loadLabels()
+	if lbl, ok := loaded["82.43.0.0"]; !ok || lbl != "home-sco" {
+		t.Fatalf("step1 loadLabels = %v, want 82.43.0.0=home-sco", loaded)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("step1 loadLabels = %d entries, want 2", len(loaded))
+	}
+
+	// --- Step 2: replicate handleLabels(POST) save flow. -----------------
+	// User moves individual IP "104.18.0.5" from "Individual IPs in masked
+	// buckets" into the "home-sco" labeled bucket via the UI. The handler
+	// canonicalizes the IP to /16 (default prefix4=16) BEFORE storing it,
+	// so the key ends up as the masked bucket "104.18.0.0" (which is what
+	// current.json's bucket_ips uses as the masked key).
+	//
+	// We do NOT mutate prefix4Holder here — canonBucketWithPrefix is
+	// called with explicit (16, 32) just like handleLabels does with
+	// prefix4Value()/prefix6Value().
+	ip := canonBucketWithPrefix("104.18.0.5", 16, 32)
+	if ip != "104.18.0.0" {
+		t.Fatalf("step2 canonBucketWithPrefix = %q, want %q (prefix4=16 mask)", ip, "104.18.0.0")
+	}
+	labels := loadLabels()
+	labels[ip] = "home-sco" // mutate cached map in-place (mirrors POST handler)
+	saveLabels(labels)
+
+	// --- Step 3: read the file back from disk, verify new key. ---------
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("step3 read file: %v", err)
+	}
+	var onDisk map[string]string
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("step3 unmarshal: %v (raw=%s)", err, string(raw))
+	}
+	if lbl, ok := onDisk["104.18.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("step3 on-disk labels missing new entry — got %v, want 104.18.0.0=home-sco (raw=%s)", onDisk, string(raw))
+	}
+	// Existing labels must still be present.
+	if lbl, ok := onDisk["82.43.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("step3 on-disk labels lost existing entry 82.43.0.0=home-sco — got %v", onDisk)
+	}
+
+	// --- Step 4: loadLabels() in the SAME process must return new label. -
+	// (Even with the cache populated, the file mtime changed; pre-v0.9.96
+	//  code re-stats and reloads; post-v0.9.96 TTL returns the mutated
+	//  cached val which already has the new entry. Either way, must have it.)
+	after := loadLabels()
+	if lbl, ok := after["104.18.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("step4 loadLabels returned %v, want 104.18.0.0=home-sco", after)
+	}
+
+	// --- Step 5: SIMULATE RESTART — reset cache, call loadLabels(). ----
+	// A restart = fresh process = zero-valued mtimeCache struct. Resetting
+	// val=nil forces the next get() to os.Stat+os.ReadFile the file again.
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+
+	afterRestart := loadLabels()
+	if lbl, ok := afterRestart["104.18.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("step5 (post-restart) loadLabels returned %v, want 104.18.0.0=home-sco — LABEL DID NOT PERSIST", afterRestart)
+	}
+	if lbl, ok := afterRestart["82.43.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("step5 (post-restart) lost pre-existing 82.43.0.0=home-sco — got %v", afterRestart)
+	}
+	if len(afterRestart) != 3 {
+		t.Errorf("step5 (post-restart) labels count = %d, want 3 (2 existing + 1 new) — got %v", len(afterRestart), afterRestart)
+	}
+	t.Logf("LabelsPersistAcrossSaveAndLoad: save+load+restart-load returned new label ✓ (entries=%d)", len(afterRestart))
+}
+
+// TestLabelsPersistViaHTTPHandler (LABEL-PERSIST-1, Phase 2): drives the
+// ACTUAL (*Collector).handleLabels HTTP handler with a real
+// httptest.ResponseRecorder + a real *http.Request carrying the same JSON
+// body the dashboard.js _bi_move() function sends. Then simulates a
+// restart (cache reset) and verifies the new label survives via
+// loadLabels(). This catches bugs that the lower-level
+// TestLabelsPersistAcrossSaveAndLoad can't — e.g. issues in the JSON
+// decode, the canonBucketWithPrefix call inside the handler, or the
+// post-save second loadLabels() that builds the response.
+func TestLabelsPersistViaHTTPHandler(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "labels.json")
+
+	// Seed: two existing labels (the kind the user says DO persist).
+	initial := []byte(`{"82.43.0.0": "home-sco", "89.168.0.0": "vps-de"}`)
+	if err := os.WriteFile(path, initial, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Redirect labelsFile + reset cache (mirrors a fresh process).
+	oldLabelsFile := labelsFile
+	labelsFile = path
+	defer func() { labelsFile = oldLabelsFile }()
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+
+	c := &Collector{}
+
+	// --- POST {ip:"104.18.0.5", label:"home-sco"} via real handler. -----
+	// This is EXACTLY what _bi_move() in dashboard.js sends: the individual
+	// IP from bucket_ips[masked] (NOT the masked bucket key itself).
+	body := strings.NewReader(`{"ip":"104.18.0.5","label":"home-sco"}`)
+	req := httptest.NewRequest("POST", "/api/labels", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	c.handleLabels(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("handler returned HTTP %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("handler response not JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if ok, _ := resp["ok"].(bool); !ok {
+		t.Fatalf("handler response missing ok=true: %s", rec.Body.String())
+	}
+	// The response should include the canonicalized key in "ip".
+	if got, _ := resp["ip"].(string); got != "104.18.0.0" {
+		t.Errorf("handler response ip=%q, want 104.18.0.0 (canonBucketWithPrefix /16)", got)
+	}
+	// The response.labels map MUST contain the new label (proves the
+	// post-save loadLabels() call inside the handler returned it).
+	respLabels, _ := resp["labels"].(map[string]interface{})
+	if lbl, ok := respLabels["104.18.0.0"]; !ok || fmt.Sprint(lbl) != "home-sco" {
+		t.Errorf("response.labels missing 104.18.0.0=home-sco — got %v (raw=%s)", respLabels, rec.Body.String())
+	}
+
+	// --- Verify the file on disk has the new label. ----------------------
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	var onDisk map[string]string
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("unmarshal on-disk: %v (raw=%s)", err, string(raw))
+	}
+	if lbl, ok := onDisk["104.18.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("on-disk labels missing 104.18.0.0=home-sco — got %v (raw=%s)", onDisk, string(raw))
+	}
+
+	// --- Simulate restart: reset cache, call loadLabels. ----------------
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+
+	afterRestart := loadLabels()
+	if lbl, ok := afterRestart["104.18.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("post-restart loadLabels = %v, want 104.18.0.0=home-sco — LABEL DID NOT PERSIST", afterRestart)
+	}
+	if lbl, ok := afterRestart["82.43.0.0"]; !ok || lbl != "home-sco" {
+		t.Errorf("post-restart lost existing 82.43.0.0=home-sco — got %v", afterRestart)
+	}
+	t.Logf("LabelsPersistViaHTTPHandler: handleLabels(POST) wrote %d entries to disk + cache; post-restart loadLabels returned new label ✓", len(afterRestart))
+}
+
+// TestLabelsPersistUnderConcurrentLoad (LABEL-PERSIST-1, Phase 5): stress
+// test that runs saveLabels concurrently with continuous loadLabels +
+// map iteration (mimicking the COLLECT goroutine's longestPrefixLabel
+// fan-out). Catches the data-race regression where json.MarshalIndent
+// iterates the cached labels map WHILE a concurrent goroutine is also
+// iterating it (or while the POST handler mutates it) — Go's runtime
+// can silently produce partial JSON, which saveLabels then writes to
+// disk. The file ends up missing the new label, even though the
+// in-memory cache has it. After restart, loadLabels reads the partial
+// file and the new label is GONE.
+//
+// Run with: go test -race -run TestLabelsPersistUnderConcurrentLoad
+func TestLabelsPersistUnderConcurrentLoad(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "labels.json")
+
+	// Seed with 50 existing labels so the map is non-trivial.
+	seed := map[string]string{}
+	for i := 0; i < 50; i++ {
+		seed[fmt.Sprintf("10.%d.0.0", i)] = fmt.Sprintf("lbl-%d", i)
+	}
+	data, _ := json.MarshalIndent(seed, "", "  ")
+	if err := os.WriteFile(path, append(data, '\n'), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLabelsFile := labelsFile
+	labelsFile = path
+	defer func() { labelsFile = oldLabelsFile }()
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+
+	// Start a goroutine that mimics the COLLECT pipeline: continuously
+	// call loadLabels + iterate the returned map (read-only, like
+	// longestPrefixLabel does). This is the concurrent reader that
+	// races with saveLabels's json.MarshalIndent.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				m := loadLabels()
+				for k, v := range m {
+					_ = k
+					_ = v
+				}
+			}
+		}
+	}()
+	defer func() { close(stop); wg.Wait() }()
+
+	// Save a NEW label (the user's "104.18.0.0" -> "home-sco").
+	newIP := canonBucketWithPrefix("104.18.0.5", 16, 32)
+	if newIP != "104.18.0.0" {
+		t.Fatalf("canonBucketWithPrefix = %q, want 104.18.0.0", newIP)
+	}
+	labels := loadLabels()
+	labels[newIP] = "home-sco"
+	saveLabels(labels)
+
+	// Give the concurrent reader a moment to potentially race.
+	time.Sleep(10 * time.Millisecond)
+
+	// Read the file back from disk. The new label MUST be there.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	var onDisk map[string]string
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("unmarshal on-disk: %v (raw=%.200s)", err, string(raw))
+	}
+	if lbl, ok := onDisk[newIP]; !ok || lbl != "home-sco" {
+		t.Errorf("on-disk labels missing new entry %q=home-sco — got %d entries (raw=%.300s)", newIP, len(onDisk), string(raw))
+	}
+	// All 50 existing labels must still be present.
+	for i := 0; i < 50; i++ {
+		k := fmt.Sprintf("10.%d.0.0", i)
+		if _, ok := onDisk[k]; !ok {
+			t.Errorf("on-disk labels lost existing entry %q — DATA RACE corrupted the JSON output", k)
+		}
+	}
+
+	// Simulate restart: reset cache, call loadLabels.
+	labelsHolder.mu.Lock()
+	labelsHolder.val = nil
+	labelsHolder.mtime = time.Time{}
+	labelsHolder.lastStat = time.Time{}
+	labelsHolder.mu.Unlock()
+	afterRestart := loadLabels()
+	if lbl, ok := afterRestart[newIP]; !ok || lbl != "home-sco" {
+		t.Errorf("post-restart loadLabels missing new label %q=home-sco — got %d entries", newIP, len(afterRestart))
+	}
+	t.Logf("LabelsPersistUnderConcurrentLoad: save+load under concurrent reader returned %d entries; new label %q present ✓", len(afterRestart), newIP)
 }

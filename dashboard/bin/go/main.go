@@ -462,9 +462,21 @@ func (c *Collector) handleLabels(w http.ResponseWriter, r *http.Request) {
                 // Canonicalize IP to current prefix width before storing.
                 ip = canonBucketWithPrefix(ip, prefix4Value(), prefix6Value())
 
+                // LABEL-SANDBOX-1: loadLabels returns a private COPY of the
+                // cached map, so the mutation below doesn't race with the
+                // COLLECT pipeline's longestPrefixLabel iterating the cached
+                // map. saveLabels acquires labelsMu internally to serialize
+                // the merge+write+cache-update.
+                //
+                // For deletes (label == ""), we set labels[ip] = "" (rather
+                // than delete(labels, ip)) so saveLabels's merge step can
+                // detect the delete (the merge iterates the caller's labels
+                // map; an entry missing from the caller's map could mean
+                // either "delete" or "not in caller's snapshot" — ambiguous.
+                // An empty value unambiguously means "delete".)
                 labels := loadLabels()
                 if label == "" {
-                        delete(labels, ip)
+                        labels[ip] = "" // mark for delete (saveLabels's merge deletes)
                 } else {
                         labels[ip] = label
                 }
@@ -561,9 +573,67 @@ func buildGroups(aliases []string, labels map[string]string) map[string]interfac
 }
 
 func saveLabels(labels map[string]string) {
-        data, _ := json.MarshalIndent(labels, "", "  ")
+        // LABEL-SANDBOX-1: serialize concurrent saves to prevent both:
+        //   - Lost updates: 10 concurrent POSTs each overwrite the file
+        //     with their own partial view; the last saveLabels to finish
+        //     would clobber the others' writes — silent label loss after
+        //     restart. The merge below (loadLabels + apply caller's
+        //     updates into the cache copy) prevents this.
+        //   - Concurrent WriteFile corruption: two os.WriteFile calls
+        //     racing on the same file produce interleaved byte writes
+        //     yielding invalid JSON on disk (the test logged raw file
+        //     content like `{"5.0.0.0":"bucket-4"} "2.0.0.0":"bucket-1",`
+        //     — two JSON objects concatenated). Serializing the write
+        //     eliminates this.
+        labelsMu.Lock()
+        defer labelsMu.Unlock()
+
+        // MERGE the caller's labels into the current cache. This is the
+        // key fix for lost updates: instead of overwriting the file with
+        // the caller's (possibly stale) snapshot, we apply the caller's
+        // updates on top of the current cache state. So if goroutine A
+        // adds {ip_A: lbl_A} and goroutine B adds {ip_B: lbl_B}
+        // concurrently, both entries end up in the merged map.
+        //
+        // Empty values are treated as deletes: the POST handler uses
+        // `labels[ip] = ""` to mark a delete (see handleLabels POST
+        // branch). Without this convention, the merge couldn't
+        // distinguish "delete" from "not in caller's snapshot".
+        merged := loadLabels() // returns copy of current cache
+        for k, v := range labels {
+                if v == "" {
+                        delete(merged, k)
+                } else {
+                        merged[k] = v
+                }
+        }
+
+        data, _ := json.MarshalIndent(merged, "", "  ")
         data = append(data, '\n')
-        os.WriteFile(labelsFile, data, 0644)
+        if err := os.WriteFile(labelsFile, data, 0644); err != nil {
+                fmt.Fprintf(os.Stderr, "saveLabels: write %s failed: %v\n", labelsFile, err)
+                return
+        }
+        // Update the labelsHolder cache so the new label is visible to
+        // subsequent loadLabels() calls within the 30s TTL window
+        // (mtimeCache.get short-circuits os.Stat when lastStat < 30s
+        // ago). Without this cache update, loadLabels would return the
+        // STALE cached val (missing the new label) until the TTL expires
+        // — and the POST handler's second loadLabels() call (line 479,
+        // which builds the response) would return the OLD labels, hiding
+        // the new label from the UI.
+        //
+        // We set c.val = merged (the freshly-merged map). This is an
+        // atomic pointer swap; concurrent loadLabels calls iterating
+        // the OLD c.val (via their local copy) are safe (they hold a
+        // stable reference to the old map, which we don't mutate).
+        labelsHolder.mu.Lock()
+        labelsHolder.val = merged
+        if fi, err := os.Stat(labelsFile); err == nil {
+                labelsHolder.mtime = fi.ModTime()
+                labelsHolder.lastStat = time.Now()
+        }
+        labelsHolder.mu.Unlock()
 }
 
 // ============================================================================
