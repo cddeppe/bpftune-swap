@@ -59,7 +59,7 @@ static struct bpftunable_scenario scenarios[] = {
         "On pre-5.14 kernels setting net.core.high_order_alloc_disable=1 reduced contention, but disabling high-order allocations lowers performance with little benefit now that frags are allocated on a pre-cpu basis and contention is minimized." }
 };
 
-/* v0.4.106: workload detection — scan /proc/*/comm for known
+/* v0.4.106: workload detection — scan /proc/PID/comm for known
  * latency-sensitive proxy processes. If found, the tuner caps
  * netdev_budget_usecs at NETDEV_BUDGET_USECS_LATENCY_MAX (8ms)
  * instead of the default 50ms, to prevent NAPI softirq from

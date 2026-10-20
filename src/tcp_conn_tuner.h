@@ -33,6 +33,7 @@ enum tcp_cong_scenarios {
 
 #define CONN_TUNER_BPF "bpftune_conn_tuner"
 #define CONN_TUNER_VOTE_BPF "bpftune_conn_tuner_vote"
+#define CONN_TUNER_TAIL_BPF "bpftune_conn_tuner_tail"
 
 /* Expanded to 16 algorithms (must be a power of two for bitmask logic) */
 enum tcp_states {

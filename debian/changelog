@@ -1,3 +1,13 @@
+bpftune (0.4.107) unstable; urgency=medium
+
+  * tcp_conn_tuner: split bpftune_conn_tuner into prep + tail programs
+    via bpf_tail_call — each gets its own 1M verifier budget; add
+    loopback (127.0.0.0/8 + ::1) early-exit at top of prep phase, fixes
+    CPU burn on cloudflared loopback traffic. Also: fix
+    net_buffer_tuner.c comment '/proc/*/comm' that broke gcc build.
+
+ -- cddeppe <91772433+cddeppe@users.noreply.github.com>  Tue, 20 Oct 2026 19:45:46 +0200
+
 bpftune (0.4.106) unstable; urgency=medium
 
   * net_buffer_tuner: fix aggressive netdev_budget_usecs increases on

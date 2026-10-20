@@ -57,6 +57,17 @@ BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
 BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
             struct in6_addr, 1024, 0);
 
+/* 0.4.107fix-program-split: PROG_ARRAY for the tail-call split of
+ * bpftune_conn_tuner.  Index 0 holds the fd of bpftune_conn_tuner_tail,
+ * populated by the userspace loader after the skeleton is loaded.
+ * Each tail-called program gets its own 1M-instruction verifier budget,
+ * so the 16-iter min loop + set_cong + tracker update can be verified
+ * independently of the prep-phase op-switch / RFC1918 filter / bucket
+ * key build.  Stack and registers are NOT preserved across the tail
+ * boundary; the tail program re-derives is_v4_mapped / v4_addr_from_v6
+ * / key / remote_host from ops. */
+BPF_MAP_DEF(conn_tuner_tail_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 1, 0);
+
 /* per-CPU scratch buffer used to initialize new remote_host entries without
  * placing a >512B struct temporary on the BPF stack (NUM_TCP_CONG_ALGS=16
  * makes struct remote_host 792 bytes, exceeding the 512-byte stack limit).
@@ -316,6 +327,23 @@ __u64 tcp_thin_lto_choices;
 SEC("sockops")
 int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 {
+    /* 0.4.107fix-program-split: skip loopback (127.0.0.0/8 + ::1) at
+     * function entry, before any map lookups.  Hoisting this check
+     * here (out of the 0.4.95 filter block at L403) was rejected by
+     * the verifier in the unsplit version because the prep + metric
+     * aggregation in one function pushed peak_states to 1198 and
+     * the additional branch pushed it over the 1M-instruction budget.
+     * Splitting via tail call gives the prep half its own budget, so
+     * adding this branch here is safe. */
+    if (ops->family == AF_INET) {
+        __u32 ip4 = bpf_ntohl(ops->remote_ip4);
+        if ((ip4 & 0xff000000) == 0x7f000000)
+            return 1;
+    } else if (ops->family == AF_INET6) {
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+            ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1))
+            return 1;
+    }
     int cb_flags = BPF_SOCK_OPS_STATE_CB_FLAG|BPF_SOCK_OPS_RETRANS_CB_FLAG|BPF_SOCK_OPS_RTT_CB_FLAG;
     /* 0.4.91: read debug flag from tuner_config_map slot 3 so the
      * CLI can toggle it live via 'bpftune --bpf-debug=0'. */
@@ -477,6 +505,79 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     if (!remote_host)
         return 1;
 
+    /* 0.4.107fix-program-split: tail-call to the metric-aggregation
+     * continuation.  The tail program gets its own verifier budget
+     * (1M instructions), so the 16-iter min loop + set_cong + tracker
+     * update can be verified independently.  Stack and registers are
+     * NOT preserved across the boundary; the tail program re-derives
+     * is_v4_mapped / v4_addr_from_v6 / key / remote_host from ops.
+     * bpf_tail_call never returns on success; the return statement
+     * below is a fallback for the (rare) case where the tail map is
+     * empty or the tail-call limit is reached. */
+    bpf_tail_call(ops, &conn_tuner_tail_map, 0);
+    return 1;
+}
+
+/* 0.4.107fix-program-split: continuation of bpftune_conn_tuner.
+ * Entered via bpf_tail_call from bpftune_conn_tuner after the prep
+ * phase (op-switch, debug-flag reload, address parse, loopback
+ * filter, bucket-key build, remote_host lookup).  Re-derives the
+ * prep-phase outputs from ops because tail calls do not preserve
+ * stack or registers.  This program is NOT attached to a cgroup —
+ * it is reached only via the PROG_ARRAY tail call. */
+SEC("sockops")
+int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
+{
+    struct remote_host *remote_host;
+    struct in6_addr raddr = {};
+    struct in6_addr *key = &raddr;
+    bool is_v4_mapped = false;
+    __u32 v4_addr_from_v6 = 0;
+
+    /* Re-derive is_v4_mapped + v4_addr_from_v6 (matches the prep
+     * phase's L427-447 logic verbatim).  is_v4_mapped only fires
+     * for AF_INET6 sockets where the upper 96 bits are ::ffff: and
+     * the lower 32 bits carry an IPv4 address. */
+    if (ops->family == AF_INET6 &&
+        ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+        ops->remote_ip6[2] == bpf_htonl(0xffff)) {
+        is_v4_mapped = true;
+        v4_addr_from_v6 = ops->remote_ip6[3];
+    }
+
+    /* Re-derive the bucket key (matches prep phase L448-474 verbatim).
+     * bucket_key_alias_or_prefix is idempotent — re-applying it here
+     * produces the same key the prep phase already used to do its
+     * get_remote_host(key, true). */
+    switch (ops->family) {
+    case AF_INET:
+        key->s6_addr32[2] = bpf_htonl(0xffff);
+        key->s6_addr32[3] = ops->remote_ip4;
+        break;
+    case AF_INET6:
+        if (is_v4_mapped) {
+            key->s6_addr32[2] = bpf_htonl(0xffff);
+            key->s6_addr32[3] = v4_addr_from_v6;
+        } else {
+            key->s6_addr32[0] = ops->remote_ip6[0];
+            key->s6_addr32[1] = ops->remote_ip6[1];
+            key->s6_addr32[2] = ops->remote_ip6[2];
+            key->s6_addr32[3] = ops->remote_ip6[3];
+        }
+        break;
+    default:
+        return 1;
+    }
+    bucket_key_alias_or_prefix(key);
+    /* initial=false: the prep phase already did instances++ and the
+     * seq-wrap pair via get_remote_host(key, true).  We just need
+     * the pointer.  The entry cannot have been LRU-evicted between
+     * the prep phase and this tail call (no scheduler involvement). */
+    remote_host = get_remote_host(key, false);
+    if (!remote_host)
+        return 1;
+
+    /* --- BEGIN moved metric aggregation + set_cong code (orig L480-569) --- */
     {
         __u64 metric_min = ~((__u64)0x0);
         __u8 i, minindex = 0, s;
@@ -505,6 +606,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 
         {
             __u64 min2 = ~((__u64)0);
+            #pragma unroll
             for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
                 __u64 v = remote_host->metrics[i].metric_value;
                 /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
@@ -567,6 +669,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
         }
     }
     return 1;
+    /* --- END moved metric aggregation + set_cong code --- */
 }
 
 /* 0.4.56: score the pending swap once >=60s have elapsed.  Cur rate

@@ -449,6 +449,48 @@ int init(struct bpftuner *tuner)
         if (err)
                 goto out;
 
+    /* 0.4.107fix-program-split: populate the PROG_ARRAY so the prep
+     * phase can tail-call into the metric-aggregation program.  The
+     * tail program is NOT attached to a cgroup; it is reached only
+     * via bpf_tail_call().  Libbpf loads all SEC("sockops") programs
+     * in the object regardless of cgroup attach status.  Index 0 of
+     * the map must hold the tail program's fd before the first sock
+     * connection is established.  Failure to populate the map is
+     * non-fatal: the prep phase falls through to `return 1` on
+     * bpf_tail_call failure (the connection is established but no
+     * metric is computed for that one event). */
+    {
+        struct bpf_program *tail_prog;
+        struct bpf_map *tail_map;
+        int tail_fd, tail_idx = 0;
+
+        tail_prog = bpf_object__find_program_by_name(tuner->obj,
+                                                    CONN_TUNER_TAIL_BPF);
+        if (!tail_prog) {
+                bpftune_log(LOG_ERR,
+                            "conn_tuner_tail: program not found; "
+                            "metric aggregation will be skipped\n");
+        } else {
+                tail_fd = bpf_program__fd(tail_prog);
+                tail_map = bpftuner_bpf_map_get(tcp_conn, tuner,
+                                                conn_tuner_tail_map);
+                if (tail_map && tail_fd >= 0) {
+                        if (bpf_map_update_elem(bpf_map__fd(tail_map),
+                                                 &tail_idx, &tail_fd,
+                                                 BPF_ANY))
+                                bpftune_log(LOG_ERR,
+                                            "conn_tuner_tail: failed to "
+                                            "populate PROG_ARRAY: %s\n",
+                                            strerror(errno));
+                        else
+                                bpftune_log(BPFTUNE_LOG_LEVEL,
+                                            "conn_tuner_tail: populated "
+                                            "PROG_ARRAY[0] with fd %d\n",
+                                            tail_fd);
+                }
+        }
+    }
+
         /* 0.4.79: verify both progs actually landed on the root cgroup.
          * Observed on fast systemctl restart: the attaches return 0 but
          * the tree ends up empty, then a second restart fixes it.  The
