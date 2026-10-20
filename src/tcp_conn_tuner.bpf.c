@@ -313,22 +313,17 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
 
 __u64 tcp_thin_lto_choices;
 
-/* 0.4.110: single source of truth for "destination we never track".
- * Same skip set as the v0.4.95 estab filter -- loopback, link-local,
- * RFC 1918 and other special-use ranges that cannot benefit from
- * congestion-control tuning (cloudflared <-> local service traffic
- * is the case that motivated this).  v4-mapped IPv6 (::ffff:a.b.c.d)
- * is folded through the v4 checks so a dual-stack socket to a
- * filtered v4 destination is caught regardless of socket family.
+/* 0.4.111: single source of truth for "destination we never track"
+ * (loopback, link-local, RFC1918, special-use; v4-mapped IPv6 folded
+ * through the v4 checks).  cloudflared <-> local service traffic is
+ * the case that motivated this.
  *
- * One __always_inline helper shared by both sockops programs so the
- * set is defined exactly once.  Verifier cost is a handful of
- * straight-line compares + early returns at the top of each program,
- * where no state is live -- the safe place to add branches (see
- * HANDOFF: mid-function branches are what blew the 1M-instruction
- * verifier budget in the 0.4.40 draft; state count, not instruction
- * count, is the scarce resource).  To change which destinations are
- * tracked, edit v4_skip()/conn_skip() here and nowhere else. */
+ * VERIFIER NOTE (0.4.110 post-mortem): the estab program must NOT be
+ * touched -- its metric loop rides the 1M processed-insn verifier
+ * budget and even small CFG perturbations there push it over
+ * (0.4.110 failed at 1000001 on both builders).  These helpers are
+ * __always_inline and called ONLY from the vote program; the estab
+ * program stays byte-identical to 0.4.107. */
 static __always_inline bool v4_skip(__u32 ip4)
 {
         if ((ip4 & 0xff000000) == 0x7f000000) return true;      /* 127.0.0.0/8 loopback */
@@ -337,11 +332,6 @@ static __always_inline bool v4_skip(__u32 ip4)
         if ((ip4 & 0xfff00000) == 0xac100000) return true;      /* 172.16.0.0/12 private */
         if ((ip4 & 0xffff0000) == 0xc0a80000) return true;      /* 192.168.0.0/16 private */
         if ((ip4 & 0xffff0000) == 0xc0000000) return true;      /* 192.0.0.0/16 special-use */
-        /* 0.4.110: fixes 0.4.95 bugs -- these two were tautologically
-         * false (compared a /16-masked value against a /24 constant, so
-         * they never matched anything; clang -Wtautological-bitwise-compare
-         * flagged them in every copy since 0.4.95) and 198.18.0.0/15 used
-         * a /16 mask that missed 198.19.x. */
         if ((ip4 & 0xffffff00) == 0xc0000200) return true;      /* 192.0.2.0/24 documentation */
         if ((ip4 & 0xffff8000) == 0xc6120000) return true;      /* 198.18.0.0/15 benchmark */
         if ((ip4 & 0xffffff00) == 0xc6336400) return true;      /* 198.51.100.0/24 documentation */
@@ -393,16 +383,6 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 
     switch (ops->op) {
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
-        /* 0.4.110: filter BEFORE arming per-packet callbacks.  Earlier
-         * builds called bpf_sock_ops_cb_flags_set() first, so loopback
-         * sockets (cloudflared <-> local services) kept firing RTT_CB,
-         * RETRANS_CB and STATE_CB into both sockops programs for every
-         * event -- the CPU burn -- despite being skipped downstream.
-         * Filtering first means the kernel never arms those callbacks
-         * for these sockets and both programs stop running for their
-         * traffic entirely. */
-        if (conn_skip(ops))
-            return 1;
         bpf_sock_ops_cb_flags_set(ops, cb_flags);
         /* 0.4.92fix: clear stale swap_target=0xff from a previous passive
          * connection on the same socket (socket reuse). Without this, an
@@ -416,11 +396,6 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
         }
         break;
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
-        /* 0.4.110: same conn_skip() gate as the active case -- do not
-         * arm callbacks (or create conn_state sk_storage) for
-         * loopback/private destinations. */
-        if (conn_skip(ops))
-            return 1;
         bpf_sock_ops_cb_flags_set(ops, cb_flags);
         /* 0.4.92: mark passive (incoming) connections — skip swap/metric
          * tracking. The server is the receiver; swapping the local
@@ -464,19 +439,62 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
      * bypass the AF_INET path and get bucketed under ::/32 (all-zero
      * after prefix6 masking), lumping every v4 peer into a single
      * useless bucket.  Fold to v4 here so the same peer shares its
-     * bucket regardless of which socket family the app used.
-     *
-     * 0.4.110: the loopback/RFC1918/special-use range checks that
-     * used to live here moved into conn_skip(), which now runs at the
-     * top of both ESTABLISHED cases (before the cb_flags_set) --
-     * nothing in the skip set can reach this point anymore. */
+     * bucket regardless of which socket family the app used. */
     bool is_v4_mapped = false;
     __u32 v4_addr_from_v6 = 0;
-    if (ops->family == AF_INET6 &&
-        ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
-        ops->remote_ip6[2] == bpf_htonl(0xffff)) {
-        is_v4_mapped = true;
-        v4_addr_from_v6 = ops->remote_ip6[3];
+    if (ops->family == AF_INET) {
+        __u32 ip4 = bpf_ntohl(ops->remote_ip4);
+        /* 0.4.95: skip RFC 1918 + special-use v4 ranges.  These are
+         * either loopback, link-local, private LAN, or documentation
+         * ranges — none of them benefit from congestion-control
+         * tuning (they're either local or never route over the
+         * internet).  Previously only 127.0.0.0/8 + 169.254.0.0/16
+         * were skipped, so LAN traffic showed up in the dashboard
+         * as '192.168.0.0' or '10.0.0.0' buckets — useless noise. */
+        if ((ip4 & 0xff000000) == 0x7f000000) return 1;  /* 127.0.0.0/8 loopback */
+        if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;  /* 169.254.0.0/16 link-local */
+        if ((ip4 & 0xff000000) == 0x0a000000) return 1;  /* 10.0.0.0/8 private */
+        if ((ip4 & 0xfff00000) == 0xac100000) return 1;  /* 172.16.0.0/12 private */
+        if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;  /* 192.168.0.0/16 private */
+        if ((ip4 & 0xffff0000) == 0xc0000000) return 1;  /* 0.0.0.0/16 reserved */
+        if ((ip4 & 0xffff0000) == 0xc000a800) return 1;  /* 192.0.2.0/24 documentation */
+        if ((ip4 & 0xffff0000) == 0xc6120000) return 1;  /* 198.18.0.0/15 benchmark */
+        if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;  /* 198.51.100.0/24 documentation */
+        if ((ip4 & 0xffff0000) == 0xcb007100) return 1;  /* 203.0.113.0/24 documentation */
+    } else if (ops->family == AF_INET6) {
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 && ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1)) return 1;
+        if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return 1;
+        /* 0.4.95: skip IPv6 ULA (fc00::/7), multicast (ff00::/8), and
+         * documentation (2001:db8::/32).  These are either private or
+         * not routable on the public internet. */
+        if ((ops->remote_ip6[0] & bpf_htonl(0xfe000000)) == bpf_htonl(0xfc000000)) return 1;
+        if ((ops->remote_ip6[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000)) return 1;
+        if (ops->remote_ip6[0] == bpf_htonl(0x20010db8)) return 1;
+        /* 0.4.94: IPv4-mapped IPv6 (::ffff:a.b.c.d).  remote_ip6[2]
+         * in network byte order is 0xffff0000 when read as __u32,
+         * but we compare against bpf_htonl(0xffff) which is the
+         * network-byte-order form of 0x0000ffff.  Both are equal on
+         * any endian CPU because bpf_htonl handles the swap. */
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+            ops->remote_ip6[2] == bpf_htonl(0xffff)) {
+            is_v4_mapped = true;
+            v4_addr_from_v6 = ops->remote_ip6[3];
+            /* 0.4.95: apply the same RFC 1918 + special-use v4 filter
+             * to the v4 address extracted from v4-in-v6 form.  Without
+             * this, LAN traffic over a dual-stack socket would slip
+             * past the AF_INET filter above. */
+            __u32 ip4 = bpf_ntohl(v4_addr_from_v6);
+            if ((ip4 & 0xff000000) == 0x7f000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+            if ((ip4 & 0xff000000) == 0x0a000000) return 1;
+            if ((ip4 & 0xfff00000) == 0xac100000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc000a800) return 1;
+            if ((ip4 & 0xffff0000) == 0xc6120000) return 1;
+            if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;
+            if ((ip4 & 0xffff0000) == 0xcb007100) return 1;
+        }
     }
     switch (ops->family) {
     case AF_INET:
@@ -766,21 +784,29 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     bool allow_ref = false;
     __u64 tc_progress = 0;
 
-    /* v0.4.110: top-of-function loopback/private filter — the same
-     * conn_skip() set the estab program now applies BEFORE arming
-     * callbacks.  Runs before the debug-map lookup and before any
-     * socket work, with no live verifier state (mid-function branches
-     * are what blew the 1M-insn verifier budget in the 0.4.40 draft;
-     * top-of-function early-outs are near-free).
+    /* v0.4.111: top-of-function loopback/private filter + self-heal.
+     * Runs before the debug-map lookup and before any socket work,
+     * with no live verifier state (mid-function branches are what
+     * blew the 1M-insn verifier budget in the 0.4.40 draft; top-of-
+     * function early-outs are near-free).
      *
-     * Self-heal: sockets established while a pre-0.4.110 build ran
-     * still have the optional callback flags armed — the flags live
-     * on the socket and survive program reloads.  The next event
-     * such a socket raises lands here; clearing the flags stops the
-     * kernel from invoking this program (and the estab program) for
-     * its RTT/retrans/state events from then on.  tcp_conn_tuner is
-     * the only sockops program family in bpftune, so clearing to 0
-     * is safe. */
+     * The estab program still arms the optional callbacks (RTT_CB /
+     * RETRANS_CB / STATE_CB) on every socket, exactly as in 0.4.107 --
+     * its code is deliberately untouched because its metric loop
+     * rides the verifier budget (0.4.110 post-mortem).  Instead, this
+     * gate neutralizes them: the FIRST event a filtered socket raises
+     * (for a new loopback connection that is typically the very first
+     * RTT sample; if this program is attached after the estab program
+     * it is the ESTABLISHED_CB itself) clears the flags via
+     * bpf_sock_ops_cb_flags_set(ops, 0), and from then on the kernel
+     * invokes NEITHER sockops program for that socket's traffic.
+     * Cost per filtered connection: at most a handful of invocations
+     * instead of a per-packet storm.  The flags live on the socket
+     * and survive daemon restarts, so this also self-heals long-lived
+     * cloudflared sockets established under pre-0.4.111 builds.
+     * Safe because tcp_conn_tuner is the only sockops program family
+     * in bpftune.  v4-mapped loopback (::ffff:127.0.0.1) is caught
+     * here too. */
     if (conn_skip(ops)) {
         bpf_sock_ops_cb_flags_set(ops, 0);
         return 1;
@@ -886,17 +912,46 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     if (!sk)
         return 1;
     tp = bpf_skc_to_tcp_sock(sk);
-    /* 0.4.94: detect IPv4-mapped IPv6 (see comment in active_estab path).
-     * 0.4.110: the v0.4.95 range checks that lived here moved into
-     * conn_skip() at the top of this function — filtered
-     * destinations never reach this point. */
+    /* 0.4.94: detect IPv4-mapped IPv6 (see comment in active_estab path). */
     bool is_v4_mapped = false;
     __u32 v4_addr_from_v6 = 0;
-    if (ops->family == AF_INET6 &&
-        ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
-        ops->remote_ip6[2] == bpf_htonl(0xffff)) {
-        is_v4_mapped = true;
-        v4_addr_from_v6 = ops->remote_ip6[3];
+    if (ops->family == AF_INET) {
+        __u32 ip4 = bpf_ntohl(ops->remote_ip4);
+        /* 0.4.95: skip RFC 1918 + special-use v4 ranges (see active_estab). */
+        if ((ip4 & 0xff000000) == 0x7f000000) return 1;
+        if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+        if ((ip4 & 0xff000000) == 0x0a000000) return 1;
+        if ((ip4 & 0xfff00000) == 0xac100000) return 1;
+        if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;
+        if ((ip4 & 0xffff0000) == 0xc0000000) return 1;
+        if ((ip4 & 0xffff0000) == 0xc000a800) return 1;
+        if ((ip4 & 0xffff0000) == 0xc6120000) return 1;
+        if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;
+        if ((ip4 & 0xffff0000) == 0xcb007100) return 1;
+    } else if (ops->family == AF_INET6) {
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 && ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1)) return 1;
+        if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return 1;
+        /* 0.4.95: skip ULA + multicast + documentation (see active_estab). */
+        if ((ops->remote_ip6[0] & bpf_htonl(0xfe000000)) == bpf_htonl(0xfc000000)) return 1;
+        if ((ops->remote_ip6[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000)) return 1;
+        if (ops->remote_ip6[0] == bpf_htonl(0x20010db8)) return 1;
+        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+            ops->remote_ip6[2] == bpf_htonl(0xffff)) {
+            is_v4_mapped = true;
+            v4_addr_from_v6 = ops->remote_ip6[3];
+            /* 0.4.95: apply RFC 1918 + special-use filter to v4-in-v6 form. */
+            __u32 ip4 = bpf_ntohl(v4_addr_from_v6);
+            if ((ip4 & 0xff000000) == 0x7f000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xa9fe0000) return 1;
+            if ((ip4 & 0xff000000) == 0x0a000000) return 1;
+            if ((ip4 & 0xfff00000) == 0xac100000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0a80000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc0000000) return 1;
+            if ((ip4 & 0xffff0000) == 0xc000a800) return 1;
+            if ((ip4 & 0xffff0000) == 0xc6120000) return 1;
+            if ((ip4 & 0xfffffe00) == 0xc6336400) return 1;
+            if ((ip4 & 0xffff0000) == 0xcb007100) return 1;
+        }
     }
     switch (ops->family) {
     case AF_INET:

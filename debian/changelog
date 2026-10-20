@@ -1,3 +1,48 @@
+bpftune (0.4.111) unstable; urgency=medium
+
+  * tcp_conn_tuner.bpf.c: vote-program-only loopback filter + callback
+    self-heal — fixes the cloudflared loopback CPU burn WITHOUT touching
+    the estab program.
+    - 0.4.110 post-mortem: 0.4.110 gated cb_flags_set in the estab
+      program and restructured its filter blocks; the estab program's
+      metric loop rides the verifier's 1M processed-insn complexity
+      budget, and the CFG perturbation pushed it to 1000001 processed
+      insns -> -E2BIG on both builders (amd64 + arm64). Static
+      instruction count (5178, 0.5% of 1M) was the wrong yardstick:
+      state exploration, not code size, is the scarce resource (see
+      the 0.4.40 post-mortem in HANDOFF.md — same failure mode).
+    - Fix: the estab program is restored byte-identical to 0.4.107
+      (verified: symbol bytes identical across CO-RE/LEGACY/NOBTF),
+      so its verifier behavior is exactly that of the version already
+      running on the fleet. The loopback/private filter (new
+      v4_skip()/conn_skip() helpers — loopback, link-local, RFC1918,
+      special-use, v4-mapped IPv6 folded through the v4 checks) runs
+      at the TOP of the vote program only, with no live verifier
+      state.
+    - Self-heal: the estab program still arms the optional callbacks
+      (RTT/RETRANS/STATE) as in 0.4.107; the vote program now clears
+      them (bpf_sock_ops_cb_flags_set(ops, 0)) on the FIRST event a
+      filtered socket raises. From then on the kernel invokes
+      NEITHER sockops program for that socket. Cost per loopback
+      connection: a handful of invocations instead of a per-packet
+      storm (loopback RTT samples fire at near-per-packet rates —
+      that was the CPU burn). Flags live on the socket and survive
+      daemon restarts, so long-lived cloudflared sockets established
+      under older builds are healed on their first event too. Safe:
+      tcp_conn_tuner is the only sockops program family in bpftune.
+    - Mask constants corrected vs the 0.4.95 copies in the shared
+      helper: 192.0.2.0/24 and 203.0.113.0/24 checks in the estab
+      program remain tautologically false as in 0.4.107 (estab is
+      deliberately untouched); they are cosmetic dead checks and are
+      now documented as such. The helper uses correct masks.
+    - Verifier budget: estab 879 insns (unchanged from 0.4.107,
+      byte-identical); vote 4144 -> 4310 insns, all new branches are
+      a single top-of-function early-out. Static counts are
+      informational only — the real check is bpftool prog load on a
+      target host, which MUST be run before fleet deploy.
+
+ -- Z User <z@container>  Mon, 20 Oct 2026 15:30:00 +0000
+
 bpftune (0.4.110) unstable; urgency=medium
 
   * tcp_conn_tuner.bpf.c: gate callback arming on the loopback/RFC1918

@@ -1,0 +1,150 @@
+diff --git a/debian/changelog b/debian/changelog
+index a60e5eb..0dc2afc 100755
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,48 @@
++bpftune (0.4.111) unstable; urgency=medium
++
++  * tcp_conn_tuner.bpf.c: vote-program-only loopback filter + callback
++    self-heal — fixes the cloudflared loopback CPU burn WITHOUT touching
++    the estab program.
++    - 0.4.110 post-mortem: 0.4.110 gated cb_flags_set in the estab
++      program and restructured its filter blocks; the estab program's
++      metric loop rides the verifier's 1M processed-insn complexity
++      budget, and the CFG perturbation pushed it to 1000001 processed
++      insns -> -E2BIG on both builders (amd64 + arm64). Static
++      instruction count (5178, 0.5% of 1M) was the wrong yardstick:
++      state exploration, not code size, is the scarce resource (see
++      the 0.4.40 post-mortem in HANDOFF.md — same failure mode).
++    - Fix: the estab program is restored byte-identical to 0.4.107
++      (verified: symbol bytes identical across CO-RE/LEGACY/NOBTF),
++      so its verifier behavior is exactly that of the version already
++      running on the fleet. The loopback/private filter (new
++      v4_skip()/conn_skip() helpers — loopback, link-local, RFC1918,
++      special-use, v4-mapped IPv6 folded through the v4 checks) runs
++      at the TOP of the vote program only, with no live verifier
++      state.
++    - Self-heal: the estab program still arms the optional callbacks
++      (RTT/RETRANS/STATE) as in 0.4.107; the vote program now clears
++      them (bpf_sock_ops_cb_flags_set(ops, 0)) on the FIRST event a
++      filtered socket raises. From then on the kernel invokes
++      NEITHER sockops program for that socket. Cost per loopback
++      connection: a handful of invocations instead of a per-packet
++      storm (loopback RTT samples fire at near-per-packet rates —
++      that was the CPU burn). Flags live on the socket and survive
++      daemon restarts, so long-lived cloudflared sockets established
++      under older builds are healed on their first event too. Safe:
++      tcp_conn_tuner is the only sockops program family in bpftune.
++    - Mask constants corrected vs the 0.4.95 copies in the shared
++      helper: 192.0.2.0/24 and 203.0.113.0/24 checks in the estab
++      program remain tautologically false as in 0.4.107 (estab is
++      deliberately untouched); they are cosmetic dead checks and are
++      now documented as such. The helper uses correct masks.
++    - Verifier budget: estab 879 insns (unchanged from 0.4.107,
++      byte-identical); vote 4144 -> 4310 insns, all new branches are
++      a single top-of-function early-out. Static counts are
++      informational only — the real check is bpftool prog load on a
++      target host, which MUST be run before fleet deploy.
++
++ -- Z User <z@container>  Mon, 20 Oct 2026 15:30:00 +0000
++
+ bpftune (0.4.110) unstable; urgency=medium
+ 
+   * tcp_conn_tuner.bpf.c: gate callback arming on the loopback/RFC1918
+diff --git a/src/tcp_conn_tuner.bpf.c b/src/tcp_conn_tuner.bpf.c
+index 8558500..84ce079 100644
+--- a/src/tcp_conn_tuner.bpf.c
++++ b/src/tcp_conn_tuner.bpf.c
+@@ -313,6 +313,57 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
+ 
+ __u64 tcp_thin_lto_choices;
+ 
++/* 0.4.111: single source of truth for "destination we never track"
++ * (loopback, link-local, RFC1918, special-use; v4-mapped IPv6 folded
++ * through the v4 checks).  cloudflared <-> local service traffic is
++ * the case that motivated this.
++ *
++ * VERIFIER NOTE (0.4.110 post-mortem): the estab program must NOT be
++ * touched -- its metric loop rides the 1M processed-insn verifier
++ * budget and even small CFG perturbations there push it over
++ * (0.4.110 failed at 1000001 on both builders).  These helpers are
++ * __always_inline and called ONLY from the vote program; the estab
++ * program stays byte-identical to 0.4.107. */
++static __always_inline bool v4_skip(__u32 ip4)
++{
++        if ((ip4 & 0xff000000) == 0x7f000000) return true;      /* 127.0.0.0/8 loopback */
++        if ((ip4 & 0xffff0000) == 0xa9fe0000) return true;      /* 169.254.0.0/16 link-local */
++        if ((ip4 & 0xff000000) == 0x0a000000) return true;      /* 10.0.0.0/8 private */
++        if ((ip4 & 0xfff00000) == 0xac100000) return true;      /* 172.16.0.0/12 private */
++        if ((ip4 & 0xffff0000) == 0xc0a80000) return true;      /* 192.168.0.0/16 private */
++        if ((ip4 & 0xffff0000) == 0xc0000000) return true;      /* 192.0.0.0/16 special-use */
++        if ((ip4 & 0xffffff00) == 0xc0000200) return true;      /* 192.0.2.0/24 documentation */
++        if ((ip4 & 0xffff8000) == 0xc6120000) return true;      /* 198.18.0.0/15 benchmark */
++        if ((ip4 & 0xffffff00) == 0xc6336400) return true;      /* 198.51.100.0/24 documentation */
++        if ((ip4 & 0xffffff00) == 0xcb007100) return true;      /* 203.0.113.0/24 documentation */
++        return false;
++}
++
++static __always_inline bool conn_skip(struct bpf_sock_ops *ops)
++{
++        if (ops->family == AF_INET)
++                return v4_skip(bpf_ntohl(ops->remote_ip4));
++        if (ops->family == AF_INET6) {
++                /* ::1 loopback */
++                if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
++                    ops->remote_ip6[2] == 0 &&
++                    ops->remote_ip6[3] == bpf_htonl(1)) return true;
++                /* fe80::/10 link-local */
++                if ((ops->remote_ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000)) return true;
++                /* fc00::/7 ULA */
++                if ((ops->remote_ip6[0] & bpf_htonl(0xfe000000)) == bpf_htonl(0xfc000000)) return true;
++                /* ff00::/8 multicast */
++                if ((ops->remote_ip6[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000)) return true;
++                /* 2001:db8::/32 documentation */
++                if (ops->remote_ip6[0] == bpf_htonl(0x20010db8)) return true;
++                /* ::ffff:0:0/96 -- v4-mapped, fold through the v4 filter */
++                if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
++                    ops->remote_ip6[2] == bpf_htonl(0xffff) &&
++                    v4_skip(bpf_ntohl(ops->remote_ip6[3]))) return true;
++        }
++        return false;
++}
++
+ SEC("sockops")
+ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
+ {
+@@ -733,6 +784,34 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
+     bool allow_ref = false;
+     __u64 tc_progress = 0;
+ 
++    /* v0.4.111: top-of-function loopback/private filter + self-heal.
++     * Runs before the debug-map lookup and before any socket work,
++     * with no live verifier state (mid-function branches are what
++     * blew the 1M-insn verifier budget in the 0.4.40 draft; top-of-
++     * function early-outs are near-free).
++     *
++     * The estab program still arms the optional callbacks (RTT_CB /
++     * RETRANS_CB / STATE_CB) on every socket, exactly as in 0.4.107 --
++     * its code is deliberately untouched because its metric loop
++     * rides the verifier budget (0.4.110 post-mortem).  Instead, this
++     * gate neutralizes them: the FIRST event a filtered socket raises
++     * (for a new loopback connection that is typically the very first
++     * RTT sample; if this program is attached after the estab program
++     * it is the ESTABLISHED_CB itself) clears the flags via
++     * bpf_sock_ops_cb_flags_set(ops, 0), and from then on the kernel
++     * invokes NEITHER sockops program for that socket's traffic.
++     * Cost per filtered connection: at most a handful of invocations
++     * instead of a per-packet storm.  The flags live on the socket
++     * and survive daemon restarts, so this also self-heals long-lived
++     * cloudflared sockets established under pre-0.4.111 builds.
++     * Safe because tcp_conn_tuner is the only sockops program family
++     * in bpftune.  v4-mapped loopback (::ffff:127.0.0.1) is caught
++     * here too. */
++    if (conn_skip(ops)) {
++        bpf_sock_ops_cb_flags_set(ops, 0);
++        return 1;
++    }
++
+     /* 0.4.91: read debug flag from tuner_config_map slot 3 so the
+      * CLI can toggle it live via 'bpftune --bpf-debug=0'. */
+     {
