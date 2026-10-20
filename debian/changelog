@@ -1,3 +1,53 @@
+bpftune (0.4.110) unstable; urgency=medium
+
+  * tcp_conn_tuner.bpf.c: gate callback arming on the loopback/RFC1918
+    filter — the fix for the cloudflared loopback CPU burn.
+    - Root cause: both ESTABLISHED cases called
+      bpf_sock_ops_cb_flags_set(STATE|RETRANS|RTT) before any filtering,
+      so the kernel invoked BOTH sockops programs for every RTT sample /
+      retransmit / state change on every loopback socket. Loopback RTT
+      samples fire at near-per-packet rates — that is where the CPU hours
+      went. Filtering inside the case handlers only makes each invocation
+      cheaper; the invocation storm itself is the cost.
+    - Fix: conn_skip() (new single-source-of-truth helper, same skip set
+      as the v0.4.95 estab filter) runs at the TOP of both ESTABLISHED
+      cases, BEFORE cb_flags_set — loopback sockets never get the
+      optional callbacks armed, so both programs stop running for their
+      traffic entirely (zero per-event cost, not just cheaper events).
+    - Self-heal: the vote program clears stale cb flags
+      (bpf_sock_ops_cb_flags_set(ops, 0)) on the first event a
+      pre-0.4.110 loopback socket raises; flags live on the socket and
+      survive daemon restarts, so long-lived cloudflared connections
+      stop firing without waiting for them to close. Safe because
+      tcp_conn_tuner is the only sockops program family in bpftune.
+    - v4-mapped loopback (::ffff:127.0.0.1, dual-stack sockets) is now
+      caught in the vote path as well — the old in-case filters never
+      checked the v4-mapped form there.
+    - Deduplicated: the RFC1918/special-use range checks that were
+      copy-pasted in 4 places (estab v4, estab v6-mapped, vote v4,
+      vote v6-mapped) now live in one v4_skip()/conn_skip() pair.
+      Edit those to change which destinations are tracked.
+    - Bug fixes inherited from the 0.4.95 copies: the 192.0.2.0/24 and
+      203.0.113.0/24 checks were tautologically false (mask/constant
+      mismatch — they never matched anything; clang
+      -Wtautological-bitwise-compare had flagged them since 0.4.95) and
+      198.18.0.0/15 used a /16 mask that missed 198.19.x. All
+      doc/benchmark ranges now use correct masks; the 8 tautological
+      warnings are gone (only the pre-existing misleading-indentation
+      warning remains).
+    - Verifier budget (measured, all 3 build modes — CO-RE, LEGACY,
+      NOBTF): estab 879 -> 1036 insns; vote 4144 -> 4142 insns; total
+      5023 -> 5178 insns = 0.5% of the 1M verifier budget. All new
+      branches are top-of-function early returns with no live verifier
+      state — the one place the HANDOFF identifies as safe (mid-function
+      branches are what blew the budget in the 0.4.40 draft; state
+      count, not instruction count, is the scarce resource). ~20
+      mid-function branches were removed from the vote path.
+    - Verified: sockops section byte-identical across CO-RE/LEGACY/NOBTF
+      against the reviewed working-tree fix before commit.
+
+ -- Z User <z@container>  Mon, 20 Oct 2026 12:00:00 +0000
+
 bpftune (0.4.107) unstable; urgency=medium
 
   * net_buffer_tuner: actively shrink netdev_budget_usecs on startup if above cap

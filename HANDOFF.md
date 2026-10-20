@@ -29,6 +29,72 @@ Verify: `dpkg-query -W -f='${Package} ${Version}\n' bpftune`
 
 
 
+## SESSION 2026-10-20 — 0.4.110: loopback callback-arming fix (cloudflared CPU burn)
+
+### Problem
+cloudflared maintains long-lived loopback connections to local services.
+Both sockops programs (`bpftune_conn_tuner`, `bpftune_conn_tuner_vote`)
+ran for every RTT sample / retransmit / state change on every one of
+those sockets — near-per-packet invocation rates, pure CPU waste.
+In-case filters (the approach tried in the discarded 0.4.108 draft)
+only make each invocation cheaper; the invocation storm itself is the
+cost.
+
+### Root cause
+Both ESTABLISHED cases called
+`bpf_sock_ops_cb_flags_set(ops, cb_flags)` BEFORE any filtering, arming
+the optional per-packet callbacks (RTT_CB / RETRANS_CB / STATE_CB) on
+loopback sockets too. The flags live on the socket and survive daemon
+restarts and program reloads.
+
+### Fix (src/tcp_conn_tuner.bpf.c)
+- New `v4_skip()` / `conn_skip()` helpers — single source of truth for
+  the skip set (loopback, link-local, RFC1918, special-use; v4-mapped
+  IPv6 folded through the v4 checks). Replaces 4 copy-pasted filter
+  blocks (estab v4, estab v6-mapped, vote v4, vote v6-mapped).
+- Both ESTABLISHED cases: `conn_skip()` at the TOP, BEFORE
+  `cb_flags_set` — filtered sockets never get callbacks armed, so both
+  programs stop running for that traffic entirely (zero per-event
+  cost).
+- Vote program: same `conn_skip()` at top + `bpf_sock_ops_cb_flags_set(ops, 0)`
+  self-heal — the first event a pre-0.4.110 loopback socket raises
+  clears its stale armed flags, so long-lived cloudflared connections
+  stop firing without waiting to close. Safe: tcp_conn_tuner is the
+  only sockops family in bpftune.
+- Mask bugs inherited from the 0.4.95 copies fixed: 192.0.2.0/24 and
+  203.0.113.0/24 checks were tautologically false since 0.4.95
+  (clang -Wtautological-bitwise-compare), 198.18.0.0/15 used a /16
+  mask that missed 198.19.x. Build went from 9 warnings to the 1
+  pre-existing cosmetic one.
+
+### Verification (before commit)
+- Compiled in all 3 modes (CO-RE / LEGACY / NOBTF), zig cc -O2.
+- Instruction counts (readelf, symbol size / 8):
+  estab 879 -> 1036, vote 4144 -> 4142, total 5023 -> 5178
+  (= 0.5% of the 1M verifier budget). All new branches are
+  top-of-function early returns with no live verifier state — the safe
+  place per the 0.4.40 post-mortem (state count, not insn count, is
+  the scarce resource).
+- sockops section byte-identical between the reviewed working-tree fix
+  and the committed file across all 3 modes (renumber only touched
+  comments).
+- Before deploying to the fleet, verify on one host:
+  `make tcp_conn_tuner.bpf.o && sudo bpftool prog load tcp_conn_tuner.bpf.o /sys/fs/bpftune/verify`
+  (silent + exit 0 = verifier accepted).
+
+### History / release notes
+- The 0.4.108 and 0.4.109 attempts (vote-handler-only filter) were
+  wrong approaches by a previous agent and were discarded: GitHub main
+  was rewound to 0.4.107 (50c5257) and this change was rebuilt directly
+  on top as 0.4.110 (both numbers are burnt — reusing them would
+  collide with cached artifacts on the fleet).
+- The stale v0.4.108 draft release (with its .debs) was deleted.
+- Release v0.4.110 created from tag on the new commit; .deb assets
+  `bpftune_0.4.110_amd64.deb` / `bpftune_0.4.110_arm64.deb` follow the
+  naming update.sh parses. Build them on the usual builders (vps-3959
+  amd64, instance-20250225-1017 arm64).
+
+
 
 ## SESSION 2026-09-27 — dashboard: SWAP OUTCOMES redesign + render.py refactor + fleet standardization
 
