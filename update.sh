@@ -271,6 +271,11 @@ print(candidates[0][1])
         cp dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
         cp dashboard/bin/chart.umd.min.js "$DASH_BIN"/ 2>/dev/null || true
         cp dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$DASH_BIN"/ 2>/dev/null || true
+        # ALSO copy to SERVED (histDir) where the Go HTTP handler looks for index.html
+        cp dashboard/bin/index.html "$SERVED"/ 2>/dev/null || true
+        cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$SERVED"/ 2>/dev/null || true
+        cp dashboard/bin/chart.umd.min.js dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$SERVED"/ 2>/dev/null || true
+        chmod 644 "$SERVED"/*.css "$SERVED"/*.js 2>/dev/null || true
         chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js 2>/dev/null || true
         chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
         ok "frontend files synced"
