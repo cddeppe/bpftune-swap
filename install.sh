@@ -294,8 +294,8 @@ print(candidates[0][1])
     # The Go collector serves index.html from histDir (/var/lib/bpftune/history/),
     # and dashboard.js/css from binDir (/opt/bpftune-dashboard/bin/)
     cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$DASH_BIN"/ 2>/dev/null || true
-    cp dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
-    cp dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
+    cp /root/bpftune/dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
+    cp /root/bpftune/dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
     # ALSO copy to histDir where the HTTP handler actually looks for index.html
     cp "$DASH_BIN"/index.html "$SERVED"/ 2>/dev/null || true
     cp "$DASH_BIN"/dashboard.js "$DASH_BIN"/dashboard.css "$SERVED"/ 2>/dev/null || true

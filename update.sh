@@ -267,10 +267,10 @@ print(candidates[0][1])
         # v0.9.1: also copy chart.umd.min.js + chartjs-adapter-date-fns
         # (bundled locally so charts work without CDN access)
         cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$DASH_BIN"/ 2>/dev/null || true
-        cp dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
-        cp dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
-        cp dashboard/bin/chart.umd.min.js "$DASH_BIN"/ 2>/dev/null || true
-        cp dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$DASH_BIN"/ 2>/dev/null || true
+        cp /root/bpftune/dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
+        cp /root/bpftune/dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
+        cp /root/bpftune/dashboard/bin/chart.umd.min.js "$DASH_BIN"/ 2>/dev/null || true
+        cp /root/bpftune/dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$DASH_BIN"/ 2>/dev/null || true
         # ALSO copy to SERVED (histDir) where the Go HTTP handler looks for index.html
         cp "$DASH_BIN"/index.html "$SERVED"/ 2>/dev/null || true
         cp "$DASH_BIN"/dashboard.js "$DASH_BIN"/dashboard.css "$SERVED"/ 2>/dev/null || true
