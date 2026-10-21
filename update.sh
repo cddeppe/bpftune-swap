@@ -232,7 +232,7 @@ for r in releases:
         continue
     ver_tuple = tuple(int(x) for x in m.group(1).split('.'))
     for a in r.get('assets', []):
-        if a.get('name') == 'bpftune-collector-go-${ARCH}':
+        if a.get('name') == 'bpftune-dashboard-${ARCH}':
             candidates.append((ver_tuple, r['tag_name']))
             break
 if not candidates:
@@ -241,13 +241,13 @@ candidates.sort(key=lambda c: c[0], reverse=True)
 print(candidates[0][1])
 " 2>/dev/null)
         if [ -n "$DASH_TAG" ]; then
-            BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-collector-go-${ARCH}"
+            BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-dashboard-${ARCH}"
         fi
-        if [ -n "$BIN_URL" ] && curl -fsSL "$BIN_URL" -o /tmp/bpftune-collector-go-"$ARCH" 2>/dev/null; then
+        if [ -n "${BIN_URL:-}" ] && curl -fsSL "${BIN_URL:-}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
             # Stop service before swapping binary (avoid "Text file busy")
             systemctl stop bpftune-collector-go 2>/dev/null || true
             sleep 2
-            cp /tmp/bpftune-collector-go-"$ARCH" "$GO_BIN"
+            cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
             chmod +x "$GO_BIN"
             ok "Go binary updated from GitHub Releases"
         elif command -v go >/dev/null 2>&1; then
