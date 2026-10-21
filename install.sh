@@ -263,11 +263,12 @@ print(candidates[0][1])
         chmod +x "$GO_BIN"
         ok "downloaded Go binary from GitHub Releases ($ARCH, tag $DASH_TAG)"
     # Fallback: try direct download from known dashboard release tags
-    elif curl -fsSL "https://github.com/${REPO}/releases/download/v0.9.99/bpftune-dashboard-${ARCH}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
+    elif systemctl stop bpftune-collector-go 2>/dev/null || true; curl -fsSL "https://github.com/${REPO}/releases/download/v0.9.99/bpftune-dashboard-${ARCH}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
         cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
         chmod +x "$GO_BIN"
         ok "downloaded Go binary from GitHub Releases ($ARCH, fallback v0.9.99)"
     elif [ -f "$BACKUP_DIR/bpftune-dashboard-$ARCH" ]; then
+        systemctl stop bpftune-collector-go 2>/dev/null || true
         cp "$BACKUP_DIR/bpftune-dashboard-$ARCH" "$GO_BIN"
         chmod +x "$GO_BIN"
         ok "copied Go binary from $BACKUP_DIR"
