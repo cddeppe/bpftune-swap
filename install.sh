@@ -62,6 +62,7 @@ NEED_INSTALL=""
 command -v curl    >/dev/null || NEED_INSTALL="$NEED_INSTALL curl"
 command -v python3 >/dev/null || NEED_INSTALL="$NEED_INSTALL python3"
 command -v git     >/dev/null || NEED_INSTALL="$NEED_INSTALL git"
+command -v bpftool  >/dev/null || NEED_INSTALL="$NEED_INSTALL bpftool"
 command -v dpkg    >/dev/null || NEED_INSTALL="$NEED_INSTALL dpkg"
 if [ -n "$NEED_INSTALL" ]; then
     apt-get update -qq 2>/dev/null || true
@@ -347,14 +348,15 @@ Wants=bpftune.service
 
 [Service]
 Type=simple
+WorkingDirectory=$DASH_BIN
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$DASH_BIN/bpftune-collector-go --port 8080 --bind 0.0.0.0
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-ProtectSystem=full
 ReadWritePaths=/var/lib/bpftune
-NoNewPrivileges=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
