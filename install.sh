@@ -217,8 +217,9 @@ if [ "$DASHBOARD" = 1 ]; then
         git pull --rebase --autostash
         ok "git checkout updated (branch: dashboard)"
     else
+        printf "  cloning dashboard branch (depth 1, minimal history)...\n"
         rm -rf /root/bpftune
-        git clone --branch dashboard --depth 50 https://github.com/${REPO} /root/bpftune
+        git clone --branch dashboard --depth 1 https://github.com/${REPO} /root/bpftune
         cd /root/bpftune
         ok "git cloned (branch: dashboard)"
     fi
