@@ -158,6 +158,17 @@ var (
         csvReadCacheMu sync.Mutex
 )
 
+// v0.9.99: incremental CSV reading cache. Instead of re-reading the entire
+// buckets.v2.csv on every 30-min renderSlowToDisk cycle, we cache the binned
+// series in memory and only read NEW lines since the last read.
+var (
+	streamBinsCache  map[string]map[string]map[int64]*binAcc
+	streamBinsOffset int64  // byte offset of last complete line read
+	streamBinsHeader string // cached CSV header for schema-change detection
+	streamBinsMu     sync.Mutex
+)
+
+
 // readBucketCSVFast returns snapshots for one bucket from a pre-loaded map.
 // Used by renderToDisk (which calls readCSVAll once, then iterates).
 func readBucketCSVFromMap(all map[string][]bucketSnapshot, bucketID string, span int64) []bucketSnapshot {
@@ -346,185 +357,247 @@ type binAcc struct {
 }
 
 func streamCSVToSeries(bucketIDs []string) map[string]map[string]map[string]interface{} {
-        // Determine which ranges to stream (only slow ranges — skip 1h and 24h)
-        type rngCfg struct {
-                span  int64 // 0 = unlimited
-                width int64
-        }
-        slowRanges := map[string]rngCfg{}
-        for rngName, rc := range ranges {
-                if isFastRange(rngName) {
-                        continue
-                }
-                span, _ := rc[0].(int)
-                width, _ := rc[1].(int)
-                if width == 0 {
-                        width = 60
-                }
-                var span64 int64
-                if span > 0 {
-                        span64 = int64(span)
-                }
-                slowRanges[rngName] = rngCfg{span64, int64(width)}
-        }
+	type rngCfg struct {
+		span  int64
+		width int64
+	}
+	slowRanges := map[string]rngCfg{}
+	for rngName, rc := range ranges {
+		if isFastRange(rngName) {
+			continue
+		}
+		span, _ := rc[0].(int)
+		width, _ := rc[1].(int)
+		if width == 0 {
+			width = 60
+		}
+		var span64 int64
+		if span > 0 {
+			span64 = int64(span)
+		}
+		slowRanges[rngName] = rngCfg{span64, int64(width)}
+	}
 
-        if len(slowRanges) == 0 || len(bucketIDs) == 0 {
-                return nil
-        }
+	if len(slowRanges) == 0 || len(bucketIDs) == 0 {
+		return nil
+	}
 
-        // Build bucket set for fast lookup
-        bucketSet := map[string]bool{}
-        for _, id := range bucketIDs {
-                bucketSet[id] = true
-        }
+	bucketSet := map[string]bool{}
+	for _, id := range bucketIDs {
+		bucketSet[id] = true
+	}
 
-        // Per-bucket, per-range, per-bin accumulators
-        // bins[bucketID][rngName][binIdx] = *binAcc
-        bins := map[string]map[string]map[int64]*binAcc{}
-        for _, bid := range bucketIDs {
-                bins[bid] = map[string]map[int64]*binAcc{}
-                for rngName := range slowRanges {
-                        bins[bid][rngName] = map[int64]*binAcc{}
-                }
-        }
+	streamBinsMu.Lock()
+	defer streamBinsMu.Unlock()
 
-        now := time.Now().Unix()
+	f, err := os.Open(bucketsCSVPath)
+	if err != nil {
+		os.Stderr.WriteString("streamCSVToSeries: failed to open CSV: " + err.Error() + "\n")
+		return nil
+	}
+	defer f.Close()
 
-        f, err := os.Open(bucketsCSVPath)
-        if err != nil {
-                os.Stderr.WriteString("streamCSVToSeries: failed to open CSV: " + err.Error() + "\n")
-                return nil
-        }
-        defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	fileSize := fi.Size()
 
-        scanner := bufio.NewScanner(f)
-        scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// Check if we need a full rebuild or can do incremental
+	needFullRebuild := false
+	reason := ""
+	if streamBinsCache == nil {
+		needFullRebuild = true
+		reason = "cold cache"
+	} else if fileSize < streamBinsOffset {
+		needFullRebuild = true
+		reason = "file shrank (rotated)"
+	} else if fileSize == streamBinsOffset {
+		os.Stderr.WriteString("streamCSVToSeries: no new data\n")
+		return finalizeCachedBins(streamBinsCache, bucketSet)
+	}
 
-        // Read header to get column indices
-        if !scanner.Scan() {
-                return nil
-        }
-        header := strings.Split(strings.TrimSpace(scanner.Text()), ",")
-        colIdx := map[string]int{}
-        for i, col := range header {
-                colIdx[col] = i
-        }
+	// Read header
+	if _, err := f.Seek(0, 0); err != nil {
+		return nil
+	}
+	reader := bufio.NewReaderSize(f, 1024*1024)
+	headerLine, err := reader.ReadString('\n')
+	if err != nil && headerLine == "" {
+		return nil
+	}
+	headerLine = strings.TrimRight(headerLine, "\r\n")
+	headerLen := int64(len(headerLine) + 1)
 
-        // Scan data lines — accumulate running sums per bin
-        rowCount := 0
-        for scanner.Scan() {
-                line := strings.TrimSpace(scanner.Text())
-                if line == "" {
-                        continue
-                }
-                cols := strings.Split(line, ",")
-                if len(cols) < 9 {
-                        continue
-                }
+	if streamBinsHeader != "" && streamBinsHeader != headerLine {
+		needFullRebuild = true
+		reason = "header changed"
+	}
 
-                ts, err := strconv.ParseInt(cols[0], 10, 64)
-                if err != nil {
-                        continue
-                }
+	colIdx := map[string]int{}
+	for i, col := range strings.Split(headerLine, ",") {
+		colIdx[col] = i
+	}
 
-                addr := cols[1] // B1-fix: trust stored label, no ResolveBucket
-                if !bucketSet[addr] {
-                        continue
-                }
+	now := time.Now().Unix()
 
-                // Parse per-alg fields
-                var re [16]float64
-                var ss [16]int
-                var bs [16]int
-                var ns [16]int
-                var mv [16]float64
-                for i, alg := range CONGS {
-                        if i >= 16 {
-                                break
-                        }
-                        if idx, ok := colIdx["re_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                {
-                                        v, _ := strconv.ParseFloat(cols[idx], 64)
-                                        if v > 10000000 {
-                                                v = 0
-                                        }
-                                        re[i] = v
-                                }
-                        }
-                        if idx, ok := colIdx["ss_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                {
-                                        v, _ := strconv.Atoi(cols[idx])
-                                        if v > 1000 {
-                                                v = 0
-                                        }
-                                        ss[i] = v
-                                }
-                        }
-                        if idx, ok := colIdx["bs_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                {
-                                        v, _ := strconv.Atoi(cols[idx])
-                                        if v > 1000 {
-                                                v = 0
-                                        }
-                                        bs[i] = v
-                                }
-                        }
-                        if idx, ok := colIdx["ns_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                {
-                                        v, _ := strconv.Atoi(cols[idx])
-                                        if v > 1000 {
-                                                v = 0
-                                        }
-                                        ns[i] = v
-                                }
-                        }
-                        if idx, ok := colIdx["mv_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
-                                mv[i], _ = strconv.ParseFloat(cols[idx], 64)
-                        }
-                }
+	if needFullRebuild {
+		streamBinsCache = map[string]map[string]map[int64]*binAcc{}
+		for _, bid := range bucketIDs {
+			streamBinsCache[bid] = map[string]map[int64]*binAcc{}
+			for rngName := range slowRanges {
+				streamBinsCache[bid][rngName] = map[int64]*binAcc{}
+			}
+		}
+		streamBinsOffset = headerLen
+		streamBinsHeader = headerLine
+		if _, err := f.Seek(headerLen, 0); err != nil {
+			return nil
+		}
+		reader = bufio.NewReaderSize(f, 1024*1024)
+		os.Stderr.WriteString("streamCSVToSeries: full-rebuild (" + reason + ")\n")
+	} else {
+		if _, err := f.Seek(streamBinsOffset, 0); err != nil {
+			return nil
+		}
+		reader = bufio.NewReaderSize(f, 1024*1024)
+	}
 
-                // Add to bins for each slow range
-                bucketBins, ok := bins[addr]
-                if !ok {
-                        continue
-                }
-                for rngName, cfg := range slowRanges {
-                        if cfg.span > 0 && ts < now-cfg.span {
-                                continue // outside the range window
-                        }
-                        binIdx := ts / cfg.width
-                        rngBins := bucketBins[rngName]
-                        b, exists := rngBins[binIdx]
-                        if !exists {
-                                b = &binAcc{ts: binIdx*cfg.width + cfg.width/2}
-                                rngBins[binIdx] = b
-                        }
-                        b.count++
-                        for i := 0; i < 16; i++ {
-                                b.sumRe[i] += re[i]
-                                b.sumSs[i] += ss[i]
-                                b.sumBs[i] += bs[i]
-                                b.sumNs[i] += ns[i]
-                                b.sumMv[i] += mv[i]
-                        }
-                }
-                rowCount++
-        }
+	rowCount := 0
+	currentOffset := streamBinsOffset
 
-        // Finalize: compute averages from sums, produce series arrays
-        result := map[string]map[string]map[string]interface{}{}
-        for bid, rngBins := range bins {
-                result[bid] = map[string]map[string]interface{}{}
-                for rngName, binMap := range rngBins {
-                        result[bid][rngName] = finalizeSeriesFromBins(binMap)
-                }
-        }
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && line == "" {
+			break
+		}
+		if !strings.HasSuffix(line, "\n") {
+			break // partial line at EOF — don't advance offset
+		}
+		currentOffset += int64(len(line))
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		cols := strings.Split(line, ",")
+		if len(cols) < 9 {
+			continue
+		}
+		ts, err := strconv.ParseInt(cols[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		addr := cols[1]
+		if !bucketSet[addr] {
+			continue
+		}
 
-        os.Stderr.WriteString("streamCSVToSeries: processed " + strconv.Itoa(rowCount) +
-                " rows for " + strconv.Itoa(len(bucketIDs)) + " buckets\n")
+		var re [16]float64
+		var ss [16]int
+		var bs [16]int
+		var ns [16]int
+		var mv [16]float64
+		for i, alg := range CONGS {
+			if i >= 16 {
+				break
+			}
+			if idx, ok := colIdx["re_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
+				v, _ := strconv.ParseFloat(cols[idx], 64)
+				if v > 10000000 {
+					v = 0
+				}
+				re[i] = v
+			}
+			if idx, ok := colIdx["ss_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
+				v, _ := strconv.Atoi(cols[idx])
+				if v > 1000 {
+					v = 0
+				}
+				ss[i] = v
+			}
+			if idx, ok := colIdx["bs_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
+				v, _ := strconv.Atoi(cols[idx])
+				if v > 1000 {
+					v = 0
+				}
+				bs[i] = v
+			}
+			if idx, ok := colIdx["ns_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
+				v, _ := strconv.Atoi(cols[idx])
+				if v > 1000 {
+					v = 0
+				}
+				ns[i] = v
+			}
+			if idx, ok := colIdx["mv_"+alg]; ok && idx < len(cols) && cols[idx] != "" {
+				mv[i], _ = strconv.ParseFloat(cols[idx], 64)
+			}
+		}
 
-        return result
+		bucketBins, ok := streamBinsCache[addr]
+		if !ok {
+			bucketBins = map[string]map[int64]*binAcc{}
+			streamBinsCache[addr] = bucketBins
+			for rngName := range slowRanges {
+				bucketBins[rngName] = map[int64]*binAcc{}
+			}
+		}
+		for rngName, cfg := range slowRanges {
+			if cfg.span > 0 && ts < now-cfg.span {
+				continue
+			}
+			binIdx := ts / cfg.width
+			rngBins := bucketBins[rngName]
+			if rngBins == nil {
+				rngBins = map[int64]*binAcc{}
+				bucketBins[rngName] = rngBins
+			}
+			b, exists := rngBins[binIdx]
+			if !exists {
+				b = &binAcc{ts: binIdx*cfg.width + cfg.width/2}
+				rngBins[binIdx] = b
+			}
+			b.count++
+			for i := 0; i < 16; i++ {
+				b.sumRe[i] += re[i]
+				b.sumSs[i] += ss[i]
+				b.sumBs[i] += bs[i]
+				b.sumNs[i] += ns[i]
+				b.sumMv[i] += mv[i]
+			}
+		}
+		rowCount++
+	}
+
+	streamBinsOffset = currentOffset
+
+	mode := "incremental"
+	if needFullRebuild {
+		mode = "full-rebuild"
+	}
+	os.Stderr.WriteString("streamCSVToSeries: " + mode + " processed " + strconv.Itoa(rowCount) +
+		" rows for " + strconv.Itoa(len(bucketIDs)) + " buckets\n")
+
+	return finalizeCachedBins(streamBinsCache, bucketSet)
 }
+
+func finalizeCachedBins(bins map[string]map[string]map[int64]*binAcc, bucketSet map[string]bool) map[string]map[string]map[string]interface{} {
+	if len(bins) == 0 {
+		return nil
+	}
+	result := map[string]map[string]map[string]interface{}{}
+	for bid, rngBins := range bins {
+		if !bucketSet[bid] {
+			continue
+		}
+		result[bid] = map[string]map[string]interface{}{}
+		for rngName, binMap := range rngBins {
+			result[bid][rngName] = finalizeSeriesFromBins(binMap)
+		}
+	}
+	return result
+}
+
 
 // finalizeSeriesFromBins converts a map of bin accumulators into the series
 // format expected by the dashboard (same format as buildSeriesFromSnaps).
