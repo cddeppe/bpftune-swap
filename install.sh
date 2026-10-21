@@ -137,7 +137,7 @@ except Exception:
 candidates = []
 for r in releases:
     tag = r.get('tag_name', '').lstrip('v')
-    m = re.match(r'^v?(\d+\.\d+\.\d+)\$', tag)
+    m = re.match(r'^v?(\d+\.\d+\.\d+)', tag)
     if not m:
         continue
     ver = tuple(int(x) for x in m.group(1).split('.'))
@@ -241,7 +241,7 @@ except Exception:
 candidates = []
 for r in releases:
     tag = r.get('tag_name', '').lstrip('v')
-    m = re.match(r'^v?(\d+\.\d+\.\d+)\$', tag)
+    m = re.match(r'^v?(\d+\.\d+\.\d+)', tag)
     if not m:
         continue
     ver = tuple(int(x) for x in m.group(1).split('.'))
