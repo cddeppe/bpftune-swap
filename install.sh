@@ -290,9 +290,16 @@ print(candidates[0][1])
     fi
 
     # --- 3c. Deploy frontend files ---
+    # Copy frontend files to BOTH binDir (for Go binary) and histDir (for HTTP serving)
+    # The Go collector serves index.html from histDir (/var/lib/bpftune/history/),
+    # and dashboard.js/css from binDir (/opt/bpftune-dashboard/bin/)
     cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$DASH_BIN"/ 2>/dev/null || true
     cp dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
     cp dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
+    # ALSO copy to histDir where the HTTP handler actually looks for index.html
+    cp dashboard/bin/index.html "$SERVED"/ 2>/dev/null || true
+    cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$SERVED"/ 2>/dev/null || true
+    cp dashboard/bin/chart.umd.min.js dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$SERVED"/ 2>/dev/null || true
     chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js 2>/dev/null || true
     chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
     ok "frontend files deployed to $DASH_BIN"
