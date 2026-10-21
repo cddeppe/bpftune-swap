@@ -57,6 +57,17 @@ fi
 
 # ---------- Pre-flight ----------
 [ "$(id -u)" = "0" ] || fail "Run as root (use: sudo bash install.sh)"
+# Auto-install dependencies if missing
+NEED_INSTALL=""
+command -v curl    >/dev/null || NEED_INSTALL="$NEED_INSTALL curl"
+command -v python3 >/dev/null || NEED_INSTALL="$NEED_INSTALL python3"
+command -v git     >/dev/null || NEED_INSTALL="$NEED_INSTALL git"
+command -v dpkg    >/dev/null || NEED_INSTALL="$NEED_INSTALL dpkg"
+if [ -n "$NEED_INSTALL" ]; then
+    apt-get update -qq 2>/dev/null || true
+    apt-get install -y -qq $NEED_INSTALL 2>&1 | tail -3
+fi
+
 command -v curl    >/dev/null || fail "curl not found (apt-get install curl)"
 command -v python3 >/dev/null || fail "python3 not found (apt-get install python3)"
 command -v dpkg    >/dev/null || fail "dpkg not found — this script targets Debian/Ubuntu"
@@ -70,9 +81,9 @@ case "$ARCH" in
 esac
 
 HAVE_NGINX=0; command -v nginx >/dev/null && HAVE_NGINX=1
-HAVE_GIT=0;   command -v git   >/dev/null && HAVE_GIT=1 || warn "git not found — dashboard install needs git"
+HAVE_GIT=0;   command -v git   >/dev/null && HAVE_GIT=1
 
-REPO="${BPFTUNE_REPO:-cddeppe/bpftune-swap-swap}"
+REPO="${BPFTUNE_REPO:-cddeppe/bpftune-swap}"
 BACKUP_DIR="${BPFTUNE_BACKUP_DIR:-/mnt/backup}"
 
 printf "\n${BOLD}=== bpftune fork installer ===${NC}\n"
@@ -116,17 +127,29 @@ if [ "$DEB_INSTALL" = 1 ]; then
 
         if [ -z "$DEB" ]; then
             printf "  No local .deb — querying GitHub releases for %s/%s...\n" "$REPO" "$ARCH"
-            DEB_URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+            DEB_URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null \
                 | python3 -c "
-import json, sys
+import json, sys, re
 try:
-    d = json.load(sys.stdin)
+    releases = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-for a in d.get('assets', []):
-    if '${ARCH}' in a.get('name', '') and 'bpftune-custom' in a.get('name', ''):
-        print(a.get('browser_download_url', ''))
-        break
+candidates = []
+for r in releases:
+    tag = r.get('tag_name', '').lstrip('v')
+    m = re.match(r'^v?(\d+\.\d+\.\d+)\$', tag)
+    if not m:
+        continue
+    ver = tuple(int(x) for x in m.group(1).split('.'))
+    for a in r.get('assets', []):
+        name = a.get('name', '')
+        if 'bpftune_' in name and '${ARCH}' in name and name.endswith('.deb'):
+            candidates.append((ver, a.get('browser_download_url', '')))
+            break
+if not candidates:
+    sys.exit(0)
+candidates.sort(key=lambda c: c[0], reverse=True)
+print(candidates[0][1])
 " 2>/dev/null || true)
             if [ -n "$DEB_URL" ]; then
                 curl -fsSL "$DEB_URL" -o /tmp/bpftune-"$ARCH".deb
@@ -207,13 +230,38 @@ if [ "$DASHBOARD" = 1 ]; then
     mkdir -p "$DASH_BIN"
 
     # Try to download pre-built binary from GitHub Releases
-    BIN_URL="https://github.com/${REPO}/releases/latest/download/bpftune-collector-go-${ARCH}"
-    if curl -fsSL "$BIN_URL" -o /tmp/bpftune-collector-go-"$ARCH" 2>/dev/null; then
-        cp /tmp/bpftune-collector-go-"$ARCH" "$GO_BIN"
+    DASH_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null \
+        | python3 -c "
+import json, sys, re
+try:
+    releases = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+candidates = []
+for r in releases:
+    tag = r.get('tag_name', '').lstrip('v')
+    m = re.match(r'^v?(\d+\.\d+\.\d+)\$', tag)
+    if not m:
+        continue
+    ver = tuple(int(x) for x in m.group(1).split('.'))
+    for a in r.get('assets', []):
+        if a.get('name') == 'bpftune-dashboard-${ARCH}':
+            candidates.append((ver, r['tag_name']))
+            break
+if not candidates:
+    sys.exit(0)
+candidates.sort(key=lambda c: c[0], reverse=True)
+print(candidates[0][1])
+" 2>/dev/null || true)
+    if [ -n "$DASH_TAG" ]; then
+        BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-dashboard-${ARCH}"
+    fi
+    if [ -n "\${BIN_URL:-}" ] && curl -fsSL "\${BIN_URL:-}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
+        cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
         chmod +x "$GO_BIN"
-        ok "downloaded Go binary from GitHub Releases ($ARCH)"
-    elif [ -f "$BACKUP_DIR/bpftune-collector-go-$ARCH" ]; then
-        cp "$BACKUP_DIR/bpftune-collector-go-$ARCH" "$GO_BIN"
+        ok "downloaded Go binary from GitHub Releases ($ARCH, tag $DASH_TAG)"
+    elif [ -f "$BACKUP_DIR/bpftune-dashboard-$ARCH" ]; then
+        cp "$BACKUP_DIR/bpftune-dashboard-$ARCH" "$GO_BIN"
         chmod +x "$GO_BIN"
         ok "copied Go binary from $BACKUP_DIR"
     elif command -v go >/dev/null 2>&1; then
