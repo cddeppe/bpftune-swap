@@ -772,6 +772,7 @@ func main() {
         // GOGC=50: more frequent, smaller GC runs (prevents 91% spikes).
         syscall.Setpriority(syscall.PRIO_PROCESS, 0, 10)
         os.Setenv("GOGC", "50")
+	startWatchdog() // v0.9.102: self-kill safety switch
         debug.SetGCPercent(50)
         fmt.Fprintf(os.Stderr, "collector: CPU priority=nice(10) GOGC=50\n")
 
