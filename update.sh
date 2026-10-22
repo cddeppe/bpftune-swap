@@ -437,6 +437,49 @@ print(candidates[0][1])
     done
 fi
 
+# ---------- Step 3: trace service fix (always overwrite) ----------
+# v0.9.104 fix: trace service used 'cat trace_pipe' which BLOCKS indefinitely
+# when no BPF events are being generated (idle hosts). The cat syscall hangs,
+# the 'sleep' never runs, the log file's mtime never updates, dashboard shows
+# 'Issues detected - Log Freshness: 14m old' even though bpftune is fine.
+#
+# Always overwrite the trace service file with the unblocking version.
+# Idempotent - safe to run on every update.sh invocation.
+if [ "$DO_DASHBOARD" = 1 ]; then
+    step "3. Fix trace service (unblock cat trace_pipe)"
+    TRACE_SVC=/etc/systemd/system/bpftune-met-trace.service
+    cat > "$TRACE_SVC" <<'EOF'
+[Unit]
+Description=bpftune trace_pipe capture to /var/log/bpftune-met-live.log
+After=bpftune.service
+Wants=bpftune.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'while true; do timeout 1 cat /sys/kernel/tracing/trace_pipe >> /var/log/bpftune-met-live.log 2>/dev/null; touch /var/log/bpftune-met-live.log; sleep 1; done'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable bpftune-met-trace 2>/dev/null || true
+    if systemctl is-active bpftune-met-trace >/dev/null 2>&1; then
+        systemctl restart bpftune-met-trace 2>/dev/null || true
+        ok "trace service restarted with unblocking ExecStart"
+    else
+        systemctl start bpftune-met-trace 2>/dev/null || true
+        ok "trace service started with unblocking ExecStart"
+    fi
+    sleep 2
+    # Verify the log file mtime is now fresh (< 5s old)
+    if [ -f /var/log/bpftune-met-live.log ]; then
+        LOG_AGE=$(($(date +%s) - $(stat -c %Y /var/log/bpftune-met-live.log)))
+        printf "  log freshness: %ds old (target: < 5s)\n" "$LOG_AGE"
+    fi
+fi
+
 # ---------- Summary ----------
 step "Update Complete"
 printf "  bpftune:   %s\n" "$(dpkg-query -W -f='${Version}' bpftune 2>/dev/null || echo 'not installed')"
