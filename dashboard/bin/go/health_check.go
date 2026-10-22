@@ -21,16 +21,16 @@ package main
 //   5. Logs warnings if anything is wrong
 
 import (
-        "encoding/binary"
-        "fmt"
-        "os"
-        "os/exec"
-        "strconv"
-        "strings"
-        "sync"
-        "time"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-        "golang.org/x/sys/unix"
+	"golang.org/x/sys/unix"
 )
 
 // v0.9.76: Escalation state for the trace capture service health check.
@@ -40,48 +40,49 @@ import (
 // writing to trace_pipe). The user had to manually reboot the machine.
 //
 // Now we escalate:
-//   Level 1: log stale → restart trace service (up to 3 times in 15 min)
-//   Level 2: still stale after 3 trace restarts → restart bpftune
-//   Level 3: still stale after bpftune restart → set needs_reboot=true,
-//            alert the user via service_health["needs_reboot"]
+//
+//	Level 1: log stale → restart trace service (up to 3 times in 15 min)
+//	Level 2: still stale after 3 trace restarts → restart bpftune
+//	Level 3: still stale after bpftune restart → set needs_reboot=true,
+//	         alert the user via service_health["needs_reboot"]
 //
 // Only a full machine reboot can fix Level 3 (kernel tracing subsystem
 // is broken). The health monitor can DETECT this but cannot FIX it.
 var traceEscalation struct {
-        mu                  sync.Mutex
-        traceRestarts       []time.Time // timestamps of recent trace service restarts
-        bpftuneRestartTried time.Time   // when we last restarted bpftune
-        needsReboot        bool         // Level 3: kernel tracing is broken, needs manual reboot
+	mu                  sync.Mutex
+	traceRestarts       []time.Time // timestamps of recent trace service restarts
+	bpftuneRestartTried time.Time   // when we last restarted bpftune
+	needsReboot         bool        // Level 3: kernel tracing is broken, needs manual reboot
 }
 
 // ensureSystemHealth runs on collector startup and fixes system-level
 // settings that the bpftune tuner needs. All idempotent — safe to run
 // every startup, no harm if already correct.
 func ensureSystemHealth() {
-        fmt.Fprintf(os.Stderr, "collector: running system health checks...\n")
+	fmt.Fprintf(os.Stderr, "collector: running system health checks...\n")
 
-        // 1. Increase trace_pipe ring buffer to 256MB (stops event loss)
-        // Default is ~1408 KB (1.4MB) which overflows on busy hosts,
-        // causing "CPU:0 [LOST N EVENTS]" and dropping swap events.
-        ensureTraceBufferSize()
+	// 1. Increase trace_pipe ring buffer to 256MB (stops event loss)
+	// Default is ~1408 KB (1.4MB) which overflows on busy hosts,
+	// causing "CPU:0 [LOST N EVENTS]" and dropping swap events.
+	ensureTraceBufferSize()
 
-        // 2. Sync saved explore_pct to BPF map
-        // When bpftune restarts, it reads /var/lib/bpftune/explore_pct and
-        // writes it to the BPF map. But if the BPF program was reloaded
-        // (kernel update, manual bpftool reload), the map resets to default
-        // (5%). This re-applies the saved value.
-        syncExplorePctToBPF()
+	// 2. Sync saved explore_pct to BPF map
+	// When bpftune restarts, it reads /var/lib/bpftune/explore_pct and
+	// writes it to the BPF map. But if the BPF program was reloaded
+	// (kernel update, manual bpftool reload), the map resets to default
+	// (5%). This re-applies the saved value.
+	syncExplorePctToBPF()
 
-        // 3. Ensure the trace capture service is running
-        // v0.9.46: This is the #1 cause of "no swaps in dashboard".
-        // The bpftune-met-trace service reads trace_pipe and writes to
-        // /var/log/bpftune-met-live.log. When it dies, the log goes stale.
-        ensureTraceCaptureService()
+	// 3. Ensure the trace capture service is running
+	// v0.9.46: This is the #1 cause of "no swaps in dashboard".
+	// The bpftune-met-trace service reads trace_pipe and writes to
+	// /var/log/bpftune-met-live.log. When it dies, the log goes stale.
+	ensureTraceCaptureService()
 
-        // 4. Verify BPF programs are loaded
-        checkBPFPrograms()
+	// 4. Verify BPF programs are loaded
+	checkBPFPrograms()
 
-        fmt.Fprintf(os.Stderr, "collector: system health checks complete\n")
+	fmt.Fprintf(os.Stderr, "collector: system health checks complete\n")
 }
 
 // ensureTraceBufferSize increases the trace_pipe ring buffer.
@@ -90,31 +91,31 @@ func ensureSystemHealth() {
 // (seen as "CPU:0 [LOST 31486 EVENTS]" in trace output).
 // We set it to 256MB which is enough for even the busiest hosts.
 func ensureTraceBufferSize() {
-        const targetSize = 256 * 1024 // 256MB in KB
-        const bufferSizePath = "/sys/kernel/debug/tracing/buffer_size_kb"
+	const targetSize = 256 * 1024 // 256MB in KB
+	const bufferSizePath = "/sys/kernel/debug/tracing/buffer_size_kb"
 
-        // Read current size
-        current, err := os.ReadFile(bufferSizePath)
-        if err != nil {
-                // Not mounted or no permission — non-fatal
-                fmt.Fprintf(os.Stderr, "  trace buffer: could not read %s: %v (non-fatal)\n", bufferSizePath, err)
-                return
-        }
-        currentSize, _ := strconv.Atoi(strings.TrimSpace(string(current)))
+	// Read current size
+	current, err := os.ReadFile(bufferSizePath)
+	if err != nil {
+		// Not mounted or no permission — non-fatal
+		fmt.Fprintf(os.Stderr, "  trace buffer: could not read %s: %v (non-fatal)\n", bufferSizePath, err)
+		return
+	}
+	currentSize, _ := strconv.Atoi(strings.TrimSpace(string(current)))
 
-        if currentSize >= targetSize {
-                fmt.Fprintf(os.Stderr, "  trace buffer: already %dKB (OK)\n", currentSize)
-                return
-        }
+	if currentSize >= targetSize {
+		fmt.Fprintf(os.Stderr, "  trace buffer: already %dKB (OK)\n", currentSize)
+		return
+	}
 
-        // Write new size
-        err = os.WriteFile(bufferSizePath, []byte(fmt.Sprintf("%d", targetSize)), 0644)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "  trace buffer: could not increase to %dKB: %v (non-fatal)\n", targetSize, err)
-                return
-        }
+	// Write new size
+	err = os.WriteFile(bufferSizePath, []byte(fmt.Sprintf("%d", targetSize)), 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  trace buffer: could not increase to %dKB: %v (non-fatal)\n", targetSize, err)
+		return
+	}
 
-        fmt.Fprintf(os.Stderr, "  trace buffer: increased %dKB → %dKB (stops event loss)\n", currentSize, targetSize)
+	fmt.Fprintf(os.Stderr, "  trace buffer: increased %dKB → %dKB (stops event loss)\n", currentSize, targetSize)
 }
 
 // syncExplorePctToBPF reads the saved explore_pct from
@@ -122,110 +123,110 @@ func ensureTraceBufferSize() {
 // This ensures the tuner uses the user's saved setting even after
 // bpftune restarts or the BPF map is reset.
 func syncExplorePctToBPF() {
-        saved := explorePctValue()
-        if saved < 0 || saved > 100 {
-                saved = 5 // default
-        }
+	saved := explorePctValue()
+	if saved < 0 || saved > 100 {
+		saved = 5 // default
+	}
 
-        // Try to read current BPF map value
-        // The pinned map is at /sys/fs/bpftune/tcp_conn/explore
-        // (pinned by the tuner on startup)
-        pinPath := "/sys/fs/bpftune/tcp_conn/explore"
+	// Try to read current BPF map value
+	// The pinned map is at /sys/fs/bpftune/tcp_conn/explore
+	// (pinned by the tuner on startup)
+	pinPath := "/sys/fs/bpftune/tcp_conn/explore"
 
-        // v0.9.86: use raw BPF syscall instead of forking bpftool.
-        // The map key is 4 bytes (uint32 = 0), value is 4 bytes (uint32 = explore_pct).
-        var currentPct int = -1
-        fd, err := bpfOpenPinnedMap(pinPath)
-        if err == nil {
-                key := []byte{0, 0, 0, 0}
-                value := make([]byte, 4)
-                if err := bpfMapLookupElem(fd, key, value); err == nil {
-                        currentPct = int(binary.LittleEndian.Uint32(value))
-                }
-                unix.Close(fd)
-        }
+	// v0.9.86: use raw BPF syscall instead of forking bpftool.
+	// The map key is 4 bytes (uint32 = 0), value is 4 bytes (uint32 = explore_pct).
+	var currentPct int = -1
+	fd, err := bpfOpenPinnedMap(pinPath)
+	if err == nil {
+		key := []byte{0, 0, 0, 0}
+		value := make([]byte, 4)
+		if err := bpfMapLookupElem(fd, key, value); err == nil {
+			currentPct = int(binary.LittleEndian.Uint32(value))
+		}
+		unix.Close(fd)
+	}
 
-        if currentPct < 0 {
-                // Fall back to bpftool if the syscall path failed
-                out, err := exec.Command("bpftool", "map", "lookup", "pinned", pinPath,
-                        "key", "hex", "00 00 00 00").Output()
-                if err != nil {
-                        fmt.Fprintf(os.Stderr, "  explore_pct: could not read BPF map (non-fatal): %v\n", err)
-                        return
-                }
-                // Parse current value from bpftool output
-                lines := strings.Split(string(out), "\n")
-                for _, line := range lines {
-                        if strings.Contains(line, "value:") {
-                                parts := strings.SplitN(line, "value:", 2)
-                                if len(parts) == 2 {
-                                        hexStr := strings.TrimSpace(parts[1])
-                                        hexParts := strings.Fields(hexStr)
-                                        if len(hexParts) > 0 {
-                                                hexVal := hexParts[0]
-                                                hexVal = strings.TrimPrefix(hexVal, "0x")
-                                                if v, err := strconv.ParseUint(hexVal, 16, 32); err == nil {
-                                                        currentPct = int(v)
-                                                }
-                                        }
-                                }
-                                break
-                        }
-                }
-        }
+	if currentPct < 0 {
+		// Fall back to bpftool if the syscall path failed
+		out, err := exec.Command("bpftool", "map", "lookup", "pinned", pinPath,
+			"key", "hex", "00 00 00 00").Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  explore_pct: could not read BPF map (non-fatal): %v\n", err)
+			return
+		}
+		// Parse current value from bpftool output
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "value:") {
+				parts := strings.SplitN(line, "value:", 2)
+				if len(parts) == 2 {
+					hexStr := strings.TrimSpace(parts[1])
+					hexParts := strings.Fields(hexStr)
+					if len(hexParts) > 0 {
+						hexVal := hexParts[0]
+						hexVal = strings.TrimPrefix(hexVal, "0x")
+						if v, err := strconv.ParseUint(hexVal, 16, 32); err == nil {
+							currentPct = int(v)
+						}
+					}
+				}
+				break
+			}
+		}
+	}
 
-        if currentPct == saved {
-                fmt.Fprintf(os.Stderr, "  explore_pct: BPF map already %d%% (OK)\n", saved)
-                return
-        }
+	if currentPct == saved {
+		fmt.Fprintf(os.Stderr, "  explore_pct: BPF map already %d%% (OK)\n", saved)
+		return
+	}
 
-        // Write saved value to BPF map via raw syscall
-        written := false
-        fd2, err := bpfOpenPinnedMap(pinPath)
-        if err == nil {
-                key := []byte{0, 0, 0, 0}
-                value := make([]byte, 4)
-                binary.LittleEndian.PutUint32(value, uint32(saved))
-                if err := bpfMapUpdateElem(fd2, key, value, 0); err == nil {
-                        written = true
-                }
-                unix.Close(fd2)
-        }
-        if !written {
-                // Fall back to bpftool
-                hexVal := fmt.Sprintf("%02x %02x %02x %02x",
-                        byte(saved), byte(saved>>8), byte(saved>>16), byte(saved>>24))
-                err = exec.Command("bpftool", "map", "update", "pinned", pinPath,
-                        "key", "hex", "00 00 00 00",
-                        "value", "hex", hexVal).Run()
-                if err != nil {
-                        fmt.Fprintf(os.Stderr, "  explore_pct: WARNING could not sync %d%% to BPF map: %v\n", saved, err)
-                        return
-                }
-        }
+	// Write saved value to BPF map via raw syscall
+	written := false
+	fd2, err := bpfOpenPinnedMap(pinPath)
+	if err == nil {
+		key := []byte{0, 0, 0, 0}
+		value := make([]byte, 4)
+		binary.LittleEndian.PutUint32(value, uint32(saved))
+		if err := bpfMapUpdateElem(fd2, key, value, 0); err == nil {
+			written = true
+		}
+		unix.Close(fd2)
+	}
+	if !written {
+		// Fall back to bpftool
+		hexVal := fmt.Sprintf("%02x %02x %02x %02x",
+			byte(saved), byte(saved>>8), byte(saved>>16), byte(saved>>24))
+		err = exec.Command("bpftool", "map", "update", "pinned", pinPath,
+			"key", "hex", "00 00 00 00",
+			"value", "hex", hexVal).Run()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  explore_pct: WARNING could not sync %d%% to BPF map: %v\n", saved, err)
+			return
+		}
+	}
 
-        if currentPct >= 0 {
-                fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map %d%% → %d%% (from saved config)\n", currentPct, saved)
-        } else {
-                fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map → %d%% (from saved config)\n", saved)
-        }
+	if currentPct >= 0 {
+		fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map %d%% → %d%% (from saved config)\n", currentPct, saved)
+	} else {
+		fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map → %d%% (from saved config)\n", saved)
+	}
 }
 
 // checkBPFPrograms verifies that the bpftune BPF programs are loaded.
 // Logs a warning if not — the collector will still run (degraded mode)
 // but the dashboard won't show live data.
 func checkBPFPrograms() {
-        out, err := exec.Command("bpftool", "prog", "show").Output()
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "  BPF programs: could not check (bpftool failed): %v\n", err)
-                return
-        }
-        count := strings.Count(string(out), "bpftune")
-        if count == 0 {
-                fmt.Fprintf(os.Stderr, "  BPF programs: WARNING — no bpftune programs loaded! Tuner not running.\n")
-                return
-        }
-        fmt.Fprintf(os.Stderr, "  BPF programs: %d bpftune programs loaded (OK)\n", count)
+	out, err := exec.Command("bpftool", "prog", "show").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  BPF programs: could not check (bpftool failed): %v\n", err)
+		return
+	}
+	count := strings.Count(string(out), "bpftune")
+	if count == 0 {
+		fmt.Fprintf(os.Stderr, "  BPF programs: WARNING — no bpftune programs loaded! Tuner not running.\n")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  BPF programs: %d bpftune programs loaded (OK)\n", count)
 }
 
 // ensureTraceCaptureService ensures the bpftune-met-trace service is
@@ -239,9 +240,10 @@ func checkBPFPrograms() {
 // it, and the health monitor never alerted them.
 //
 // Now we escalate through three levels:
-//   Level 1: log stale → restart trace service (up to 3 times in 15 min)
-//   Level 2: still stale after 3 trace restarts → restart bpftune
-//   Level 3: still stale after bpftune restart → set needs_reboot=true
+//
+//	Level 1: log stale → restart trace service (up to 3 times in 15 min)
+//	Level 2: still stale after 3 trace restarts → restart bpftune
+//	Level 3: still stale after bpftune restart → set needs_reboot=true
 //
 // Only a full machine reboot can fix Level 3. The health monitor sets
 // needs_reboot in service_health so the dashboard can display a warning.
@@ -257,178 +259,180 @@ func checkBPFPrograms() {
 //
 // Returns false if the newest line's ktime <= uptime + 300 (current boot).
 func isLogContentStale(logPath string) bool {
-    data, err := os.ReadFile(logPath)
-    if err != nil || len(data) == 0 {
-        return true // no file or empty = stale
-    }
-    // Get the last non-empty line
-    lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-    var lastLine string
-    for i := len(lines) - 1; i >= 0; i-- {
-        if strings.TrimSpace(lines[i]) != "" {
-            lastLine = lines[i]
-            break
-        }
-    }
-    if lastLine == "" {
-        return true
-    }
-    // Extract ktime from the line (format: ... <secs>.<usecs>: bpf_trace_printk: ...)
-    // Use a simple string search: find the last numeric prefix before ":"
-    idx := strings.Index(lastLine, ": bpf_trace_printk:")
-    if idx < 0 {
-        return true // not a trace_pipe line
-    }
-    // Walk backwards from idx to find the start of the timestamp
-    start := idx
-    for start > 0 {
-        c := lastLine[start-1]
-        if (c >= '0' && c <= '9') || c == '.' {
-            start--
-        } else {
-            break
-        }
-    }
-    tsStr := lastLine[start:idx]
-    ts, err := strconv.ParseFloat(tsStr, 64)
-    if err != nil {
-        return true
-    }
-    uptime := readProcUptime()
-    if uptime <= 0 {
-        return false // can't read uptime, assume not stale
-    }
-    // Stale if ktime > uptime + 300 (from a previous boot)
-    return ts > uptime+300
+	// v0.9.104 H2: tail-only 4KB read. Was os.ReadFile(2-16MB).
+	// The last trace_pipe line is all we need for staleness check.
+	data, err := readTail(logPath, 4096)
+	if err != nil || len(data) == 0 {
+		return true
+	}
+	// Get the last non-empty line
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			lastLine = lines[i]
+			break
+		}
+	}
+	if lastLine == "" {
+		return true
+	}
+	// Extract ktime from the line (format: ... <secs>.<usecs>: bpf_trace_printk: ...)
+	// Use a simple string search: find the last numeric prefix before ":"
+	idx := strings.Index(lastLine, ": bpf_trace_printk:")
+	if idx < 0 {
+		return true // not a trace_pipe line
+	}
+	// Walk backwards from idx to find the start of the timestamp
+	start := idx
+	for start > 0 {
+		c := lastLine[start-1]
+		if (c >= '0' && c <= '9') || c == '.' {
+			start--
+		} else {
+			break
+		}
+	}
+	tsStr := lastLine[start:idx]
+	ts, err := strconv.ParseFloat(tsStr, 64)
+	if err != nil {
+		return true
+	}
+	uptime := readProcUptime()
+	if uptime <= 0 {
+		return false // can't read uptime, assume not stale
+	}
+	// Stale if ktime > uptime + 300 (from a previous boot)
+	return ts > uptime+300
 }
 
 // v0.9.89: clearStaleLog truncates the log file if its content is from a
 // previous boot. Called on collector startup to ensure fresh content.
 func clearStaleLog(logPath string) {
-    if !isLogContentStale(logPath) {
-        return
-    }
-    fmt.Fprintf(os.Stderr, "  log: content is from a previous boot — truncating %s\n", logPath)
-    if err := os.Truncate(logPath, 0); err != nil {
-        fmt.Fprintf(os.Stderr, "  log: truncate failed: %v\n", err)
-    }
+	if !isLogContentStale(logPath) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  log: content is from a previous boot — truncating %s\n", logPath)
+	if err := os.Truncate(logPath, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "  log: truncate failed: %v\n", err)
+	}
 }
 
 func ensureTraceCaptureService() {
-        const serviceName = "bpftune-met-trace"
-        const serviceFilePath = "/etc/systemd/system/bpftune-met-trace.service"
-        const logPath = "/var/log/bpftune-met-live.log"
+	const serviceName = "bpftune-met-trace"
+	const serviceFilePath = "/etc/systemd/system/bpftune-met-trace.service"
+	const logPath = "/var/log/bpftune-met-live.log"
 
-        // Check if the service file exists; create it if missing
-        if _, err := os.Stat(serviceFilePath); os.IsNotExist(err) {
-                fmt.Fprintf(os.Stderr, "  trace service: service file missing, creating it...\n")
-                createTraceServiceFile(serviceFilePath)
-        }
+	// Check if the service file exists; create it if missing
+	if _, err := os.Stat(serviceFilePath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "  trace service: service file missing, creating it...\n")
+		createTraceServiceFile(serviceFilePath)
+	}
 
-        // Check if the service is running
-        out, err := exec.Command("systemctl", "is-active", serviceName).Output()
-        status := strings.TrimSpace(string(out))
-        if err == nil && status == "active" {
-                // v0.9.89: check CONTENT freshness, not just mtime.
-                // The old mtime check was fooled because the trace service
-                // touches the file every cycle even when trace_pipe is empty.
-                var logAge time.Duration
-                if fi, err := os.Stat(logPath); err == nil {
-                        logAge = time.Since(fi.ModTime())
-                }
-                logStale := isLogContentStale(logPath)
+	// Check if the service is running
+	out, err := exec.Command("systemctl", "is-active", serviceName).Output()
+	status := strings.TrimSpace(string(out))
+	if err == nil && status == "active" {
+		// v0.9.89: check CONTENT freshness, not just mtime.
+		// The old mtime check was fooled because the trace service
+		// touches the file every cycle even when trace_pipe is empty.
+		var logAge time.Duration
+		if fi, err := os.Stat(logPath); err == nil {
+			logAge = time.Since(fi.ModTime())
+		}
+		logStale := isLogContentStale(logPath)
 
-                if !logStale {
-                        // Log content is fresh — reset escalation state
-                        traceEscalation.mu.Lock()
-                        traceEscalation.traceRestarts = nil
-                        traceEscalation.bpftuneRestartTried = time.Time{}
-                        traceEscalation.needsReboot = false
-                        traceEscalation.mu.Unlock()
-                        fmt.Fprintf(os.Stderr, "  trace service: active (log content fresh, file %v old) (OK)\n", logAge.Round(time.Second))
-                        return
-                }
+		if !logStale {
+			// Log content is fresh — reset escalation state
+			traceEscalation.mu.Lock()
+			traceEscalation.traceRestarts = nil
+			traceEscalation.bpftuneRestartTried = time.Time{}
+			traceEscalation.needsReboot = false
+			traceEscalation.mu.Unlock()
+			fmt.Fprintf(os.Stderr, "  trace service: active (log content fresh, file %v old) (OK)\n", logAge.Round(time.Second))
+			return
+		}
 
-                // Log content is stale — escalate
-                traceEscalation.mu.Lock()
-                defer traceEscalation.mu.Unlock()
+		// Log content is stale — escalate
+		traceEscalation.mu.Lock()
+		defer traceEscalation.mu.Unlock()
 
-                // Clean up old restart timestamps (> 15 min ago)
-                now := time.Now()
-                var recent []time.Time
-                for _, t := range traceEscalation.traceRestarts {
-                        if now.Sub(t) < 15*time.Minute {
-                                recent = append(recent, t)
-                        }
-                }
-                traceEscalation.traceRestarts = recent
+		// Clean up old restart timestamps (> 15 min ago)
+		now := time.Now()
+		var recent []time.Time
+		for _, t := range traceEscalation.traceRestarts {
+			if now.Sub(t) < 15*time.Minute {
+				recent = append(recent, t)
+			}
+		}
+		traceEscalation.traceRestarts = recent
 
-                if len(recent) < 3 && traceEscalation.bpftuneRestartTried.IsZero() {
-                        // Level 1: restart trace service (haven't tried 3 times yet)
-                        fmt.Fprintf(os.Stderr, "  trace service: log file is %v old — restarting trace service (attempt %d/3)\n",
-                                logAge.Round(time.Minute), len(recent)+1)
-                        exec.Command("systemctl", "restart", serviceName).Run()
-                        traceEscalation.traceRestarts = append(traceEscalation.traceRestarts, now)
-                        return
-                }
+		if len(recent) < 3 && traceEscalation.bpftuneRestartTried.IsZero() {
+			// Level 1: restart trace service (haven't tried 3 times yet)
+			fmt.Fprintf(os.Stderr, "  trace service: log file is %v old — restarting trace service (attempt %d/3)\n",
+				logAge.Round(time.Minute), len(recent)+1)
+			exec.Command("systemctl", "restart", serviceName).Run()
+			traceEscalation.traceRestarts = append(traceEscalation.traceRestarts, now)
+			return
+		}
 
-                if !traceEscalation.bpftuneRestartTried.IsZero() && now.Sub(traceEscalation.bpftuneRestartTried) > 5*time.Minute {
-                        // Level 3: bpftune was restarted > 5 min ago and log is STILL stale.
-                        // The kernel's tracing subsystem is broken. Only a reboot can fix it.
-                        if !traceEscalation.needsReboot {
-                                traceEscalation.needsReboot = true
-                                fmt.Fprintf(os.Stderr, "  trace service: CRITICAL — log still stale after bpftune restart. Kernel tracing may be broken. MANUAL REBOOT RECOMMENDED.\n")
-                        }
-                        return
-                }
+		if !traceEscalation.bpftuneRestartTried.IsZero() && now.Sub(traceEscalation.bpftuneRestartTried) > 5*time.Minute {
+			// Level 3: bpftune was restarted > 5 min ago and log is STILL stale.
+			// The kernel's tracing subsystem is broken. Only a reboot can fix it.
+			if !traceEscalation.needsReboot {
+				traceEscalation.needsReboot = true
+				fmt.Fprintf(os.Stderr, "  trace service: CRITICAL — log still stale after bpftune restart. Kernel tracing may be broken. MANUAL REBOOT RECOMMENDED.\n")
+			}
+			return
+		}
 
-                if traceEscalation.bpftuneRestartTried.IsZero() {
-                        // Level 2: 3 trace service restarts didn't fix it — restart bpftune
-                        fmt.Fprintf(os.Stderr, "  trace service: log still stale after %d trace restarts — escalating: restarting bpftune\n", len(recent))
-                        exec.Command("systemctl", "restart", "bpftune").Run()
-                        traceEscalation.bpftuneRestartTried = now
-                        // Also restart the trace service to pick up the new trace context
-                        time.Sleep(3 * time.Second)
-                        exec.Command("systemctl", "restart", serviceName).Run()
-                        return
-                }
+		if traceEscalation.bpftuneRestartTried.IsZero() {
+			// Level 2: 3 trace service restarts didn't fix it — restart bpftune
+			fmt.Fprintf(os.Stderr, "  trace service: log still stale after %d trace restarts — escalating: restarting bpftune\n", len(recent))
+			exec.Command("systemctl", "restart", "bpftune").Run()
+			traceEscalation.bpftuneRestartTried = now
+			// Also restart the trace service to pick up the new trace context
+			time.Sleep(3 * time.Second)
+			exec.Command("systemctl", "restart", serviceName).Run()
+			return
+		}
 
-                // Between Level 2 and Level 3 — bpftune was restarted recently,
-                // waiting to see if it fixed the log. Will be checked again next cycle.
-                fmt.Fprintf(os.Stderr, "  trace service: waiting for bpftune restart to take effect (log still %v old)\n", logAge.Round(time.Minute))
-                return
-        }
+		// Between Level 2 and Level 3 — bpftune was restarted recently,
+		// waiting to see if it fixed the log. Will be checked again next cycle.
+		fmt.Fprintf(os.Stderr, "  trace service: waiting for bpftune restart to take effect (log still %v old)\n", logAge.Round(time.Minute))
+		return
+	}
 
-        // Service is not running — start it
-        traceEscalation.mu.Lock()
-        traceEscalation.traceRestarts = nil
-        traceEscalation.bpftuneRestartTried = time.Time{}
-        traceEscalation.needsReboot = false
-        traceEscalation.mu.Unlock()
+	// Service is not running — start it
+	traceEscalation.mu.Lock()
+	traceEscalation.traceRestarts = nil
+	traceEscalation.bpftuneRestartTried = time.Time{}
+	traceEscalation.needsReboot = false
+	traceEscalation.mu.Unlock()
 
-        fmt.Fprintf(os.Stderr, "  trace service: %s (status=%s), starting...\n", serviceName, status)
-        exec.Command("systemctl", "daemon-reload").Run()
-        exec.Command("systemctl", "enable", serviceName).Run()
-        err = exec.Command("systemctl", "start", serviceName).Run()
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "  trace service: WARNING could not start: %v\n", err)
-                return
-        }
-        time.Sleep(1 * time.Second)
-        out, _ = exec.Command("systemctl", "is-active", serviceName).Output()
-        status = strings.TrimSpace(string(out))
-        if status == "active" {
-                fmt.Fprintf(os.Stderr, "  trace service: started (OK)\n")
-        } else {
-                fmt.Fprintf(os.Stderr, "  trace service: WARNING still %s after start attempt\n", status)
-        }
+	fmt.Fprintf(os.Stderr, "  trace service: %s (status=%s), starting...\n", serviceName, status)
+	exec.Command("systemctl", "daemon-reload").Run()
+	exec.Command("systemctl", "enable", serviceName).Run()
+	err = exec.Command("systemctl", "start", serviceName).Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  trace service: WARNING could not start: %v\n", err)
+		return
+	}
+	time.Sleep(1 * time.Second)
+	out, _ = exec.Command("systemctl", "is-active", serviceName).Output()
+	status = strings.TrimSpace(string(out))
+	if status == "active" {
+		fmt.Fprintf(os.Stderr, "  trace service: started (OK)\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "  trace service: WARNING still %s after start attempt\n", status)
+	}
 }
 
 // createTraceServiceFile writes the systemd service file for the trace
 // capture service. This service reads trace_pipe and writes to the log
 // file that the collector reads.
 func createTraceServiceFile(path string) {
-        const serviceContent = `[Unit]
+	const serviceContent = `[Unit]
 Description=bpftune trace_pipe capture to /var/log/bpftune-met-live.log
 After=sys-kernel-debug.mount sys-kernel-tracing.mount bpftune.service
 ConditionPathExists=/sys/kernel/debug/tracing/trace_pipe
@@ -443,18 +447,18 @@ User=root
 [Install]
 WantedBy=multi-user.target
 `
-        err := os.WriteFile(path, []byte(serviceContent), 0644)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "  trace service: could not create %s: %v\n", path, err)
-                return
-        }
-        fmt.Fprintf(os.Stderr, "  trace service: created %s\n", path)
+	err := os.WriteFile(path, []byte(serviceContent), 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  trace service: could not create %s: %v\n", path, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  trace service: created %s\n", path)
 
-        // Also ensure the log file exists
-        f, err := os.OpenFile("/var/log/bpftune-met-live.log", os.O_CREATE|os.O_APPEND, 0644)
-        if err == nil {
-                f.Close()
-        }
+	// Also ensure the log file exists
+	f, err := os.OpenFile("/var/log/bpftune-met-live.log", os.O_CREATE|os.O_APPEND, 0644)
+	if err == nil {
+		f.Close()
+	}
 }
 
 // getServiceHealth collects the current health status of all system
@@ -463,81 +467,135 @@ WantedBy=multi-user.target
 //
 // v0.9.46: The dashboard renders this as a visual health panel so users
 // can immediately see if something is wrong.
+// v0.9.104 H1: cache getServiceHealth for 5 min.
+// The original function forks bpftool + 2× systemctl + reads the
+// full 2-16MB log file every cycle. 5-min cache = 10× less work.
+var (
+	serviceHealthCache    map[string]interface{}
+	serviceHealthCacheMu  sync.Mutex
+	serviceHealthCacheTs  time.Time
+	serviceHealthCacheTTL = 5 * time.Minute
+)
+
 func getServiceHealth() map[string]interface{} {
-        health := map[string]interface{}{}
+	serviceHealthCacheMu.Lock()
+	if time.Since(serviceHealthCacheTs) < serviceHealthCacheTTL && serviceHealthCache != nil {
+		out := serviceHealthCache
+		serviceHealthCacheMu.Unlock()
+		return out
+	}
+	serviceHealthCacheMu.Unlock()
+	fresh := getServiceHealthUncached()
+	serviceHealthCacheMu.Lock()
+	serviceHealthCache = fresh
+	serviceHealthCacheTs = time.Now()
+	serviceHealthCacheMu.Unlock()
+	return fresh
+}
 
-        // 1. BPF programs loaded?
-        bpfCount := 0
-        if out, err := exec.Command("bpftool", "prog", "show").Output(); err == nil {
-                bpfCount = strings.Count(string(out), "bpftune")
-        }
-        health["bpf_programs"] = bpfCount
-        health["bpf_programs_ok"] = bpfCount > 0
+func getServiceHealthUncached() map[string]interface{} {
+	health := map[string]interface{}{}
 
-        // 2. bpftune service active?
-        bpftuneActive := "unknown"
-        if out, err := exec.Command("systemctl", "is-active", "bpftune").Output(); err == nil {
-                bpftuneActive = strings.TrimSpace(string(out))
-        }
-        health["bpftune_service"] = bpftuneActive
-        health["bpftune_service_ok"] = bpftuneActive == "active"
+	// 1. BPF programs loaded?
+	bpfCount := 0
+	if out, err := exec.Command("bpftool", "prog", "show").Output(); err == nil {
+		bpfCount = strings.Count(string(out), "bpftune")
+	}
+	health["bpf_programs"] = bpfCount
+	health["bpf_programs_ok"] = bpfCount > 0
 
-        // 3. Trace capture service active?
-        traceActive := "unknown"
-        if out, err := exec.Command("systemctl", "is-active", "bpftune-met-trace").Output(); err == nil {
-                traceActive = strings.TrimSpace(string(out))
-        }
-        health["trace_service"] = traceActive
-        health["trace_service_ok"] = traceActive == "active"
+	// 2. bpftune service active?
+	bpftuneActive := "unknown"
+	if out, err := exec.Command("systemctl", "is-active", "bpftune").Output(); err == nil {
+		bpftuneActive = strings.TrimSpace(string(out))
+	}
+	health["bpftune_service"] = bpftuneActive
+	health["bpftune_service_ok"] = bpftuneActive == "active"
 
-        // 4. Log file freshness
-        logAge := "unknown"
-        logAgeSec := int64(0)
-        if fi, err := os.Stat("/var/log/bpftune-met-live.log"); err == nil {
-                ageSec := int64(time.Since(fi.ModTime()).Seconds())
-                logAgeSec = ageSec
-                if ageSec < 60 {
-                        logAge = fmt.Sprintf("%ds", ageSec)
-                } else if ageSec < 3600 {
-                        logAge = fmt.Sprintf("%dm", ageSec/60)
-                } else {
-                        logAge = fmt.Sprintf("%dh", ageSec/3600)
-                }
-        }
-        health["log_age"] = logAge
-        health["log_age_sec"] = logAgeSec
-        // v0.9.89: use content-based freshness, not just mtime
-        health["log_fresh_ok"] = logAgeSec >= 0 && logAgeSec < 120 && !isLogContentStale("/var/log/bpftune-met-live.log")
+	// 3. Trace capture service active?
+	traceActive := "unknown"
+	if out, err := exec.Command("systemctl", "is-active", "bpftune-met-trace").Output(); err == nil {
+		traceActive = strings.TrimSpace(string(out))
+	}
+	health["trace_service"] = traceActive
+	health["trace_service_ok"] = traceActive == "active"
 
-        // 5. Explore_pct
-        expPct := explorePctValue()
-        health["explore_pct"] = expPct
-        health["explore_pct_ok"] = expPct > 0
+	// 4. Log file freshness
+	logAge := "unknown"
+	logAgeSec := int64(0)
+	if fi, err := os.Stat("/var/log/bpftune-met-live.log"); err == nil {
+		ageSec := int64(time.Since(fi.ModTime()).Seconds())
+		logAgeSec = ageSec
+		if ageSec < 60 {
+			logAge = fmt.Sprintf("%ds", ageSec)
+		} else if ageSec < 3600 {
+			logAge = fmt.Sprintf("%dm", ageSec/60)
+		} else {
+			logAge = fmt.Sprintf("%dh", ageSec/3600)
+		}
+	}
+	health["log_age"] = logAge
+	health["log_age_sec"] = logAgeSec
+	// v0.9.89: use content-based freshness, not just mtime
+	health["log_fresh_ok"] = logAgeSec >= 0 && logAgeSec < 120 && !isLogContentStale("/var/log/bpftune-met-live.log")
 
-        // 6. Trace buffer size
-        bufSize := 0
-        if data, err := os.ReadFile("/sys/kernel/debug/tracing/buffer_size_kb"); err == nil {
-                bufSize, _ = strconv.Atoi(strings.TrimSpace(string(data)))
-        }
-        health["trace_buffer_kb"] = bufSize
-        health["trace_buffer_ok"] = bufSize >= 65536 // 64MB minimum
+	// 5. Explore_pct
+	expPct := explorePctValue()
+	health["explore_pct"] = expPct
+	health["explore_pct_ok"] = expPct > 0
 
-        // 7. v0.9.76: needs_reboot — set by the escalation logic in
-        // ensureTraceCaptureService when the kernel's tracing subsystem is
-        // broken and only a full machine reboot can fix it. The dashboard
-        // should display a prominent warning when this is true.
-        traceEscalation.mu.Lock()
-        health["needs_reboot"] = traceEscalation.needsReboot
-        traceEscalation.mu.Unlock()
+	// 6. Trace buffer size
+	bufSize := 0
+	if data, err := os.ReadFile("/sys/kernel/debug/tracing/buffer_size_kb"); err == nil {
+		bufSize, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+	health["trace_buffer_kb"] = bufSize
+	health["trace_buffer_ok"] = bufSize >= 65536 // 64MB minimum
 
-        // Overall health
-        allOk := health["bpf_programs_ok"].(bool) &&
-                health["bpftune_service_ok"].(bool) &&
-                health["trace_service_ok"].(bool) &&
-                health["log_fresh_ok"].(bool) &&
-                health["explore_pct_ok"].(bool) &&
-                !health["needs_reboot"].(bool)
-        health["all_ok"] = allOk
+	// 7. v0.9.76: needs_reboot — set by the escalation logic in
+	// ensureTraceCaptureService when the kernel's tracing subsystem is
+	// broken and only a full machine reboot can fix it. The dashboard
+	// should display a prominent warning when this is true.
+	traceEscalation.mu.Lock()
+	health["needs_reboot"] = traceEscalation.needsReboot
+	traceEscalation.mu.Unlock()
 
-        return health
+	// Overall health
+	allOk := health["bpf_programs_ok"].(bool) &&
+		health["bpftune_service_ok"].(bool) &&
+		health["trace_service_ok"].(bool) &&
+		health["log_fresh_ok"].(bool) &&
+		health["explore_pct_ok"].(bool) &&
+		!health["needs_reboot"].(bool)
+	health["all_ok"] = allOk
+
+	return health
+}
+
+// v0.9.104 H2: readTail reads the last `budget` bytes of a file efficiently.
+// Avoids reading the full file when only the tail is needed (e.g. log
+// staleness checks on 2-16MB log files).
+func readTail(path string, budget int64) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	size := fi.Size()
+	if size <= budget {
+		return os.ReadFile(path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(size-budget, 0); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, budget)
+	n, err := f.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
 }

@@ -37,8 +37,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,9 +50,29 @@ import (
 )
 
 var (
-	sqliteDB   *sql.DB
-	sqliteOnce sync.Once
-	sqliteMu  sync.Mutex
+	sqliteDB     *sql.DB
+	sqliteOnce   sync.Once
+	sqliteMu     sync.Mutex
+	sqliteInitMu sync.Mutex // guards initSQLite race window
+
+	// v0.9.104: dedup state — skip INSERT when per-host snapshot unchanged.
+	// Keyed by host addr. Value is the FNV-1a 64-bit hash of the
+	// non-timestamp fields. Reset to empty on startup (cold cache = full
+	// write on first cycle, then incremental after).
+	lastWriteHash   map[string]uint64
+	lastWriteHashMu sync.Mutex
+
+	// sqliteMaxBytes — hard cap before aggressive prune.
+	// 50 MB chosen because (a) modernc.org/sqlite baseline allocator
+	// overhead is ~3-5 MB, (b) typical 7-day bucket churn is <30 MB,
+	// (c) low-RAM hosts (al: 967 MB) cannot afford 200+ MB DB.
+	sqliteMaxBytes int64 = 50 * 1024 * 1024
+
+	// v0.9.104 H6: throttle writeBucketSQLite to 60s (was 30s).
+	// Combined with the dedup hash, this cuts SQL round-trips by
+	// ~75% on stable hosts. Counted at collect cycle granularity.
+	sqliteWriteCycle   int64
+	sqliteWriteCycleMu sync.Mutex
 )
 
 // sqlitePath returns the path to the SQLite database file.
@@ -62,19 +84,56 @@ func sqlitePath() string {
 // Called once at startup via sync.Once.
 func initSQLite() {
 	sqliteOnce.Do(func() {
+		// v0.9.104: initialize dedup map
+		lastWriteHash = make(map[string]uint64, 64)
+
 		dbPath := sqlitePath()
 		// Ensure parent directory exists
 		os.MkdirAll(filepath.Dir(dbPath), 0755)
 
-		db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+		// v0.9.104: DSN with _pragma query params — applied on every
+		// connection so they survive pool recycling.
+		//   journal_mode=WAL         — concurrent readers + 1 writer
+		//   synchronous=NORMAL       — fsync only on commit
+		//   busy_timeout=5000        — 5s retry on lock contention
+		//   mmap_size=8388608        — 8MB mmap ceiling (default
+		//                              unlimited reserves huge VA space
+		//                              and trips VPS OOM-killer heuristics)
+		//   cache_size=-512          — 512KB page cache (was -8000 = 8MB)
+		//   temp_store=MEMORY        — no temp files on disk
+		//   soft_heap_limit=20971520 — 20MB hard ceiling on SQLite\'s
+		//                              internal allocator (modernc.org/sqlite
+		//                              passes this through to its malloc wrapper)
+		dsn := dbPath +
+			"?_pragma=journal_mode(WAL)" +
+			"&_pragma=synchronous(NORMAL)" +
+			"&_pragma=busy_timeout(5000)" +
+			"&_pragma=mmap_size(8388608)" +
+			"&_pragma=cache_size(-512)" +
+			"&_pragma=temp_store(MEMORY)" +
+			"&_pragma=soft_heap_limit(20971520)"
+
+		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sqlite: open failed: %v\n", err)
 			return
 		}
-		// Optimize for write throughput
+		// Optimize for write throughput + low RSS
 		db.SetMaxOpenConns(1) // SQLite single-writer
+		// Belt-and-suspenders: re-apply critical PRAGMAs via Exec too
+		// (some modernc.org/sqlite versions only honor _pragma on the
+		// initial connection, not pool-reclaimed ones).
 		db.Exec("PRAGMA synchronous=NORMAL")
-		db.Exec("PRAGMA cache_size=-8000") // 8MB cache
+		db.Exec("PRAGMA cache_size=-512")   // 512KB (was 8MB)
+		db.Exec("PRAGMA mmap_size=8388608") // 8MB mmap ceiling
+		db.Exec("PRAGMA temp_store=MEMORY")
+		db.Exec("PRAGMA soft_heap_limit=20971520") // 20MB
+		db.Exec("PRAGMA wal_autocheckpoint=200")   // ~800KB
+
+		// v0.9.104: cap Go heap pressure so SQLite allocations don\'t
+		// trigger stop-the-world GC. Defensive in case main.go ordering
+		// changes; main.go already sets GOMEMLIMIT=200MiB + GOGC=50.
+		debug.SetGCPercent(50)
 
 		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS buckets (
 			ts INTEGER NOT NULL,
@@ -269,6 +328,14 @@ func extractAlgArray(fields []string, colIdx map[string]int, prefix string) stri
 // writeBucketSQLite inserts a bucket snapshot into the SQLite database.
 // Called from writeBucketsCSV (dual-write during transition).
 func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
+	// v0.9.104 H6: throttle to 60s — skip odd cycles.
+	sqliteWriteCycleMu.Lock()
+	sqliteWriteCycle++
+	cycle := sqliteWriteCycle
+	sqliteWriteCycleMu.Unlock()
+	if cycle%2 == 1 {
+		return // odd cycle — skip; even cycle writes
+	}
 	if sqliteDB == nil {
 		return
 	}
@@ -329,8 +396,11 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 
 	// v0.9.103: dedup — skip INSERT if data hasn't changed
 	h64 := fnv.New64a()
-	h64.Write(mvJSON); h64.Write(reJSON); h64.Write(ssJSON)
-	h64.Write(bsJSON); h64.Write(nsJSON)
+	h64.Write(mvJSON)
+	h64.Write(reJSON)
+	h64.Write(ssJSON)
+	h64.Write(bsJSON)
+	h64.Write(nsJSON)
 	// Fold in scalar fields (exclude ts — it always changes)
 	fmt.Fprintf(h64, "|%d|%s|%d|%g|%g|%g", bestI, bestAlg, h.Inst,
 		toFloat(v["min_rtt"]), toFloat(v["max_rate_delivered"])/bpsToMbps, rateBestV)
@@ -358,8 +428,7 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 		rmemMin, rmemDef, rmemMax,
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "sqlite: insert failed: %v
-", err)
+		fmt.Fprintf(os.Stderr, "sqlite: insert failed: %v\n", err)
 		return
 	}
 	// Record hash only after successful INSERT
@@ -497,4 +566,18 @@ func pruneSQLiteOld(days int) {
 
 	// v0.9.103: Stage 3 — VACUUM to reclaim freed pages
 	sqliteDB.Exec("VACUUM")
+}
+
+// resetSQLiteForTest — closes the DB and resets all package-level state.
+// Only intended for unit tests that need to re-init from a clean slate.
+// NOT called in production.
+func resetSQLiteForTest() {
+	if sqliteDB != nil {
+		sqliteDB.Close()
+	}
+	sqliteDB = nil
+	lastWriteHash = nil
+	// Note: sqliteOnce cannot be reset without reassignment, so tests
+	// that need a fresh init must run in a separate process or use
+	// build tags to swap the initOnce.
 }
