@@ -478,6 +478,24 @@ EOF
         LOG_AGE=$(($(date +%s) - $(stat -c %Y /var/log/bpftune-met-live.log)))
         printf "  log freshness: %ds old (target: < 5s)\n" "$LOG_AGE"
     fi
+
+    # v0.9.104 cache-invalidation fix: the dashboard collector's
+    # getServiceHealth() result is cached for 5 minutes (added in v0.9.104
+    # to reduce CPU). If the collector restarted in Step 2 BEFORE the trace
+    # service was fixed in Step 3, the first collect() cycle would have
+    # cached the STALE log freshness (mtime was still old at that moment).
+    # The cache would then show stale data for 5 minutes despite the trace
+    # service now being healthy.
+    #
+    # Fix: restart the collector AFTER the trace service is fixed. This
+    # invalidates the cache, and the first collect() cycle (within ~30s)
+    # reads the now-fresh file mtime and caches the correct value.
+    printf "  restarting collector to invalidate service_health cache...\n"
+    systemctl restart bpftune-collector-go 2>/dev/null || true
+    sleep 5
+    if systemctl is-active bpftune-collector-go >/dev/null 2>&1; then
+        ok "collector restarted (cache invalidated, will read fresh log mtime on next collect)"
+    fi
 fi
 
 # ---------- Summary ----------
