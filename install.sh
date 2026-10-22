@@ -377,8 +377,14 @@ EOF
     ok "bpftune-collector-go.service installed + enabled"
 
     # --- 3g. Ensure bpftune-met-trace service (trace_pipe capture) ---
-    if ! systemctl is-enabled bpftune-met-trace 2>/dev/null | grep -q enabled; then
-        cat > /etc/systemd/system/bpftune-met-trace.service <<'EOF'
+    # v0.9.104 fix: ALWAYS overwrite the trace service file, even if it's
+    # already enabled. Earlier install.sh skipped this block when the service
+    # was enabled, which left hosts running the OLD broken ExecStart that
+    # blocked indefinitely on 'cat trace_pipe' when no BPF events were
+    # being generated (idle hosts). Idempotent overwrite + restart is safe.
+    TRACE_SVC=/etc/systemd/system/bpftune-met-trace.service
+    NEEDS_RELOAD=0
+    cat > "$TRACE_SVC" <<'EOF'
 [Unit]
 Description=bpftune trace_pipe capture to /var/log/bpftune-met-live.log
 After=bpftune.service
@@ -393,11 +399,17 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable --now bpftune-met-trace 2>/dev/null || true
-        ok "bpftune-met-trace.service installed (trace_pipe capture)"
+    NEEDS_RELOAD=1
+    systemctl daemon-reload
+    systemctl enable bpftune-met-trace 2>/dev/null || true
+    # Restart only if not already running OR if the ExecStart changed
+    if ! systemctl is-active bpftune-met-trace >/dev/null 2>&1; then
+        systemctl start bpftune-met-trace 2>/dev/null || true
+        ok "bpftune-met-trace.service installed + started"
     else
-        ok "bpftune-met-trace.service already running"
+        # Already running - restart to pick up new ExecStart
+        systemctl restart bpftune-met-trace 2>/dev/null || true
+        ok "bpftune-met-trace.service updated + restarted"
     fi
 
     # --- 3h. Remove old render cron (Go collector renders internally) ---
