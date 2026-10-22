@@ -293,12 +293,24 @@ if [ "$DO_DASHBOARD" = 1 ]; then
     DASH_TAG=""
 
     printf "  checking GitHub releases for bpftune-dashboard-%s...\n" "$ARCH"
-    DASH_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null | \
-        python3 -c "
+    # v0.9.104 fix: distinguish "API call failed" from "release not found"
+    # so we know whether to retry or fall back. Save API response to a temp
+    # file so we can inspect it if parsing fails.
+    API_TMP=$(mktemp /tmp/bpftune-releases.XXXXXX.json)
+    API_HTTP=$(curl -sSL -w "%{http_code}" -o "$API_TMP" \
+        "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null || echo 000)
+    if [ "$API_HTTP" != "200" ]; then
+        warn "GitHub API returned HTTP $API_HTTP (rate-limited? network down? cache lag?)"
+        warn "if this is right after a fresh release, wait 2-5 min for CDN cache to refresh"
+        rm -f "$API_TMP"
+    else
+        DASH_TAG=$(python3 -c "
 import json, sys, re
 try:
-    releases = json.load(sys.stdin)
-except Exception:
+    with open('$API_TMP') as f:
+        releases = json.load(f)
+except Exception as e:
+    sys.stderr.write(f'parse failed: {e}\n')
     sys.exit(0)
 candidates = []
 for r in releases:
@@ -312,10 +324,15 @@ for r in releases:
             candidates.append((ver_tuple, r['tag_name']))
             break
 if not candidates:
+    # List what tags we DID see, for debugging
+    tags = [r.get('tag_name','?') for r in releases[:5]]
+    sys.stderr.write(f'no matching release. saw tags: {tags}\n')
     sys.exit(0)
 candidates.sort(key=lambda c: c[0], reverse=True)
 print(candidates[0][1])
-" 2>/dev/null || true)
+" 2>&1 || true)
+        rm -f "$API_TMP"
+    fi
 
     if [ -n "$DASH_TAG" ]; then
         BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-dashboard-${ARCH}"
@@ -339,6 +356,9 @@ print(candidates[0][1])
         fi
     else
         warn "no GitHub release with bpftune-dashboard-$ARCH asset found"
+        warn "  this is normal right after a new release (CDN cache lag of 2-5 min)"
+        warn "  or you may be rate-limited (unauthenticated API: 60 req/hour per IP)"
+        warn "  will try source build or keep existing binary"""
     fi
 
     # --- 2c. Fallback: build from source if Go is installed ---
