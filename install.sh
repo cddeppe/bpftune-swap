@@ -386,7 +386,7 @@ Wants=bpftune.service
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'while true; do cat /sys/kernel/tracing/trace_pipe >> /var/log/bpftune-met-live.log 2>&1; sleep 0.1; done'
+ExecStart=/bin/sh -c 'while true; do timeout 1 cat /sys/kernel/tracing/trace_pipe >> /var/log/bpftune-met-live.log 2>/dev/null; touch /var/log/bpftune-met-live.log; sleep 1; done'
 Restart=always
 RestartSec=3
 
