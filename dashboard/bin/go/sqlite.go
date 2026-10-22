@@ -327,6 +327,22 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 	bsJSON, _ := json.Marshal(bs)
 	nsJSON, _ := json.Marshal(ns)
 
+	// v0.9.103: dedup — skip INSERT if data hasn't changed
+	h64 := fnv.New64a()
+	h64.Write(mvJSON); h64.Write(reJSON); h64.Write(ssJSON)
+	h64.Write(bsJSON); h64.Write(nsJSON)
+	// Fold in scalar fields (exclude ts — it always changes)
+	fmt.Fprintf(h64, "|%d|%s|%d|%g|%g|%g", bestI, bestAlg, h.Inst,
+		toFloat(v["min_rtt"]), toFloat(v["max_rate_delivered"])/bpsToMbps, rateBestV)
+	snapHash := h64.Sum64()
+
+	lastWriteHashMu.Lock()
+	prev, seen := lastWriteHash[h.Addr]
+	lastWriteHashMu.Unlock()
+	if seen && prev == snapHash {
+		return // data unchanged — skip INSERT
+	}
+
 	sqliteMu.Lock()
 	defer sqliteMu.Unlock()
 	_, err := sqliteDB.Exec(
@@ -342,8 +358,14 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 		rmemMin, rmemDef, rmemMax,
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "sqlite: insert failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "sqlite: insert failed: %v
+", err)
+		return
 	}
+	// Record hash only after successful INSERT
+	lastWriteHashMu.Lock()
+	lastWriteHash[h.Addr] = snapHash
+	lastWriteHashMu.Unlock()
 }
 
 // readBucketsFromSQLite queries bucket snapshots for a given bucket_id and
@@ -453,6 +475,8 @@ func pruneSQLiteOld(days int) {
 	cutoff := time.Now().Unix() - int64(days*86400)
 	sqliteMu.Lock()
 	defer sqliteMu.Unlock()
+
+	// Stage 1: age-based prune
 	result, err := sqliteDB.Exec("DELETE FROM buckets WHERE ts < ?", cutoff)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sqlite: prune failed: %v\n", err)
@@ -461,4 +485,16 @@ func pruneSQLiteOld(days int) {
 	if n, _ := result.RowsAffected(); n > 0 {
 		fmt.Fprintf(os.Stderr, "sqlite: pruned %d rows older than %d days\n", n, days)
 	}
+
+	// v0.9.103: Stage 2 — hard cap at 50MB
+	if fi, err := os.Stat(sqlitePath()); err == nil && fi.Size() > sqliteMaxBytes {
+		hourCutoff := time.Now().Unix() - 3600
+		sqliteDB.Exec("DELETE FROM buckets WHERE ts < ?", hourCutoff)
+		sqliteDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		fmt.Fprintf(os.Stderr, "sqlite: size cap triggered (%dMB > %dMB) — pruned to 1h\n",
+			fi.Size()/1024/1024, sqliteMaxBytes/1024/1024)
+	}
+
+	// v0.9.103: Stage 3 — VACUUM to reclaim freed pages
+	sqliteDB.Exec("VACUUM")
 }
