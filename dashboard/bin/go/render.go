@@ -131,9 +131,13 @@ func (c *Collector) renderSlowToDisk() {
         hist.streamedSeries = streamCSVToSeries(bucketIDs)
         hist.mu.Unlock()
 
-        	// v0.9.99: keep streamedSeries cached between renderSlowToDisk calls
-	// for instant HTTP serving. Previously this was nil'd to free memory,
-	// but that forced a full CSV re-read every 30 min.
+        	// v0.9.101: reverted v0.9.99 incremental reader (caused memory leak).
+	// Free streamedSeries after render to prevent memory growth.
+	defer func() {
+		hist.mu.Lock()
+		hist.streamedSeries = nil
+		hist.mu.Unlock()
+	}()
 
         // v0.9.5: MERGE not REPLACE.  Read the existing bucket_*.json
         // file first, preserve its 30d/all series, then update only
