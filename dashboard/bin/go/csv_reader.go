@@ -571,6 +571,20 @@ func streamCSVToSeries(bucketIDs []string) map[string]map[string]map[string]inte
 
 	streamBinsOffset = currentOffset
 
+	// v0.9.100: Prune cache if too large (prevents memory leak on low-RAM hosts)
+	totalBins := 0
+	for _, ranges := range streamBinsCache {
+		for _, bins := range ranges {
+			totalBins += len(bins)
+		}
+	}
+	if totalBins > 50000 {
+		os.Stderr.WriteString("streamCSVToSeries: cache pruning " + strconv.Itoa(totalBins) +
+			" bins (limit 50000) — next call will full-rebuild\n")
+		streamBinsCache = nil
+		streamBinsOffset = 0
+	}
+
 	mode := "incremental"
 	if needFullRebuild {
 		mode = "full-rebuild"
