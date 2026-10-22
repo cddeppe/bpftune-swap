@@ -16,9 +16,13 @@
 # Force-push-safe: uses `git fetch + git reset --hard` instead of `git pull --rebase`
 #                  so a force-push on the remote dashboard branch doesn't break updates.
 #
-# Remote one-shot:
-#   sudo bash <(curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/update.sh)
+# Remote one-shot (matches README):
+#   curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/update.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/update.sh | sudo bash -s -- --dashboard-only
 #
+#   NOTE: do NOT use `sudo bash <(curl ...)` process substitution -
+#   sudo closes fd >= 3 by default, so /dev/fd/63 doesn't exist
+#   inside the bash that sudo launches. The pipe form above is correct.
 # Optional env overrides:
 #   BPFTUNE_REPO=cddeppe/bpftune-swap   (default; for forks)
 #   BPFTUNE_BRANCH=dashboard             (default; for forks using different branch name)
