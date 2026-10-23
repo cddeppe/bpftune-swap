@@ -24,13 +24,21 @@ package main
 //     Now CSV writes the labeled form and CSV reads use the stored
 //     label as-is (no re-resolve), so historical data accumulates
 //     under a single key per bucket.
+//
+// v0.9.108-lean changes (pure performance, byte-identical output):
+//   - readLogTailCached(): incremental tail cache (no 8MB disk re-read +
+//     string rebuild every cycle when nothing changed)
+//   - buildDocRaw(): marshal each document key ONCE per cycle (was 3-4x:
+//     writeCurrentJSON + computeKeyHashes + notifySSE assembly)
+//   - rebuildBucketLiveFromRing(): typed slices instead of []interface{}
+//     boxing; per-host column maps only built when snapshots exist
 
 import (
-	"fmt"
-	"os"
-	"sort"
-	"strings"
-	"time"
+        "fmt"
+        "os"
+        "sort"
+        "strings"
+        "time"
 )
 
 // collect is the per-cycle collection pipeline. Runs every 30s.
@@ -42,228 +50,235 @@ import (
 // bucket_live, live_leaders) and CSV appends. This prevents the frontend
 // from freezing for 30+ seconds on a transient bpftool failure.
 func (c *Collector) collect() {
-	cycleCount++ // v0.9.25: increment cycle counter (was never incremented — throttle was dead)
-	now := time.Now().Unix()
+        cycleCount++  // v0.9.25: increment cycle counter (was never incremented — throttle was dead)
+        now := time.Now().Unix()
 
-	// v0.9.41: ensure cookie_dest map is loaded BEFORE readBPFMap()
-	// so v6ToV4Label() can cross-reference v6 entries to v4 labels.
-	// Without this, the first readBPFMap() call has a nil cookieDestDiskMap
-	// and all v6 entries stay as "v6:xxxx" instead of merging with v4.
-	ensureCookieDestLoaded()
+        // v0.9.41: ensure cookie_dest map is loaded BEFORE readBPFMap()
+        // so v6ToV4Label() can cross-reference v6 entries to v4 labels.
+        // Without this, the first readBPFMap() call has a nil cookieDestDiskMap
+        // and all v6 entries stay as "v6:xxxx" instead of merging with v4.
+        ensureCookieDestLoaded()
 
-	hosts, err := readBPFMap()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "collector: BPF map read failed (degraded mode): %v\n", err)
-		hosts = nil // degraded mode — log panels still update
-	}
+        hosts, err := readBPFMap()
+        if err != nil {
+                fmt.Fprintf(os.Stderr, "collector: BPF map read failed (degraded mode): %v\n", err)
+                hosts = nil // degraded mode — log panels still update
+        }
 
-	// ----- Parse log tail ONCE for the entire cycle ---------------------
-	// v0.9.9: single-pass parser — eliminates 8 redundant strings.Split
-	// calls on the 2-16MB log tail. Was: parseSwapsMetsSrates +
-	// cookieDestMap + buildRecentProofRows + proofEvents +
-	// buildProofsRawEvents + buildRate + buildBucketIPs + readBPFClock
-	// = 9 scans × 237K lines = 2.1M allocations per cycle.
-	// Now: 1 scan, all data extracted into parsedLog struct.
-	logText := readLogTail(collectorMode.LogTailBytes)
-	pl := parseLogSinglePass(logText)
-	allSwaps := pl.Swaps
-	allMets := pl.MetByCookie
-	allSrates := pl.SrateByCookie
-	// v0.9.0: persist cookie→dest map across cycles so proofs with
-	// cookies established before the 2 MB log tail still get a dest.
-	cdest := persistCookieDest(pl.Cdest)
+        // ----- Parse log tail ONCE for the entire cycle ---------------------
+        // v0.9.9: single-pass parser — eliminates 8 redundant strings.Split
+        // calls on the 2-16MB log tail. Was: parseSwapsMetsSrates +
+        // cookieDestMap + buildRecentProofRows + proofEvents +
+        // buildProofsRawEvents + buildRate + buildBucketIPs + readBPFClock
+        // = 9 scans × 237K lines = 2.1M allocations per cycle.
+        // Now: 1 scan, all data extracted into parsedLog struct.
+        // v0.9.108: incremental tail cache — unchanged files are not
+        // re-read and the assembled string is reused when nothing changed.
+        logText := readLogTailCached(collectorMode.LogTailBytes)
+        pl := parseLogSinglePass(logText)
+        allSwaps := pl.Swaps
+        allMets := pl.MetByCookie
+        allSrates := pl.SrateByCookie
+        // v0.9.0: persist cookie→dest map across cycles so proofs with
+        // cookies established before the 2 MB log tail still get a dest.
+        cdest := persistCookieDest(pl.Cdest)
 
-	// ----- Build live buckets + metric_by_bucket + bucket_live ---------
-	buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
+        // ----- Build live buckets + metric_by_bucket + bucket_live ---------
+        buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
 
-	// v0.9.36: build route health ONCE — was called twice (line 97 + line 104).
-	// This halves the work for the route health panel which iterates all hosts.
-	routeHealth := buildRouteHealth(hosts, metricByBucket)
+        // v0.9.36: build route health ONCE — was called twice (line 97 + line 104).
+        // This halves the work for the route health panel which iterates all hosts.
+        routeHealth := buildRouteHealth(hosts, metricByBucket)
 
-	// ----- Build current.json document -----------------------------------
-	doc := map[string]interface{}{
-		"generated_ts": now,
-		"degraded":     err != nil, // A4-fix: signal degraded mode to frontend
-		"build": map[string]interface{}{
-			"version":          bpftuneVersion(),
-			"dash_version":     dashVersion(),
-			"service":          bpftuneServiceActive(),
-			"uptime_min":       uptimeMin(),
-			"started_utc":      startedUTC(),
-			"log_path":         "/var/log/bpftune-met-live.log",
-			"prefix4":          prefix4Value(),
-			"prefix6":          prefix6Value(),
-			"explore_pct":      explorePctValue(),
-			"proof_good_bps":   proofGoodBpsValue(),
-			"proof_proved_bps": proofProvedBpsValue(),
-		},
-		"system":           readSystemInfo(),
-		"buckets":          buckets,
-		"metric_by_bucket": metricByBucket,
-		"bucket_live":      bucketLive,
-		"live_leaders":     liveLeaders,
-		"hostname":         readProc("/proc/sys/kernel/hostname"),
-		"now_mono":         nowMono(pl.MaxTs),
-		"route_health":     routeHealth,
-		"service_health":   getServiceHealth(),
-	}
+        // ----- Build current.json document -----------------------------------
+        doc := map[string]interface{}{
+                "generated_ts": now,
+                "degraded":     err != nil, // A4-fix: signal degraded mode to frontend
+                "build": map[string]interface{}{
+                        "version":          bpftuneVersion(),
+                        "dash_version":     dashVersion(),
+                        "service":          bpftuneServiceActive(),
+                        "uptime_min":       uptimeMin(),
+                        "started_utc":      startedUTC(),
+                        "log_path":         "/var/log/bpftune-met-live.log",
+                        "prefix4":          prefix4Value(),
+                        "prefix6":          prefix6Value(),
+                        "explore_pct":      explorePctValue(),
+                        "proof_good_bps":   proofGoodBpsValue(),
+                        "proof_proved_bps": proofProvedBpsValue(),
+                },
+                "system":           readSystemInfo(),
+                "buckets":          buckets,
+                "metric_by_bucket": metricByBucket,
+                "bucket_live":      bucketLive,
+                "live_leaders":     liveLeaders,
+                "hostname":         readProc("/proc/sys/kernel/hostname"),
+                "now_mono":         nowMono(pl.MaxTs),
+                "route_health":     routeHealth,
+                "service_health":   getServiceHealth(),
+        }
 
-	// ----- Log-derived panels (single parse, multiple consumers) --------
-	// v0.9.9: set currentParsedLog so buildLogPanels uses the single-pass
-	// parsed data instead of re-scanning text 4 more times.
-	currentParsedLog = pl
-	defer func() { currentParsedLog = nil }()
+        // ----- Log-derived panels (single parse, multiple consumers) --------
+        // v0.9.9: set currentParsedLog so buildLogPanels uses the single-pass
+        // parsed data instead of re-scanning text 4 more times.
+        currentParsedLog = pl
+        defer func() { currentParsedLog = nil }()
 
-	topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText, now)
+        topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText, now)
 
-	// v0.7.6: streak writeback — patch BPF map bad_streak/null_streak from
-	// sustained outcomes (60-300s after swap). Mirrors deleted Python
-	// streak_writeback.py. Async to avoid blocking the 30s collect cycle.
-	// v0.9.89: run every 2nd cycle (60s) — was every 4th (2 min).
-	// Safe now that v0.9.86 uses raw BPF syscalls.
-	if cycleCount%2 == 0 {
-		go c.writebackStreaks(allSwaps, allMets, allSrates)
-	}
-	doc["recent_swaps"] = topSwaps
-	doc["recent_proofs"] = topProofs
-	doc["swap_outcomes"] = swapOutcomes
-	doc["bucket_ips"] = bucketIPs
-	doc["log_window"] = logWindow
-	doc["proofs_raw"] = pl.GetProofsRawEvents(cdest)
-	doc["proof"] = proofsRaw
+        // v0.7.6: streak writeback — patch BPF map bad_streak/null_streak from
+        // sustained outcomes (60-300s after swap). Mirrors deleted Python
+        // streak_writeback.py. Async to avoid blocking the 30s collect cycle.
+        // v0.9.89: run every 2nd cycle (60s) — was every 4th (2 min).
+        // Safe now that v0.9.86 uses raw BPF syscalls.
+        if cycleCount % 2 == 0 {
+                go c.writebackStreaks(allSwaps, allMets, allSrates)
+        }
+        doc["recent_swaps"] = topSwaps
+        doc["recent_proofs"] = topProofs
+        doc["swap_outcomes"] = swapOutcomes
+        doc["bucket_ips"] = bucketIPs
+        doc["log_window"] = logWindow
+        doc["proofs_raw"] = pl.GetProofsRawEvents(cdest)
+        doc["proof"] = proofsRaw
 
-	// ----- Other data panels (reuse parsed log results) ----------------
-	// v0.9.6: fall back to CSVs when the log tail is sparse, so churn
-	// and divergence panels always show data after a restart.
-	churnResult := buildChurnFromParsed(allSwaps)
-	if collectorMode.CSVFallback && len(allSwaps) < 50 {
-		csvChurn := buildChurnFromCSV(200)
-		csvTotal := toInt(csvChurn["total"])
-		logTotal := toInt(churnResult["total"])
-		if csvTotal > logTotal {
-			churnResult = csvChurn
-		}
-	}
-	doc["churn"] = churnResult
-	// v0.9.7: rate progression now falls back to midsamp.csv when the
-	// log tail is sparse, so the panel always shows data after restart.
-	// v0.9.9: use single-pass parsed midsamp data instead of re-scanning text.
-	rateResult := pl.GetRate()
-	if collectorMode.CSVFallback && len(rateResult) == 0 {
-		csvRate := buildRateFromCSVCached()
-		if len(csvRate) > 0 {
-			rateResult = csvRate
-		}
-	}
-	doc["rate"] = rateResult
-	// v0.9.23: add rate_raw for bucket filtering in the frontend.
-	// proofs_raw already exists; rate_raw was missing, causing the
-	// rate progression panel to go empty when a specific bucket
-	// was selected (frontend's _filterByBucket looks for rate_raw).
-	doc["rate_raw"] = pl.GetRateRaw()
-	// v0.9.88: divergence panel was removed in v0.9.82; skip computation
-	doc["tunables"] = buildTunables()
+        // ----- Other data panels (reuse parsed log results) ----------------
+        // v0.9.6: fall back to CSVs when the log tail is sparse, so churn
+        // and divergence panels always show data after a restart.
+        churnResult := buildChurnFromParsed(allSwaps)
+        if collectorMode.CSVFallback && len(allSwaps) < 50 {
+                csvChurn := buildChurnFromCSV(200)
+                csvTotal := toInt(csvChurn["total"])
+                logTotal := toInt(churnResult["total"])
+                if csvTotal > logTotal {
+                        churnResult = csvChurn
+                }
+        }
+        doc["churn"] = churnResult
+        // v0.9.7: rate progression now falls back to midsamp.csv when the
+        // log tail is sparse, so the panel always shows data after restart.
+        // v0.9.9: use single-pass parsed midsamp data instead of re-scanning text.
+        rateResult := pl.GetRate()
+        if collectorMode.CSVFallback && len(rateResult) == 0 {
+                csvRate := buildRateFromCSVCached()
+                if len(csvRate) > 0 {
+                        rateResult = csvRate
+                }
+        }
+        doc["rate"] = rateResult
+        // v0.9.23: add rate_raw for bucket filtering in the frontend.
+        // proofs_raw already exists; rate_raw was missing, causing the
+        // rate progression panel to go empty when a specific bucket
+        // was selected (frontend's _filterByBucket looks for rate_raw).
+        doc["rate_raw"] = pl.GetRateRaw()
+        // v0.9.88: divergence panel was removed in v0.9.82; skip computation
+        doc["tunables"] = buildTunables()
 
-	// ----- Capture snapshots for the in-memory ring buffer --------------
-	captureSnapshotsFromBPF(hosts, now)
+        // ----- Capture snapshots for the in-memory ring buffer --------------
+        captureSnapshotsFromBPF(hosts, now)
 
-	// ----- Rebuild bucket_live from ring buffer (full 1h time series) --
-	// This replaces the single-point bucketLive built above with the
-	// real time-series from the ring buffer.
-	rebuildBucketLiveFromRing(bucketLive, hosts, now)
+        // ----- Rebuild bucket_live from ring buffer (full 1h time series) --
+        // This replaces the single-point bucketLive built above with the
+        // real time-series from the ring buffer.
+        rebuildBucketLiveFromRing(bucketLive, hosts, now)
 
-	// ----- Write CSV + SQLite rows (write labeled form; reader trusts label) ----
-	// v0.9.9: throttle buckets.csv writes to every 2nd cycle (every ~60s
-	// instead of ~30s). The ring buffer already captures 30s resolution
-	// for the 1h chart, so the CSV only needs 60s resolution for the
-	// 24h+ charts. Halves CSV write CPU and file growth.
-	//
-	// v0.9.10: dual-write to SQLite — SQLite gets every cycle (30s res),
-	// CSV gets every 2nd cycle (60s res for backward compat). Eventually
-	// CSV will be phased out.
-	// v0.9.33: throttle CSV writes to every Nth cycle when configured.
-	// Default (normal mode): N=1, every cycle. normal-light: N=2, every 60s.
-	csvN := collectorMode.CSVWriteEveryN
-	if csvN <= 0 {
-		csvN = 1
-	}
-	doCSV := (cycleCount % csvN) == 0
+        // ----- Write CSV + SQLite rows (write labeled form; reader trusts label) ----
+        // v0.9.9: throttle buckets.csv writes to every 2nd cycle (every ~60s
+        // instead of ~30s). The ring buffer already captures 30s resolution
+        // for the 1h chart, so the CSV only needs 60s resolution for the
+        // 24h+ charts. Halves CSV write CPU and file growth.
+        //
+        // v0.9.10: dual-write to SQLite — SQLite gets every cycle (30s res),
+        // CSV gets every 2nd cycle (60s res for backward compat). Eventually
+        // CSV will be phased out.
+        // v0.9.33: throttle CSV writes to every Nth cycle when configured.
+        // Default (normal mode): N=1, every cycle. normal-light: N=2, every 60s.
+        csvN := collectorMode.CSVWriteEveryN
+        if csvN <= 0 { csvN = 1 }
+        doCSV := (cycleCount % csvN) == 0
 
-	if doCSV {
-		if sqliteDB != nil {
-			rmemMin, rmemDef, rmemMax := readTcpRmem()
-			for _, h := range hosts {
-				if h.Inst < 2 {
-					continue
-				}
-				writeBucketSQLite(h, now, rmemMin, rmemDef, rmemMax)
-			}
-		}
-		if cycleCount%2 == 0 {
-			writeBucketsCSV(hosts, now)
-		}
-	}
-	// v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
-	// Mirrors Python _resolve_pending enrichment logic.
-	enrichSwapsForCSV(allSwaps, allMets, allSrates, cdest)
-	if doCSV {
-		writeSwapsCSV(allSwaps, now)
-		writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
-		// v0.9.24: write midsamp.csv from parsed events (was never called!)
-		if len(pl.MidsampRows) > 0 {
-			midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
-			for _, mr := range pl.MidsampRows {
-				midsampEvents = append(midsampEvents, midsampEvent{
-					Ts:     float64(now),
-					Thr:    mr.Thr,
-					Srate:  mr.Srate,
-					Rport:  mr.Rport,
-					Alg:    -1,
-					Cookie: 0,
-				})
-			}
-			writeMidsampCSV(midsampEvents, now)
-		}
+        if doCSV {
+                if sqliteDB != nil {
+                        rmemMin, rmemDef, rmemMax := readTcpRmem()
+                        for _, h := range hosts {
+                                if h.Inst < 2 {
+                                        continue
+                                }
+                                writeBucketSQLite(h, now, rmemMin, rmemDef, rmemMax)
+                        }
+                }
+                if cycleCount%2 == 0 {
+                        writeBucketsCSV(hosts, now)
+                }
+        }
+        // v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
+        // Mirrors Python _resolve_pending enrichment logic.
+        enrichSwapsForCSV(allSwaps, allMets, allSrates, cdest)
+        if doCSV {
+                writeSwapsCSV(allSwaps, now)
+                writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
+                // v0.9.24: write midsamp.csv from parsed events (was never called!)
+                if len(pl.MidsampRows) > 0 {
+                        midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
+                        for _, mr := range pl.MidsampRows {
+                                midsampEvents = append(midsampEvents, midsampEvent{
+                                        Ts:     float64(now),
+                                        Thr:    mr.Thr,
+                                        Srate:  mr.Srate,
+                                        Rport:  mr.Rport,
+                                        Alg:    -1,
+                                        Cookie: 0,
+                                })
+                        }
+                        writeMidsampCSV(midsampEvents, now)
+                }
 
-		// v0.9.5: write proofs.csv for the recent-proofs panel fallback
-		// v0.9.91: write ONLY the log-derived proofs to proofs.csv. Previously
-		// we wrote topProofs (the merged list of log proofs + CSV fallback),
-		// which created a feedback loop: empty-dest entries from the CSV
-		// fallback (proofs that had (unknown) dest) were written back to the
-		// CSV with empty dest, then re-merged in next cycle, persisting
-		// forever. Now we write only the log-derived proofs. When pl is nil
-		// (fallback path), write an empty slice — the CSV retains its
-		// existing entries and just doesn't get new ones this cycle. The BPF
-		// tuner is working correctly; this is purely a dashboard code issue.
-		var logProofs []interface{}
-		if pl != nil {
-			logProofs = pl.GetProofRows(cdest)
-		}
-		writeProofsCSVFromInterface(logProofs, now)
-	}
+                // v0.9.5: write proofs.csv for the recent-proofs panel fallback
+                // v0.9.91: write ONLY the log-derived proofs to proofs.csv. Previously
+                // we wrote topProofs (the merged list of log proofs + CSV fallback),
+                // which created a feedback loop: empty-dest entries from the CSV
+                // fallback (proofs that had (unknown) dest) were written back to the
+                // CSV with empty dest, then re-merged in next cycle, persisting
+                // forever. Now we write only the log-derived proofs. When pl is nil
+                // (fallback path), write an empty slice — the CSV retains its
+                // existing entries and just doesn't get new ones this cycle. The BPF
+                // tuner is working correctly; this is purely a dashboard code issue.
+                var logProofs []interface{}
+                if pl != nil {
+                        logProofs = pl.GetProofRows(cdest)
+                }
+                writeProofsCSVFromInterface(logProofs, now)
+        }
 
-	// v0.9.7: write midsamp.csv for the rate progression panel fallback
+        // v0.9.7: write midsamp.csv for the rate progression panel fallback
 
-	// v0.9.7: one-time backfill from log tail on first collect cycle.
-	// Parses the 16MB log tail and writes any proof/midsamp events
-	// that aren't already in the CSVs. This populates the CSVs with
-	// historical data immediately after deploy, instead of waiting
-	// for new events to accumulate.
-	backfillDone.Do(func() {
-		backfillProofsFromLog(logText, cdest)
-		backfillMidsampFromLog(logText)
-	})
+        // v0.9.7: one-time backfill from log tail on first collect cycle.
+        // Parses the 16MB log tail and writes any proof/midsamp events
+        // that aren't already in the CSVs. This populates the CSVs with
+        // historical data immediately after deploy, instead of waiting
+        // for new events to accumulate.
+        backfillDone.Do(func() {
+                backfillProofsFromLog(logText, cdest)
+                backfillMidsampFromLog(logText)
+        })
 
-	// ----- Update current state + push to SSE --------------------------
-	// v0.9.9 fix: do NOT update keyHashes here — notifySSE() computes
-	// new hashes and compares against the PREVIOUS cycle's hashes.
-	// If we update here, prevHashes == newHashes and delta is always empty.
-	c.mu.Lock()
-	c.current = doc
-	c.mu.Unlock()
+        // ----- Update current state + push to SSE --------------------------
+        // v0.9.9 fix: do NOT update keyHashes here — notifySSE() computes
+        // new hashes and compares against the PREVIOUS cycle's hashes.
+        // If we update here, prevHashes == newHashes and delta is always empty.
+        //
+        // v0.9.108: marshal the document ONCE (was 3-4x per cycle across
+        // writeCurrentJSON + computeKeyHashes + notifySSE). The cached
+        // per-key bytes feed hashing (identical md5 values), current.json
+        // and the SSE messages — all byte-identical to v0.9.104 output.
+        docBytes, keyBytes := buildDocRaw(doc)
 
-	c.writeCurrentJSON()
-	c.notifySSE()
+        c.mu.Lock()
+        c.current = doc
+        c.mu.Unlock()
+
+        c.writeCurrentJSONFromRaw(docBytes)
+        c.notifySSEFromRaw(keyBytes)
 }
 
 // buildLiveBuckets constructs the buckets list (top 8),
@@ -277,326 +292,326 @@ func (c *Collector) collect() {
 // (from current, every 30s) disagreed. Now both use the same order so
 // they stop "fighting" each other.
 func buildLiveBuckets(hosts []hostEntry, now int64) (
-	buckets []bucketRow, metricByBucket map[string]interface{},
-	bucketLive map[string]interface{}, liveLeaders []interface{},
+        buckets []bucketRow, metricByBucket map[string]interface{},
+        bucketLive map[string]interface{}, liveLeaders []interface{},
 ) {
-	type bucket struct {
-		Dest    string  `json:"dest"`
-		Inst    int     `json:"inst"`
-		RttUs   float64 `json:"rtt_us"`
-		RefMbps float64 `json:"ref_mbps"`
-		BestAlg string  `json:"best_alg"`
-		NAlg    int     `json:"n_alg"`
-	}
-	metricByBucket = map[string]interface{}{}
-	bucketLive = map[string]interface{}{}
+        type bucket struct {
+                Dest    string  `json:"dest"`
+                Inst    int     `json:"inst"`
+                RttUs   float64 `json:"rtt_us"`
+                RefMbps float64 `json:"ref_mbps"`
+                BestAlg string  `json:"best_alg"`
+                NAlg    int     `json:"n_alg"`
+        }
+        metricByBucket = map[string]interface{}{}
+        bucketLive = map[string]interface{}{}
 
-	// v0.7.5e: pre-compute n_alg per host so the sort can use it
-	// without re-parsing metrics twice per comparison.
-	type hostWithAlg struct {
-		hostEntry
-		nAlg int
-	}
-	sortedHosts := make([]hostWithAlg, len(hosts))
-	for i, h := range hosts {
-		n := 0
-		if mi, _ := h.V["metrics"].([]interface{}); mi != nil {
-			for _, m := range mi {
-				if mm, ok := m.(map[string]interface{}); ok &&
-					toInt(mm["metric_count"]) > 0 {
-					n++
-				}
-			}
-		}
-		sortedHosts[i] = hostWithAlg{hostEntry: h, nAlg: n}
-	}
-	// Stable sort: n_alg desc, inst desc, id asc — matches meta.json's
-	// (n_alg desc, inst_mean desc, id asc) order closely enough that
-	// the live buckets list and the 5-min meta list no longer disagree.
-	sort.SliceStable(sortedHosts, func(i, j int) bool {
-		if sortedHosts[i].nAlg != sortedHosts[j].nAlg {
-			return sortedHosts[i].nAlg > sortedHosts[j].nAlg
-		}
-		if sortedHosts[i].Inst != sortedHosts[j].Inst {
-			return sortedHosts[i].Inst > sortedHosts[j].Inst
-		}
-		return sortedHosts[i].Addr < sortedHosts[j].Addr
-	})
+        // v0.7.5e: pre-compute n_alg per host so the sort can use it
+        // without re-parsing metrics twice per comparison.
+        type hostWithAlg struct {
+                hostEntry
+                nAlg int
+        }
+        sortedHosts := make([]hostWithAlg, len(hosts))
+        for i, h := range hosts {
+                n := 0
+                if mi, _ := h.V["metrics"].([]interface{}); mi != nil {
+                        for _, m := range mi {
+                                if mm, ok := m.(map[string]interface{}); ok &&
+                                        toInt(mm["metric_count"]) > 0 {
+                                        n++
+                                }
+                        }
+                }
+                sortedHosts[i] = hostWithAlg{hostEntry: h, nAlg: n}
+        }
+        // Stable sort: n_alg desc, inst desc, id asc — matches meta.json's
+        // (n_alg desc, inst_mean desc, id asc) order closely enough that
+        // the live buckets list and the 5-min meta list no longer disagree.
+        sort.SliceStable(sortedHosts, func(i, j int) bool {
+                if sortedHosts[i].nAlg != sortedHosts[j].nAlg {
+                        return sortedHosts[i].nAlg > sortedHosts[j].nAlg
+                }
+                if sortedHosts[i].Inst != sortedHosts[j].Inst {
+                        return sortedHosts[i].Inst > sortedHosts[j].Inst
+                }
+                return sortedHosts[i].Addr < sortedHosts[j].Addr
+        })
 
-	for _, sh := range sortedHosts {
-		h := sh.hostEntry
-		v := h.V
-		addr := h.Addr
-		if addr == "0.0.0.1" || addr == "?" {
-			continue
-		}
-		if strings.HasPrefix(addr, "127.") ||
-			strings.HasPrefix(addr, "169.254.") ||
-			strings.HasPrefix(addr, "0.") {
-			continue
-		}
-		if h.Inst < 2 {
-			continue
-		}
-		inst := h.Inst
+        for _, sh := range sortedHosts {
+                h := sh.hostEntry
+                v := h.V
+                addr := h.Addr
+                if addr == "0.0.0.1" || addr == "?" {
+                        continue
+                }
+                if strings.HasPrefix(addr, "127.") ||
+                        strings.HasPrefix(addr, "169.254.") ||
+                        strings.HasPrefix(addr, "0.") {
+                        continue
+                }
+                if h.Inst < 2 {
+                        continue
+                }
+                inst := h.Inst
 
-		// Picker's choice (same formula as data_live_leaders).
-		metrics, _ := v["metrics"].([]interface{})
-		bestI := toInt(v["best_i"])
-		if bestI < 0 || bestI >= len(CONGS) {
-			bestI = 0
-		}
-		bestW := 0
-		for i := 0; i < len(CONGS) && i < len(metrics); i++ {
-			mi, _ := metrics[i].(map[string]interface{})
-			if mi == nil {
-				continue
-			}
-			cnt := toInt(mi["metric_count"])
-			rv := toInt(mi["rate_ema"])
-			if cnt < minLeaderTrust || rv == 0 {
-				continue
-			}
-			ss := toInt(mi["swap_score"])
-			ssEff := ss
-			if ssEff == 0 {
-				ssEff = 256
-			}
-			bad := toInt(mi["bad_streak"])
-			nul := toInt(mi["null_streak"])
-			weighted := rv * ssEff / 256
-			pen := 16 + bad*4 + nul*2
-			weighted = weighted * 16 / pen
-			if weighted > bestW {
-				bestW = weighted
-				bestI = i
-			}
-		}
-		bestAlg := CONGS[bestI]
-		if bestI >= len(CONGS) {
-			bestAlg = fmt.Sprintf("alg%d", bestI)
-		}
-		// v0.7.5e: reuse pre-computed n_alg (was re-parsing here).
-		nAlg := sh.nAlg
-		refMbps := toFloat(v["max_rate_delivered"]) / bpsToMbps
-		if len(buckets) < 8 {
-			buckets = append(buckets, bucketRow{
-				Dest:    addr,
-				Inst:    inst,
-				RttUs:   toFloat(v["min_rtt"]),
-				RefMbps: round1(refMbps),
-				BestAlg: bestAlg,
-				NAlg:    nAlg,
-			})
-		}
+                // Picker's choice (same formula as data_live_leaders).
+                metrics, _ := v["metrics"].([]interface{})
+                bestI := toInt(v["best_i"])
+                if bestI < 0 || bestI >= len(CONGS) {
+                        bestI = 0
+                }
+                bestW := 0
+                for i := 0; i < len(CONGS) && i < len(metrics); i++ {
+                        mi, _ := metrics[i].(map[string]interface{})
+                        if mi == nil {
+                                continue
+                        }
+                        cnt := toInt(mi["metric_count"])
+                        rv := toInt(mi["rate_ema"])
+                        if cnt < minLeaderTrust || rv == 0 {
+                                continue
+                        }
+                        ss := toInt(mi["swap_score"])
+                        ssEff := ss
+                        if ssEff == 0 {
+                                ssEff = 256
+                        }
+                        bad := toInt(mi["bad_streak"])
+                        nul := toInt(mi["null_streak"])
+                        weighted := rv * ssEff / 256
+                        pen := 16 + bad*4 + nul*2
+                        weighted = weighted * 16 / pen
+                        if weighted > bestW {
+                                bestW = weighted
+                                bestI = i
+                        }
+                }
+                bestAlg := CONGS[bestI]
+                if bestI >= len(CONGS) {
+                        bestAlg = fmt.Sprintf("alg%d", bestI)
+                }
+                // v0.7.5e: reuse pre-computed n_alg (was re-parsing here).
+                nAlg := sh.nAlg
+                refMbps := toFloat(v["max_rate_delivered"]) / bpsToMbps
+                if len(buckets) < 8 {
+                        buckets = append(buckets, bucketRow{
+                                Dest:    addr,
+                                Inst:    inst,
+                                RttUs:   toFloat(v["min_rtt"]),
+                                RefMbps: round1(refMbps),
+                                BestAlg: bestAlg,
+                                NAlg:    nAlg,
+                        })
+                }
 
-		// metric_by_bucket: full per-alg row matching Python's output.
-		metricRows := buildMetricRows(metrics)
-		metricByBucket[addr] = metricRows
+                // metric_by_bucket: full per-alg row matching Python's output.
+                metricRows := buildMetricRows(metrics)
+                metricByBucket[addr] = metricRows
 
-		// bucket_live (single-point placeholder; rebuilt from ring buffer below).
-		ts := now
-		cols := map[string]interface{}{}
-		for i := 0; i < len(CONGS); i++ {
-			var mi map[string]interface{}
-			if i < len(metrics) {
-				mi, _ = metrics[i].(map[string]interface{})
-			}
-			if mi == nil {
-				mi = map[string]interface{}{}
-			}
-			cols["re_"+CONGS[i]] = []interface{}{toFloat(mi["rate_ema"])}
-			cols["ss_"+CONGS[i]] = []interface{}{toInt(mi["swap_score"])}
-			cols["bs_"+CONGS[i]] = []interface{}{toInt(mi["bad_streak"])}
-			cols["ns_"+CONGS[i]] = []interface{}{toInt(mi["null_streak"])}
-		}
-		bucketLive[addr] = map[string]interface{}{
-			"ts":   []interface{}{ts},
-			"cols": cols,
-		}
+                // bucket_live (single-point placeholder; rebuilt from ring buffer below).
+                ts := now
+                cols := map[string]interface{}{}
+                for i := 0; i < len(CONGS); i++ {
+                        var mi map[string]interface{}
+                        if i < len(metrics) {
+                                mi, _ = metrics[i].(map[string]interface{})
+                        }
+                        if mi == nil {
+                                mi = map[string]interface{}{}
+                        }
+                        cols["re_"+CONGS[i]] = []interface{}{toFloat(mi["rate_ema"])}
+                        cols["ss_"+CONGS[i]] = []interface{}{toInt(mi["swap_score"])}
+                        cols["bs_"+CONGS[i]] = []interface{}{toInt(mi["bad_streak"])}
+                        cols["ns_"+CONGS[i]] = []interface{}{toInt(mi["null_streak"])}
+                }
+                bucketLive[addr] = map[string]interface{}{
+                        "ts":   []interface{}{ts},
+                        "cols": cols,
+                }
 
-		// live_leaders entry.
-		ll := buildLiveLeadersEntry(addr, inst, metrics)
-		if ll != nil && len(liveLeaders) < liveMaxBuckets {
-			liveLeaders = append(liveLeaders, ll)
-		}
-	}
-	return
+                // live_leaders entry.
+                ll := buildLiveLeadersEntry(addr, inst, metrics)
+                if ll != nil && len(liveLeaders) < liveMaxBuckets {
+                        liveLeaders = append(liveLeaders, ll)
+                }
+        }
+        return
 }
 
 // bucketRow is the JSON-serializable bucket entry in current.json.
 type bucketRow struct {
-	Dest    string  `json:"dest"`
-	Inst    int     `json:"inst"`
-	RttUs   float64 `json:"rtt_us"`
-	RefMbps float64 `json:"ref_mbps"`
-	BestAlg string  `json:"best_alg"`
-	NAlg    int     `json:"n_alg"`
+        Dest    string  `json:"dest"`
+        Inst    int     `json:"inst"`
+        RttUs   float64 `json:"rtt_us"`
+        RefMbps float64 `json:"ref_mbps"`
+        BestAlg string  `json:"best_alg"`
+        NAlg    int     `json:"n_alg"`
 }
 
 // buildMetricRows builds the per-algorithm row list for one bucket.
 func buildMetricRows(metrics []interface{}) []interface{} {
-	var metricRows []interface{}
-	for i := 0; i < len(CONGS); i++ {
-		var mi map[string]interface{}
-		if i < len(metrics) {
-			mi, _ = metrics[i].(map[string]interface{})
-		}
-		if mi == nil {
-			mi = map[string]interface{}{}
-		}
-		val := toInt(mi["metric_value"])
-		if val == (1<<63-1) || val < 0 {
-			val = 0
-		}
-		mc := toInt(mi["metric_count"])
-		a := toInt(mi["sockets_alive"])
-		ss := toInt(mi["swap_score"])
-		bs := toInt(mi["bad_streak"])
-		ns := toInt(mi["null_streak"])
-		re := toInt(mi["rate_ema"])
-		penalty := 16.0 / (16.0 + float64(bs)*4.0 + float64(ns)*2.0)
-		score := float64(re) * (float64(ss) / 256.0) * penalty
-		active := mc > 0 || a > 0 || re > 0 || ss > 0
-		var metricVal interface{}
-		if val > 0 {
-			metricVal = round1(float64(val) / 1e6)
-		} else {
-			metricVal = 0
-		}
-		row := map[string]interface{}{
-			"alg":         CONGS[i],
-			"metric":      metricVal,
-			"votes":       mc,
-			"alive":       a,
-			"rate_ema":    re,
-			"swap_score":  ss,
-			"penalty":     round3(penalty),
-			"score":       round2(score),
-			"bad_streak":  bs,
-			"null_streak": ns,
-			"active":      active,
-		}
-		metricRows = append(metricRows, row)
-	}
-	sort.SliceStable(metricRows, func(i, j int) bool {
-		ri, _ := metricRows[i].(map[string]interface{})
-		rj, _ := metricRows[j].(map[string]interface{})
-		ai, _ := ri["active"].(bool)
-		aj, _ := rj["active"].(bool)
-		if ai != aj {
-			return ai
-		}
-		si, _ := ri["score"].(float64)
-		sj, _ := rj["score"].(float64)
-		return si > sj
-	})
-	return metricRows
+        var metricRows []interface{}
+        for i := 0; i < len(CONGS); i++ {
+                var mi map[string]interface{}
+                if i < len(metrics) {
+                        mi, _ = metrics[i].(map[string]interface{})
+                }
+                if mi == nil {
+                        mi = map[string]interface{}{}
+                }
+                val := toInt(mi["metric_value"])
+                if val == (1<<63-1) || val < 0 {
+                        val = 0
+                }
+                mc := toInt(mi["metric_count"])
+                a := toInt(mi["sockets_alive"])
+                ss := toInt(mi["swap_score"])
+                bs := toInt(mi["bad_streak"])
+                ns := toInt(mi["null_streak"])
+                re := toInt(mi["rate_ema"])
+                penalty := 16.0 / (16.0 + float64(bs)*4.0 + float64(ns)*2.0)
+                score := float64(re) * (float64(ss) / 256.0) * penalty
+                active := mc > 0 || a > 0 || re > 0 || ss > 0
+                var metricVal interface{}
+                if val > 0 {
+                        metricVal = round1(float64(val) / 1e6)
+                } else {
+                        metricVal = 0
+                }
+                row := map[string]interface{}{
+                        "alg":         CONGS[i],
+                        "metric":      metricVal,
+                        "votes":       mc,
+                        "alive":       a,
+                        "rate_ema":    re,
+                        "swap_score":  ss,
+                        "penalty":     round3(penalty),
+                        "score":       round2(score),
+                        "bad_streak":  bs,
+                        "null_streak": ns,
+                        "active":      active,
+                }
+                metricRows = append(metricRows, row)
+        }
+        sort.SliceStable(metricRows, func(i, j int) bool {
+                ri, _ := metricRows[i].(map[string]interface{})
+                rj, _ := metricRows[j].(map[string]interface{})
+                ai, _ := ri["active"].(bool)
+                aj, _ := rj["active"].(bool)
+                if ai != aj {
+                        return ai
+                }
+                si, _ := ri["score"].(float64)
+                sj, _ := rj["score"].(float64)
+                return si > sj
+        })
+        return metricRows
 }
 
 // buildLiveLeadersEntry builds one live_leaders entry from metrics.
 // Returns nil if no candidates qualify (cnt < minLeaderTrust or rv == 0).
 func buildLiveLeadersEntry(addr string, inst int, metrics []interface{}) map[string]interface{} {
-	var cands []struct {
-		W, Rv, Ss, Bad, Nul, Cnt, I int
-	}
-	for i := 0; i < len(CONGS); i++ {
-		var mi map[string]interface{}
-		if i < len(metrics) {
-			mi, _ = metrics[i].(map[string]interface{})
-		}
-		if mi == nil {
-			continue
-		}
-		cnt := toInt(mi["metric_count"])
-		rv := toInt(mi["rate_ema"])
-		ss := toInt(mi["swap_score"])
-		bad := toInt(mi["bad_streak"])
-		nul := toInt(mi["null_streak"])
-		if cnt < minLeaderTrust || rv == 0 {
-			continue
-		}
-		ssEff := ss
-		if ssEff == 0 {
-			ssEff = 256
-		}
-		weighted := rv * ssEff / 256
-		pen := 16 + bad*4 + nul*2
-		weighted = weighted * 16 / pen
-		cands = append(cands, struct {
-			W, Rv, Ss, Bad, Nul, Cnt, I int
-		}{weighted, rv, ss, bad, nul, cnt, i})
-	}
-	if len(cands) == 0 {
-		return nil
-	}
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].W > cands[j].W })
-	topN := liveTopN
-	if len(cands) < topN {
-		topN = len(cands)
-	}
-	topRows := make([]interface{}, 0, topN)
-	for _, c := range cands[:topN] {
-		topRows = append(topRows, map[string]interface{}{
-			"alg":        CONGS[c.I],
-			"weighted":   c.W,
-			"rate_ema":   c.Rv,
-			"swap_score": c.Ss,
-			"bad":        c.Bad,
-			"null":       c.Nul,
-			"count":      c.Cnt,
-		})
-	}
-	return map[string]interface{}{
-		"dest": addr,
-		"inst": inst,
-		"top":  topRows,
-	}
+        var cands []struct {
+                W, Rv, Ss, Bad, Nul, Cnt, I int
+        }
+        for i := 0; i < len(CONGS); i++ {
+                var mi map[string]interface{}
+                if i < len(metrics) {
+                        mi, _ = metrics[i].(map[string]interface{})
+                }
+                if mi == nil {
+                        continue
+                }
+                cnt := toInt(mi["metric_count"])
+                rv := toInt(mi["rate_ema"])
+                ss := toInt(mi["swap_score"])
+                bad := toInt(mi["bad_streak"])
+                nul := toInt(mi["null_streak"])
+                if cnt < minLeaderTrust || rv == 0 {
+                        continue
+                }
+                ssEff := ss
+                if ssEff == 0 {
+                        ssEff = 256
+                }
+                weighted := rv * ssEff / 256
+                pen := 16 + bad*4 + nul*2
+                weighted = weighted * 16 / pen
+                cands = append(cands, struct {
+                        W, Rv, Ss, Bad, Nul, Cnt, I int
+                }{weighted, rv, ss, bad, nul, cnt, i})
+        }
+        if len(cands) == 0 {
+                return nil
+        }
+        sort.SliceStable(cands, func(i, j int) bool { return cands[i].W > cands[j].W })
+        topN := liveTopN
+        if len(cands) < topN {
+                topN = len(cands)
+        }
+        topRows := make([]interface{}, 0, topN)
+        for _, c := range cands[:topN] {
+                topRows = append(topRows, map[string]interface{}{
+                        "alg":        CONGS[c.I],
+                        "weighted":   c.W,
+                        "rate_ema":   c.Rv,
+                        "swap_score": c.Ss,
+                        "bad":        c.Bad,
+                        "null":       c.Nul,
+                        "count":      c.Cnt,
+                })
+        }
+        return map[string]interface{}{
+                "dest": addr,
+                "inst": inst,
+                "top":  topRows,
+        }
 }
 
 // rebuildBucketLiveFromRing replaces the single-point bucket_live with
 // the full 1h time-series from the ring buffer (fixes "charts go empty
 // every 30s" — SSE now pushes real time-series data).
+//
+// v0.9.108: typed series arrays ([]float64 / []int16 / []int64) instead
+// of []interface{} boxing, and the 64-entry column map is only built for
+// hosts that actually have ring snapshots.  JSON output is identical:
+// encoding/json renders []int16 and []interface{}{int16} the same way.
 func rebuildBucketLiveFromRing(bucketLive map[string]interface{}, hosts []hostEntry, now int64) {
-	cutoff := now - 3600
-	for _, h := range hosts {
-		addr := h.Addr
-		hist.mu.RLock()
-		rawSnaps := hist.raw[addr]
-		var tsArr []interface{}
-		colsLive := map[string]interface{}{}
-		for _, alg := range CONGS {
-			colsLive["re_"+alg] = []interface{}{}
-			colsLive["ss_"+alg] = []interface{}{}
-			colsLive["bs_"+alg] = []interface{}{}
-			colsLive["ns_"+alg] = []interface{}{}
-		}
-		for _, s := range rawSnaps {
-			if s.Ts < cutoff {
-				continue
-			}
-			tsArr = append(tsArr, s.Ts)
-			// v0.7.2: read from arrays, output maps for JSON
-			for i, alg := range CONGS {
-				if i >= 16 {
-					break
-				}
-				reArr, _ := colsLive["re_"+alg].([]interface{})
-				colsLive["re_"+alg] = append(reArr, s.Re[i])
-				ssArr, _ := colsLive["ss_"+alg].([]interface{})
-				colsLive["ss_"+alg] = append(ssArr, s.Ss[i])
-				bsArr, _ := colsLive["bs_"+alg].([]interface{})
-				colsLive["bs_"+alg] = append(bsArr, s.Bs[i])
-				nsArr, _ := colsLive["ns_"+alg].([]interface{})
-				colsLive["ns_"+alg] = append(nsArr, s.Ns[i])
-			}
-		}
-		hist.mu.RUnlock()
-		if len(tsArr) > 0 {
-			bucketLive[addr] = map[string]interface{}{
-				"ts":   tsArr,
-				"cols": colsLive,
-			}
-		}
-	}
+        cutoff := now - 3600
+        for _, h := range hosts {
+                addr := h.Addr
+                hist.mu.RLock()
+                rawSnaps := hist.raw[addr]
+                var tsArr []int64
+                var reArrs [16][]float64
+                var ssArrs, bsArrs, nsArrs [16][]int16
+                for _, s := range rawSnaps {
+                        if s.Ts < cutoff {
+                                continue
+                        }
+                        tsArr = append(tsArr, s.Ts)
+                        // v0.7.2: read from arrays, output maps for JSON
+                        for i := 0; i < 16; i++ {
+                                reArrs[i] = append(reArrs[i], s.Re[i])
+                                ssArrs[i] = append(ssArrs[i], s.Ss[i])
+                                bsArrs[i] = append(bsArrs[i], s.Bs[i])
+                                nsArrs[i] = append(nsArrs[i], s.Ns[i])
+                        }
+                }
+                hist.mu.RUnlock()
+                if len(tsArr) > 0 {
+                        colsLive := make(map[string]interface{}, 64)
+                        for i, alg := range CONGS {
+                                colsLive["re_"+alg] = reArrs[i]
+                                colsLive["ss_"+alg] = ssArrs[i]
+                                colsLive["bs_"+alg] = bsArrs[i]
+                                colsLive["ns_"+alg] = nsArrs[i]
+                        }
+                        bucketLive[addr] = map[string]interface{}{
+                                "ts":   tsArr,
+                                "cols": colsLive,
+                        }
+                }
+        }
 }
