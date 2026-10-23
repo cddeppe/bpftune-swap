@@ -38,7 +38,7 @@ type tieredRetentionConfig struct {
 }
 
 type retentionTier struct {
-	maxAgeDays int // rows older than this are in the next tier (or dropped if last)
+	maxAgeDays int   // rows older than this are in the next tier (or dropped if last)
 	binSeconds int64 // 0 = keep full resolution (no downsampling)
 }
 

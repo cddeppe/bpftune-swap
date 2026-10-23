@@ -13,152 +13,152 @@ package main
 // Pick chart, following the same bucket/range selectors.
 
 import (
-        "strings"
+	"strings"
 )
 
 // routeHealthEntry is the per-bucket health data.
 type routeHealthEntry struct {
-        RTTMs    float64 `json:"rtt_ms"`
-        LossPct  float64 `json:"loss_pct"`
-        RateMbps float64 `json:"rate_mbps"`
-        Protocol string  `json:"protocol"`  // "ipv4", "ipv6", "dual"
-        Health   string  `json:"health"`     // "good", "degraded", "bad"
-        BestAlg  string  `json:"best_alg"`
-        Inst     int     `json:"inst"`
+	RTTMs    float64 `json:"rtt_ms"`
+	LossPct  float64 `json:"loss_pct"`
+	RateMbps float64 `json:"rate_mbps"`
+	Protocol string  `json:"protocol"` // "ipv4", "ipv6", "dual"
+	Health   string  `json:"health"`   // "good", "degraded", "bad"
+	BestAlg  string  `json:"best_alg"`
+	Inst     int     `json:"inst"`
 }
 
 // buildRouteHealth creates a map of bucketID → routeHealthEntry from the
 // live BPF map data. Called once per collect cycle.
 func buildRouteHealth(hosts []hostEntry, metricByBucket map[string]interface{}) map[string]interface{} {
-        out := map[string]interface{}{}
+	out := map[string]interface{}{}
 
-        for _, h := range hosts {
-                if h.Inst < 2 {
-                        continue
-                }
-                addr := h.Addr
-                if addr == "" || addr == "0.0.0.0" || addr == "?" {
-                        continue
-                }
-                if strings.HasPrefix(addr, "127.") ||
-                        strings.HasPrefix(addr, "169.254.") ||
-                        strings.HasPrefix(addr, "0.") {
-                        continue
-                }
+	for _, h := range hosts {
+		if h.Inst < 2 {
+			continue
+		}
+		addr := h.Addr
+		if addr == "" || addr == "0.0.0.0" || addr == "?" {
+			continue
+		}
+		if strings.HasPrefix(addr, "127.") ||
+			strings.HasPrefix(addr, "169.254.") ||
+			strings.HasPrefix(addr, "0.") {
+			continue
+		}
 
-                v := h.V
-                // v0.4.104: use RTT from the parsed log (rxRtt) instead of
-                // min_rtt from the BPF map. The BPF map's min_rtt is the
-                // scoring reference (guarded by outlier/heal logic), not
-                // suitable for route health display. The rtt log line gives
-                // the raw RTT from actual connections.
-                rttMs := 0.0
-                if currentParsedLog != nil && currentParsedLog.RttByDest != nil {
-                        if rttUs, ok := currentParsedLog.RttByDest[addr]; ok && rttUs > 0 {
-                                rttMs = rttUs / 1000.0
-                        }
-                }
-                // Fallback to BPF map min_rtt if no log RTT available
-                if rttMs == 0 {
-                        rttMs = toFloat(v["min_rtt"]) / 1000.0
-                }
+		v := h.V
+		// v0.4.104: use RTT from the parsed log (rxRtt) instead of
+		// min_rtt from the BPF map. The BPF map's min_rtt is the
+		// scoring reference (guarded by outlier/heal logic), not
+		// suitable for route health display. The rtt log line gives
+		// the raw RTT from actual connections.
+		rttMs := 0.0
+		if currentParsedLog != nil && currentParsedLog.RttByDest != nil {
+			if rttUs, ok := currentParsedLog.RttByDest[addr]; ok && rttUs > 0 {
+				rttMs = rttUs / 1000.0
+			}
+		}
+		// Fallback to BPF map min_rtt if no log RTT available
+		if rttMs == 0 {
+			rttMs = toFloat(v["min_rtt"]) / 1000.0
+		}
 
-                // Determine protocol from which min_rtt we're using
-                protocol := "ipv4"
-                if h.V4MinRTT == 0 && h.V6MinRTT > 0 {
-                        protocol = "ipv6"
-                }
-                if h.V4MinRTT > 0 && h.V6MinRTT > 0 {
-                        protocol = "dual"
-                }
+		// Determine protocol from which min_rtt we're using
+		protocol := "ipv4"
+		if h.V4MinRTT == 0 && h.V6MinRTT > 0 {
+			protocol = "ipv6"
+		}
+		if h.V4MinRTT > 0 && h.V6MinRTT > 0 {
+			protocol = "dual"
+		}
 
-                // Aggregate loss from metric_by_bucket
-                mbRows, _ := metricByBucket[addr].([]interface{})
-                maxBadStreak := 0
-                maxNullStreak := 0
-                bestRateEma := 0
-                for _, row := range mbRows {
-                        mi, _ := row.(map[string]interface{})
-                        if mi == nil {
-                                continue
-                        }
-                        bs := toInt(mi["bad_streak"])
-                        ns := toInt(mi["null_streak"])
-                        if bs > maxBadStreak {
-                                maxBadStreak = bs
-                        }
-                        if ns > maxNullStreak {
-                                maxNullStreak = ns
-                        }
-                        re := toInt(mi["rate_ema"])
-                        if re > bestRateEma {
-                                bestRateEma = re
-                        }
-                }
+		// Aggregate loss from metric_by_bucket
+		mbRows, _ := metricByBucket[addr].([]interface{})
+		maxBadStreak := 0
+		maxNullStreak := 0
+		bestRateEma := 0
+		for _, row := range mbRows {
+			mi, _ := row.(map[string]interface{})
+			if mi == nil {
+				continue
+			}
+			bs := toInt(mi["bad_streak"])
+			ns := toInt(mi["null_streak"])
+			if bs > maxBadStreak {
+				maxBadStreak = bs
+			}
+			if ns > maxNullStreak {
+				maxNullStreak = ns
+			}
+			re := toInt(mi["rate_ema"])
+			if re > bestRateEma {
+				bestRateEma = re
+			}
+		}
 
-                // Estimate loss percentage from streaks.
-                // bad_streak + null_streak = consecutive bad/null outcomes.
-                // Map to a rough percentage: 0 streaks = 0%, 5+ = 20%+
-                lossPct := float64(maxBadStreak*4+maxNullStreak*2) / 10.0
-                if lossPct > 100 {
-                        lossPct = 100
-                }
+		// Estimate loss percentage from streaks.
+		// bad_streak + null_streak = consecutive bad/null outcomes.
+		// Map to a rough percentage: 0 streaks = 0%, 5+ = 20%+
+		lossPct := float64(maxBadStreak*4+maxNullStreak*2) / 10.0
+		if lossPct > 100 {
+			lossPct = 100
+		}
 
-                // Rate in Mbps
-                rateMbps := float64(bestRateEma) / bpsToMbps
+		// Rate in Mbps
+		rateMbps := float64(bestRateEma) / bpsToMbps
 
-                // Health classification
-                health := "good"
-                if lossPct >= 10 || rttMs >= 200 {
-                        health = "degraded"
-                }
-                if lossPct >= 30 || rttMs >= 500 {
-                        health = "bad"
-                }
+		// Health classification
+		health := "good"
+		if lossPct >= 10 || rttMs >= 200 {
+			health = "degraded"
+		}
+		if lossPct >= 30 || rttMs >= 500 {
+			health = "bad"
+		}
 
-                // Best alg
-                bestAlg := ""
-                if bi := toInt(v["best_i"]); bi >= 0 && bi < len(CONGS) {
-                        bestAlg = CONGS[bi]
-                }
+		// Best alg
+		bestAlg := ""
+		if bi := toInt(v["best_i"]); bi >= 0 && bi < len(CONGS) {
+			bestAlg = CONGS[bi]
+		}
 
-                out[addr] = routeHealthEntry{
-                        RTTMs:    round1(rttMs),
-                        LossPct:  round1(lossPct),
-                        RateMbps: round1(rateMbps),
-                        Protocol: protocol,
-                        Health:   health,
-                        BestAlg:  bestAlg,
-                        Inst:     h.Inst,
-                }
-        }
+		out[addr] = routeHealthEntry{
+			RTTMs:    round1(rttMs),
+			LossPct:  round1(lossPct),
+			RateMbps: round1(rateMbps),
+			Protocol: protocol,
+			Health:   health,
+			BestAlg:  bestAlg,
+			Inst:     h.Inst,
+		}
+	}
 
-        // Check for dual-stack: if a bucket has both an IPv4 and IPv6 form,
-        // mark both as "dual" protocol.
-        for addr := range out {
-                // Look for the other protocol version of the same labeled bucket
-                for addr2, entry2 := range out {
-                        if addr == addr2 {
-                                continue
-                        }
-                        e1, _ := out[addr].(routeHealthEntry)
-                        e2, _ := entry2.(routeHealthEntry)
-                        if e1.Protocol != e2.Protocol {
-                                // Check if they resolve to the same label
-                                l1 := labelFor(addr)
-                                l2 := labelFor(addr2)
-                                if l1 != "" && l1 == l2 {
-                                        e1.Protocol = "dual"
-                                        out[addr] = e1
-                                        e2.Protocol = "dual"
-                                        out[addr2] = e2
-                                }
-                        }
-                }
-        }
+	// Check for dual-stack: if a bucket has both an IPv4 and IPv6 form,
+	// mark both as "dual" protocol.
+	for addr := range out {
+		// Look for the other protocol version of the same labeled bucket
+		for addr2, entry2 := range out {
+			if addr == addr2 {
+				continue
+			}
+			e1, _ := out[addr].(routeHealthEntry)
+			e2, _ := entry2.(routeHealthEntry)
+			if e1.Protocol != e2.Protocol {
+				// Check if they resolve to the same label
+				l1 := labelFor(addr)
+				l2 := labelFor(addr2)
+				if l1 != "" && l1 == l2 {
+					e1.Protocol = "dual"
+					out[addr] = e1
+					e2.Protocol = "dual"
+					out[addr2] = e2
+				}
+			}
+		}
+	}
 
-        if len(out) == 0 {
-                return nil
-        }
-        return out
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

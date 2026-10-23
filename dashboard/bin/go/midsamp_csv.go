@@ -40,7 +40,7 @@ func midsampCSVHeader() string {
 
 // midsampEvent is a parsed midsamp event from the log.
 type midsampEvent struct {
-	Ts    float64
+	Ts     float64
 	Cookie int64
 	Rport  string
 	Alg    int
@@ -84,7 +84,7 @@ func parseMidsampEvents(text string) []midsampEvent {
 		thr, _ := strconv.Atoi(mThr[1])
 		srate, _ := strconv.ParseInt(mSrate[1], 10, 64)
 		out = append(out, midsampEvent{
-			Ts:    ts,
+			Ts:     ts,
 			Cookie: cookie,
 			Rport:  mRport[1],
 			Alg:    alg,
@@ -262,7 +262,7 @@ var backfillDone sync.Once
 // when the file's mtime changes. Most cycles the file hasn't been written
 // to yet (writes happen at the end of collect()).
 var (
-	rateCSVCache     []interface{}
+	rateCSVCache      []interface{}
 	rateCSVCacheMtime int64
 )
 

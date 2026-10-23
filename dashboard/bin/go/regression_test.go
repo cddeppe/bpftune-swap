@@ -40,12 +40,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -307,10 +307,10 @@ func TestProofsCSVMixedDest(t *testing.T) {
 	defer env.cleanup(t)
 
 	csv := "collected_ts,boot_ts,cookie,alg,rate_bps,mbps,tier,dest\n"
-	csv += "1700000000,1250.000000,1001,bbr,1000000,1.0,2,\n"               // empty dest — skip
-	csv += "1700000010,1350.000000,1002,cubic,500000,0.5,1,83.52.0.0\n"     // valid
-	csv += "1700000020,1450.000000,1003,htcp,2000000,2.0,2,\n"             // empty dest — skip
-	csv += "1700000030,1550.000000,1004,bbr,800000,0.8,1,83.52.0.0\n"       // valid
+	csv += "1700000000,1250.000000,1001,bbr,1000000,1.0,2,\n"           // empty dest — skip
+	csv += "1700000010,1350.000000,1002,cubic,500000,0.5,1,83.52.0.0\n" // valid
+	csv += "1700000020,1450.000000,1003,htcp,2000000,2.0,2,\n"          // empty dest — skip
+	csv += "1700000030,1550.000000,1004,bbr,800000,0.8,1,83.52.0.0\n"   // valid
 	writeCSV(t, proofsCSVPath, csv)
 
 	rows := readRecentProofsFromCSV(50)
@@ -551,7 +551,7 @@ func TestProofsWriteThenRead(t *testing.T) {
 	now := time.Now().Unix()
 	proofs := []interface{}{
 		proofRow(1250, "bbr", "1.0", "proved", "1.2.3.4", now-100),
-		proofRow(1350, "cubic", "0.5", "good", "", now-50),    // empty dest — write should skip
+		proofRow(1350, "cubic", "0.5", "good", "", now-50), // empty dest — write should skip
 		proofRow(1450, "htcp", "2.0", "proved", "5.6.7.8", now-10),
 	}
 	writeProofsCSVFromInterface(proofs, now)
@@ -836,8 +836,8 @@ func TestSwapsCSVDuplicates(t *testing.T) {
 // (epoch_ts preferred over boot_ts).
 func TestSwapsAgeLabelCorrect(t *testing.T) {
 	nowSec := int64(1730000000)
-	epochTs := nowSec - 3600 // 1h ago wall-clock
-	bootTs := float64(4000)  // BPF ktime at swap event
+	epochTs := nowSec - 3600       // 1h ago wall-clock
+	bootTs := float64(4000)        // BPF ktime at swap event
 	serverNowMono := float64(5000) // current bpftune ktime
 
 	// Buggy path (boot_ts first): age = 5000 - 4000 = 1000s → "16m" (WRONG)
@@ -1270,11 +1270,11 @@ func TestMtimeCacheSkipsRecentStats(t *testing.T) {
 
 // TestLabelsPersistAcrossSaveAndLoad (LABEL-PERSIST-1): regression test
 // verifying that a label assignment made via saveLabels() actually:
-//   1. writes the new key to disk (file content includes it),
-//   2. is returned by the next loadLabels() call in the SAME process
-//      (cache-miss path),
-//   3. is returned by loadLabels() after a SIMULATED RESTART (cache
-//      reset to val=nil/mtime=zero, mirroring a fresh process).
+//  1. writes the new key to disk (file content includes it),
+//  2. is returned by the next loadLabels() call in the SAME process
+//     (cache-miss path),
+//  3. is returned by loadLabels() after a SIMULATED RESTART (cache
+//     reset to val=nil/mtime=zero, mirroring a fresh process).
 //
 // Background: the user reports label assignments made via the dashboard UI
 // don't persist across dashboard restarts. The save flow is

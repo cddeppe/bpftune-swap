@@ -104,6 +104,19 @@ func (c *Collector) renderToDisk() {
 // 1h+24h+7d from the CSV.
 func (c *Collector) renderSlowToDisk() {
 	// v0.7.9: rotate CSVs daily to prevent endless growth
+	// v0.9.106: set csvAll to avoid per-bucket full-CSV read
+	// (was 25 GB GC churn per 6h render + 50 MB live leak)
+	{
+		hist.mu.Lock()
+		hist.csvAll = readCSVTail(86400)
+		hist.mu.Unlock()
+	}
+	defer func() {
+		hist.mu.Lock()
+		hist.csvAll = nil
+		hist.mu.Unlock()
+	}()
+
 	rotateAllCSVs()
 
 	c.mu.RLock()
@@ -862,30 +875,6 @@ func writeFileAtomic(path string, build func() []byte) {
 	tmp := path + ".tmp"
 	_ = os.WriteFile(tmp, build(), 0644)
 	_ = os.Rename(tmp, path)
-}
-
-// writeFileAtomicJSON streams JSON directly to a temp file via json.NewEncoder,
-// then atomically renames. Avoids allocating a large []byte buffer (was 9.3 MB
-// per call for saveToDisk's ring buffer). Same JSON output, same atomic write
-// semantics, same file — just no intermediate allocation.
-func writeFileAtomicJSON(path string, v interface{}) error {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 func jsonMarshal(v interface{}) ([]byte, error) {

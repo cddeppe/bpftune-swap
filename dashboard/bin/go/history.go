@@ -268,14 +268,14 @@ func (h *historyStore) saveToDisk() {
 	defer h.mu.RUnlock()
 
 	path := historyPath("collector-go-history.json")
-	type persistData struct {
-		Raw map[string][]bucketSnapshot `json:"raw"`
-	}
-	data := persistData{Raw: h.raw}
-	// v0.9.105: stream JSON directly to file via json.NewEncoder instead
-	// of json.Marshal which allocated a 9.3 MB []byte every 30s cycle.
-	// Same JSON output, same atomic write, same file — no intermediate alloc.
-	_ = writeFileAtomicJSON(path, data)
+	writeFileAtomic(path, func() []byte {
+		type persistData struct {
+			Raw map[string][]bucketSnapshot `json:"raw"`
+		}
+		data := persistData{Raw: h.raw}
+		out, _ := jsonMarshal(data)
+		return out
+	})
 }
 
 func (h *historyStore) loadFromDisk() {
