@@ -64,6 +64,9 @@ command -v python3 >/dev/null || NEED_INSTALL="$NEED_INSTALL python3"
 command -v git     >/dev/null || NEED_INSTALL="$NEED_INSTALL git"
 command -v bpftool  >/dev/null || NEED_INSTALL="$NEED_INSTALL bpftool"
 command -v dpkg    >/dev/null || NEED_INSTALL="$NEED_INSTALL dpkg"
+# v0.9.107: bpftune .deb depends on libnl-3-200 + libnl-route-3-200
+# Install them BEFORE dpkg -i to avoid "dependency problems" error
+NEED_INSTALL="$NEED_INSTALL libnl-3-200 libnl-route-3-200"
 if [ -n "$NEED_INSTALL" ]; then
     apt-get update -qq 2>/dev/null || true
     apt-get install -y -qq $NEED_INSTALL 2>&1 | tail -3
@@ -188,7 +191,13 @@ print(candidates[0][1])
             printf "  installing %s\n" "$NEW_VER"
             systemctl stop bpftune 2>/dev/null || true
             if ! dpkg -i "$DEB"; then
-                fail "dpkg -i failed — fix apt with 'apt-get install -f' and re-run"
+                # v0.9.107: auto-fix missing deps then retry
+                warn "dpkg -i failed, auto-fixing deps..."
+                apt-get install -f -y -qq 2>&1 | tail -5
+                if ! dpkg -i "$DEB"; then
+                    fail "dpkg -i failed even after apt-get install -f"
+                fi
+                ok "auto-fixed deps, .deb installed"
             fi
             systemctl restart bpftune
             ok "bpftune $(dpkg-query -W -f='${Version}' bpftune) installed and started"
