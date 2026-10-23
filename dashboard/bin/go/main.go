@@ -12,9 +12,17 @@ package main
 //   - CSV writer → csv_writer.go
 //   - CSV reader + cache → csv_reader.go
 //
-// This file is now ~280 lines (down from ~1046). Each concern lives in
-// its own file, so future patches don't require grepping through a
-// monolith to find the right line.
+// v0.9.109-lean2 (output byte-identical to v0.9.104):
+//   - handleCurrentJSON serves the just-written current.json file instead
+//     of re-marshaling the document per request
+//   - the SSE initial snapshot + 5-min heartbeat wrap the current.json
+//     bytes instead of marshaling the full document per client
+//   - serveStatic caches gzip output per (path, mtime) — was re-gzipping
+//     the 205KB chart.umd.min.js on every request
+//   - --mem-limit-mib flag (default 128) sets the Go soft memory limit
+//     AFTER startWatchdog(), so the scavenger returns pages proactively
+//     (MADV_FREE keeps freed pages in RSS otherwise). Use 200 for
+//     v0.9.104-equivalent behaviour.
 
 import (
 	"compress/gzip"
@@ -32,6 +40,12 @@ import (
 	"syscall"
 	"time"
 )
+
+// gzipNewWriter is the single construction point for gzip writers
+// (used by the static-asset cache in perf_cache.go).
+func gzipNewWriter(w gzipWriterDst) gzipWriter {
+	return gzip.NewWriter(w)
+}
 
 // ============================================================================
 // Configuration
@@ -328,6 +342,17 @@ func (c *Collector) serveStatic(w http.ResponseWriter, r *http.Request, path, co
 		}
 	}
 	if acceptsGzip(r) && shouldGzip(path) {
+		// v0.9.109: gzip output cached per (path, mtime, size) — the
+		// 205KB chart.umd.min.js was re-compressed on every request.
+		if gz := gzipCached(path, data); gz != nil {
+			w.Header().Set("Content-Type", contentType)
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Vary", "Accept-Encoding")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(gz)))
+			w.Write(gz)
+			return
+		}
 		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Set("Vary", "Accept-Encoding")
@@ -343,10 +368,16 @@ func (c *Collector) serveStatic(w http.ResponseWriter, r *http.Request, path, co
 	}
 }
 
+// handleCurrentJSON — v0.9.109: serve the current.json bytes written by
+// the collect cycle (identical to json.Marshal(c.current)); only fall
+// back to marshaling when the file is missing.
 func (c *Collector) handleCurrentJSON(w http.ResponseWriter, r *http.Request) {
-	c.mu.RLock()
-	data, _ := json.Marshal(c.current)
-	c.mu.RUnlock()
+	data, ok := currentJSONFromDisk()
+	if !ok {
+		c.mu.RLock()
+		data, _ = json.Marshal(c.current)
+		c.mu.RUnlock()
+	}
 
 	if acceptsGzip(r) {
 		w.Header().Set("Content-Type", "application/json")
@@ -396,8 +427,10 @@ func (c *Collector) handleSSE(w http.ResponseWriter, r *http.Request) {
 	c.mu.RUnlock()
 
 	if current != nil {
-		msg := map[string]interface{}{"__t": "f", "v": current}
-		data, _ := json.Marshal(msg)
+		// v0.9.109: wrap the just-written current.json bytes — byte-
+		// identical to json.Marshal(map{"__t":"f","v":current}) without
+		// re-marshaling the document per client.
+		data := fullMessageFromDisk()
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
@@ -415,11 +448,9 @@ func (c *Collector) handleSSE(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-heartbeat.C:
-			// Send full document as heartbeat
-			c.mu.RLock()
-			fullMsg := map[string]interface{}{"__t": "f", "v": c.current}
-			c.mu.RUnlock()
-			data, _ := json.Marshal(fullMsg)
+			// v0.9.109: full message from disk bytes (was: json.Marshal
+			// of the full document per client per heartbeat).
+			data := fullMessageFromDisk()
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-time.After(25 * time.Second):
@@ -717,6 +748,12 @@ func main() {
 	// For servers with more buckets, use 60 (30min) to save memory.
 	ringCapFlag := flag.Int("ring-cap", 120, "ring buffer entries per bucket (120=1h, 60=30min, 240=2h)")
 	collectorModeFlag := flag.String("collector-mode", "normal", "collector mode: lean|normal|debug|normal-light")
+	// v0.9.109: Go soft memory limit (GOMEMLIMIT). Default 128MiB — with
+	// the v0.9.109 allocation reductions the heap high-water mark fits;
+	// the lower limit makes the scavenger return MADV_FREE pages
+	// proactively instead of letting RSS stick at the high-water mark.
+	// Use --mem-limit-mib 200 for v0.9.104-equivalent tuning.
+	memLimitFlag := flag.Int("mem-limit-mib", 128, "Go soft memory limit in MiB (GOMEMLIMIT); 200 = v0.9.104 behaviour")
 	flag.Parse()
 	collectorMode = parseCollectorMode(*collectorModeFlag)
 	// v0.9.81: removed --route-monitor flag + route monitor goroutine +
@@ -774,7 +811,11 @@ func main() {
 	os.Setenv("GOGC", "50")
 	startWatchdog() // v0.9.102: self-kill safety switch
 	debug.SetGCPercent(50)
-	fmt.Fprintf(os.Stderr, "collector: CPU priority=nice(10) GOGC=50\n")
+	// v0.9.109: soft memory limit — overrides the watchdog's 200MiB with
+	// the --mem-limit-mib value (default 128MiB). The watchdog's RSS/CPU
+	// kill-switch behaviour is unchanged.
+	debug.SetMemoryLimit(int64(*memLimitFlag) * 1024 * 1024)
+	fmt.Fprintf(os.Stderr, "collector: CPU priority=nice(10) GOGC=50 GOMEMLIMIT=%dMiB\n", *memLimitFlag)
 
 	// v0.9.45: Auto-fix trace_pipe ring buffer + sync BPF config on startup.
 	// These are system-level settings that should "just work" without

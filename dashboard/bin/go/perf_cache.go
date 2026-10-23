@@ -1,38 +1,28 @@
 package main
 
-// perf_cache.go — v0.9.108-lean: per-cycle garbage elimination.
+// perf_cache.go — per-cycle garbage elimination.
 //
-// Three caches that remove the dominant allocation sources of the 30s
-// collect cycle WITHOUT changing any output bytes:
+// v0.9.108-lean: incremental tail cache + marshal-once document cache.
+// v0.9.109-lean2: streaming hash-as-you-go document writer — the v0.9.108
+// path still materialized the full document 2x per cycle (keyBytes map +
+// docBytes slice). The streaming writer encodes each key ONCE into a
+// reused buffer, feeds the md5 hasher and the file in the same pass, and
+// retains raw bytes ONLY for keys that actually changed (for the SSE
+// delta). The full document is never assembled in the common path.
 //
-//  1. readLogTailCached() — incremental log-tail reader.  v0.9.104's
-////     readLogTail() re-read up to 8MB from disk and built a fresh string
-//     EVERY cycle (even when the log had only grown by a few KB).  This
-//     keeps a per-file tail cache: unchanged files are not read at all,
-//     grown files are appended incrementally, and the assembled result
-//     string is reused verbatim when nothing changed.  Output is
-//     byte-identical to readLogTail() for the same file state.
-//
-//  2. buildDocRaw() — marshal each top-level key of the dashboard
-//     document exactly ONCE per cycle (was 3-4x: writeCurrentJSON,
-//     computeKeyHashes, notifySSE, and again per HTTP request).  The
-//     cached per-key bytes are reused for hashing (same md5 values as
-//     v0.9.104 — same input bytes), current.json assembly and SSE
-//     messages.  Assembled output is byte-identical to json.Marshal of
-//     the equivalent map (Go sorts map keys; we sort them the same way).
-//
-//  3. notifySSEFromRaw() / writeCurrentJSONFromRaw() — consume the
-//     cached bytes instead of re-marshaling.
-//
-// Design note (why this beats v0.9.105's approach): v0.9.105 replaced
-// json.Marshal with custom type-switch hashing and got a CPU REGRESSION
-// (Go's reflect encoder is heavily optimized).  This approach keeps
-// json.Marshal's fast path and simply stops calling it 3-4x per cycle.
+// Byte-identity guarantees:
+//   - current.json == json.Marshal(doc)  (sorted keys, same value bytes;
+//     json.Encoder.Encode == json.Marshal minus the trailing newline)
+//   - key hashes == v0.9.104's md5 over json.Marshal(v)  (same input
+//     bytes => identical SSE delta decisions)
+//   - SSE messages == json.Marshal of the v0.9.104 message maps
 
 import (
+        "bytes"
         "crypto/md5"
         "encoding/json"
         "fmt"
+        "io"
         "os"
         "path/filepath"
         "sort"
@@ -41,7 +31,7 @@ import (
 )
 
 // ============================================================================
-// 1. Incremental log-tail cache
+// 1. Incremental log-tail cache (v0.9.108-lean)
 // ============================================================================
 
 // logGlobPattern is a var so tests can point it at a sandbox directory.
@@ -66,12 +56,6 @@ var (
 // readLogTailCached returns the last `budget` bytes across all files
 // matching logGlobPattern, sorted newest-first by mtime, each chunk
 // terminated by '\n' — byte-identical to v0.9.104's readLogTail().
-//
-// Caching behaviour:
-//   - stat signature unchanged since last call → returns the cached
-//     string with zero reads and zero allocations (common on quiet hosts)
-//   - file grew → only the new bytes are read and appended to the cache
-//   - file shrank / rotated / budget changed → tail re-read for that file
 func readLogTailCached(budget int64) string {
         tailMu.Lock()
         defer tailMu.Unlock()
@@ -80,24 +64,20 @@ func readLogTailCached(budget int64) string {
         if len(files) == 0 {
                 return ""
         }
-        // Same ordering as readLogTail: newest-first by mtime.
         sort.Slice(files, func(i, j int) bool {
                 fi, _ := os.Stat(files[i])
                 fj, _ := os.Stat(files[j])
                 return fi.ModTime().After(fj.ModTime())
         })
 
-        // Budget change invalidates all cached chunk sizes.
         if budget != tailBudget {
                 tailFiles = map[string]*tailFile{}
                 tailBudget = budget
                 tailSig = ""
         }
 
-        // Refresh per-file chunks + build the state signature.
         var sig strings.Builder
         order := make([]*tailFile, 0, len(files))
-        paths := make([]string, 0, len(files))
         for _, p := range files {
                 fi, err := os.Stat(p)
                 if err != nil {
@@ -128,30 +108,24 @@ func readLogTailCached(budget int64) string {
                         }
                         fc.size, fc.mtime = size, mtime
                 default:
-                        // Shrank, rotated, or first read: full tail read.
                         fc.chunk = readTailRegion(p, size, budget)
                         fc.size, fc.mtime = size, mtime
                 }
                 order = append(order, fc)
-                paths = append(paths, p)
         }
 
-        // Nothing changed → return the previous assembled string as-is.
         s := sig.String()
         if s == tailSig && s != "" {
                 return tailJoined
         }
 
-        // Assemble exactly like readLogTail: for each file newest-first,
-        // take its last min(size, remaining) bytes + '\n'.
         var sb strings.Builder
         remaining := budget
-        for i, fc := range order {
+        for _, fc := range order {
                 if remaining <= 0 {
                         break
                 }
-                size := fc.size
-                take := size
+                take := fc.size
                 if take > remaining {
                         take = remaining
                 }
@@ -161,7 +135,6 @@ func readLogTailCached(budget int64) string {
                 sb.Write(fc.chunk[int64(len(fc.chunk))-take:])
                 sb.WriteByte('\n')
                 remaining -= take
-                _ = paths[i]
         }
         tailSig = s
         tailJoined = sb.String()
@@ -215,21 +188,244 @@ func resetTailCacheForTest() {
 }
 
 // ============================================================================
-// 2. Marshal-once document cache
+// 2. Streaming hash-as-you-go document writer (v0.9.109-lean2)
+// ============================================================================
+
+// docEncBuf/docEnc — reusable marshal scratch.  The collect cycle is a
+// single writer; the mutex only guards against concurrent test use.
+var (
+        docEncMu  sync.Mutex
+        docEncBuf bytes.Buffer
+        docEnc    = json.NewEncoder(&docEncBuf)
+)
+
+// docCycle carries what the SSE push needs from one document write:
+// the new per-key hashes, the raw JSON of CHANGED keys (retained copies)
+// and the list of removed keys.
+type docCycle struct {
+        newHashes map[string]string
+        changed   map[string][]byte
+        removed   []string
+}
+
+// writeCurrentJSONStream writes current.json from doc in a single pass:
+// each value is encoded once into a reused buffer, hashed (v0.9.104-
+// identical md5 over the same bytes), and streamed to the file.  Raw
+// bytes are retained only for keys whose hash changed since prevHashes.
+//
+// Returns ok=false when a value cannot be marshaled or the file cannot
+// be written; the caller then falls back to the v0.9.108 reference path.
+func writeCurrentJSONStream(doc map[string]interface{}, prevHashes map[string]string) (*docCycle, bool) {
+        keys := make([]string, 0, len(doc))
+        for k := range doc {
+                keys = append(keys, k)
+        }
+        sort.Strings(keys)
+
+        fullHash := (cycleCount % 4) == 0
+        firstPush := len(prevHashes) == 0
+
+        docEncMu.Lock()
+        defer docEncMu.Unlock()
+
+        path := filepath.Join(histDir, "current.json")
+        tmp := path + ".tmp"
+        f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+        if err != nil {
+                return nil, false
+        }
+        abort := func() {
+                f.Close()
+                os.Remove(tmp)
+        }
+        if _, err := f.Write([]byte{'{'}); err != nil {
+                abort()
+                return nil, false
+        }
+
+        hashes := make(map[string]string, len(doc))
+        changed := map[string][]byte{}
+        for i, k := range keys {
+                if i > 0 {
+                        if _, err := f.Write([]byte{','}); err != nil {
+                                abort()
+                                return nil, false
+                        }
+                }
+                kb, _ := json.Marshal(k)
+                if _, err := f.Write(kb); err != nil {
+                        abort()
+                        return nil, false
+                }
+                if _, err := f.Write([]byte{':'}); err != nil {
+                        abort()
+                        return nil, false
+                }
+                docEncBuf.Reset()
+                if err := docEnc.Encode(doc[k]); err != nil {
+                        abort()
+                        return nil, false
+                }
+                raw := docEncBuf.Bytes()
+                if n := len(raw); n > 0 && raw[n-1] == '\n' {
+                        raw = raw[:n-1] // json.Encoder appends '\n'; json.Marshal does not
+                }
+                if _, err := f.Write(raw); err != nil {
+                        abort()
+                        return nil, false
+                }
+                if !fullHash && slowChangingKeys[k] {
+                        continue // hashed every 4th cycle; carried forward below
+                }
+                sum := md5.Sum(raw)
+                h := fmt.Sprintf("%x", sum)
+                hashes[k] = h
+                if !firstPush {
+                        if prev, ok := prevHashes[k]; !ok || prev != h {
+                                cpy := make([]byte, len(raw))
+                                copy(cpy, raw)
+                                changed[k] = cpy
+                        }
+                }
+        }
+        if _, err := f.Write([]byte{'}'}); err != nil {
+                abort()
+                return nil, false
+        }
+        if err := f.Close(); err != nil {
+                os.Remove(tmp)
+                return nil, false
+        }
+        if err := os.Rename(tmp, path); err != nil {
+                os.Remove(tmp)
+                return nil, false
+        }
+
+        // v0.9.83 semantics: carry slow-key hashes forward on non-full cycles.
+        if !fullHash && len(prevHashes) > 0 {
+                for k := range slowChangingKeys {
+                        if _, ok := hashes[k]; !ok {
+                                if prev, ok := prevHashes[k]; ok {
+                                        hashes[k] = prev
+                                }
+                        }
+                }
+        }
+
+        var removed []string
+        for k := range prevHashes {
+                if _, exists := doc[k]; !exists {
+                        removed = append(removed, k)
+                }
+        }
+        return &docCycle{newHashes: hashes, changed: changed, removed: removed}, true
+}
+
+// fullMessageFromDisk builds the SSE full-document message
+// {"__t":"f","v":<doc>} from the just-written current.json.
+// Byte-identical to json.Marshal(map{"__t":"f","v":doc}).
+func fullMessageFromDisk() []byte {
+        data, err := os.ReadFile(filepath.Join(histDir, "current.json"))
+        if err != nil {
+                return []byte(`{"__t":"f","v":{}}`)
+        }
+        out := make([]byte, 0, len(data)+13)
+        out = append(out, `{"__t":"f","v":`...)
+        out = append(out, data...)
+        out = append(out, '}')
+        return out
+}
+
+// currentJSONFromDisk returns the current.json bytes (identical to
+// json.Marshal(c.current) at the last completed cycle).
+func currentJSONFromDisk() ([]byte, bool) {
+        data, err := os.ReadFile(filepath.Join(histDir, "current.json"))
+        if err != nil {
+                return nil, false
+        }
+        return data, true
+}
+
+// notifySSEFromCycle pushes the SSE delta for one document cycle.
+// Wire-format identical to v0.9.104's notifySSE():
+//   - first push (prevHashes empty): full document message
+//   - otherwise: {"__t":"d","c":{changed}}[, "r":[removed]]
+//   - keyHashes updated before the empty-delta early return, as in v0.9.104
+func (c *Collector) notifySSEFromCycle(cy *docCycle) {
+        c.mu.RLock()
+        prevHashes := c.keyHashes
+        c.mu.RUnlock()
+
+        if len(prevHashes) == 0 {
+                data := fullMessageFromDisk()
+                c.mu.Lock()
+                for client := range c.sseClients {
+                        select {
+                        case client <- data:
+                        default:
+                        }
+                }
+                c.keyHashes = cy.newHashes
+                c.mu.Unlock()
+                return
+        }
+
+        deltaKeys := make([]string, 0, len(cy.changed))
+        for k := range cy.changed {
+                deltaKeys = append(deltaKeys, k)
+        }
+        sort.Strings(deltaKeys)
+
+        // Assemble {"__t":"d","c":{...}} [, "r":[...]] exactly like
+        // json.Marshal of the v0.9.104 message map (keys sorted __t,c,r;
+        // delta object keys sorted).
+        var buf []byte
+        if len(deltaKeys) > 0 || len(cy.removed) > 0 {
+                buf = append(buf, `{"__t":"d","c":{`...)
+                for i, k := range deltaKeys {
+                        if i > 0 {
+                                buf = append(buf, ',')
+                        }
+                        kb, _ := json.Marshal(k)
+                        buf = append(buf, kb...)
+                        buf = append(buf, ':')
+                        buf = append(buf, cy.changed[k]...)
+                }
+                buf = append(buf, '}')
+                if len(cy.removed) > 0 {
+                        buf = append(buf, `,"r":[`...)
+                        for i, k := range cy.removed {
+                                if i > 0 {
+                                        buf = append(buf, ',')
+                                }
+                                kb, _ := json.Marshal(k)
+                                buf = append(buf, kb...)
+                        }
+                        buf = append(buf, ']')
+                }
+                buf = append(buf, '}')
+        }
+
+        c.mu.Lock()
+        c.keyHashes = cy.newHashes
+        if buf != nil {
+                for client := range c.sseClients {
+                        select {
+                        case client <- buf:
+                        default:
+                        }
+                }
+        }
+        c.mu.Unlock()
+}
+
+// ============================================================================
+// 3. Reference implementations (v0.9.108) — kept as fallback + test oracles
 // ============================================================================
 
 // buildDocRaw marshals every top-level value of doc exactly once and
 // assembles the full document from the cached per-key bytes.
-//
-// Returns:
-//   - docBytes: identical bytes to json.Marshal(doc) — Go's map encoder
-//     sorts keys; we sort them the same way.  Per-value bytes come from
-//     json.Marshal itself (same escaping, same float formatting).
-//   - keyBytes: per-key raw JSON, reused for md5 hashing (identical hash
-//     values to v0.9.104's computeKeyHashes) and SSE delta assembly.
-//
-// On any per-key marshal error the function falls back to a single
-// json.Marshal(doc) so the output degrades exactly like v0.9.104.
+// Byte-identical to json.Marshal(doc).
 func buildDocRaw(doc map[string]interface{}) (docBytes []byte, keyBytes map[string][]byte) {
         keys := make([]string, 0, len(doc))
         for k := range doc {
@@ -242,8 +438,6 @@ func buildDocRaw(doc map[string]interface{}) (docBytes []byte, keyBytes map[stri
         for _, k := range keys {
                 raw, err := json.Marshal(doc[k])
                 if err != nil {
-                        // Fallback: identical behaviour to v0.9.104's
-                        // json.Marshal(c.current) (which also fails).
                         data, _ := json.Marshal(doc)
                         keyBytes = map[string][]byte{}
                         for _, kk := range keys {
@@ -261,7 +455,7 @@ func buildDocRaw(doc map[string]interface{}) (docBytes []byte, keyBytes map[stri
                 if i > 0 {
                         buf = append(buf, ',')
                 }
-                kb, _ := json.Marshal(k) // quoted key, same escaping as map encoder
+                kb, _ := json.Marshal(k)
                 buf = append(buf, kb...)
                 buf = append(buf, ':')
                 buf = append(buf, keyBytes[k]...)
@@ -271,7 +465,7 @@ func buildDocRaw(doc map[string]interface{}) (docBytes []byte, keyBytes map[stri
 }
 
 // writeCurrentJSONFromRaw writes the pre-marshaled document atomically.
-// Byte-identical to v0.9.104's writeCurrentJSON() output.
+// Fallback path for writeCurrentJSONStream failures.
 func (c *Collector) writeCurrentJSONFromRaw(docBytes []byte) {
         path := filepath.Join(histDir, "current.json")
         tmp := path + ".tmp"
@@ -282,16 +476,8 @@ func (c *Collector) writeCurrentJSONFromRaw(docBytes []byte) {
         os.Rename(tmp, path)
 }
 
-// ============================================================================
-// 3. SSE delta from cached bytes
-// ============================================================================
-
-// notifySSEFromRaw is a byte-output-compatible replacement for
-// notifySSE() that hashes the pre-marshaled key bytes instead of
-// re-marshaling every value.  md5 inputs are the same bytes v0.9.104
-// hashed, so the stored keyHashes values and the delta decisions are
-// identical.  Message assembly reproduces json.Marshal's map output
-// (sorted keys, same value bytes).
+// notifySSEFromRaw — v0.9.108 reference SSE push (used as fallback and
+// as the byte-identity oracle in tests).
 func (c *Collector) notifySSEFromRaw(keyBytes map[string][]byte) {
         c.mu.RLock()
         current := c.current
@@ -307,7 +493,6 @@ func (c *Collector) notifySSEFromRaw(keyBytes map[string][]byte) {
                 sum := md5.Sum(raw)
                 newHashes[k] = fmt.Sprintf("%x", sum)
         }
-        // v0.9.83 semantics: carry forward slow-key hashes on non-full cycles.
         if !fullHash && len(prevHashes) > 0 {
                 for k := range slowChangingKeys {
                         if _, ok := newHashes[k]; !ok {
@@ -319,7 +504,6 @@ func (c *Collector) notifySSEFromRaw(keyBytes map[string][]byte) {
         }
 
         if len(prevHashes) == 0 {
-                // Full document — first push or after reset.
                 data := assembleFullMessage(c, keyBytes)
                 c.mu.Lock()
                 for client := range c.sseClients {
@@ -333,7 +517,6 @@ func (c *Collector) notifySSEFromRaw(keyBytes map[string][]byte) {
                 return
         }
 
-        // Delta — only changed keys.
         deltaKeys := make([]string, 0, len(current))
         for k := range current {
                 hash, ok := newHashes[k]
@@ -352,18 +535,14 @@ func (c *Collector) notifySSEFromRaw(keyBytes map[string][]byte) {
                 }
         }
 
-        // Store new hashes for next cycle regardless of whether we send anything.
         c.mu.Lock()
         c.keyHashes = newHashes
         c.mu.Unlock()
 
         if len(deltaKeys) == 0 && len(removed) == 0 {
-                return // nothing changed
+                return
         }
 
-        // Assemble {"__t":"d","c":{...}} [, "r":[...]] exactly like
-        // json.Marshal of the v0.9.104 message map (keys sorted: __t, c, r;
-        // delta object keys sorted).
         sort.Strings(deltaKeys)
         var buf []byte
         buf = append(buf, `{"__t":"d","c":{`...)
@@ -401,12 +580,10 @@ func (c *Collector) notifySSEFromRaw(keyBytes map[string][]byte) {
 }
 
 // assembleFullMessage builds {"__t":"f","v":<doc>} from cached bytes.
-// Byte-identical to json.Marshal(map[string]interface{}{"__t":"f","v":doc}).
 func assembleFullMessage(c *Collector, keyBytes map[string][]byte) []byte {
         c.mu.RLock()
         current := c.current
         c.mu.RUnlock()
-        // Reassemble the document in sorted key order (same as buildDocRaw).
         keys := make([]string, 0, len(current))
         for k := range current {
                 keys = append(keys, k)
@@ -431,4 +608,60 @@ func assembleFullMessage(c *Collector, keyBytes map[string][]byte) []byte {
         }
         buf = append(buf, '}', '}')
         return buf
+}
+
+// ============================================================================
+// 4. Static-asset gzip cache (v0.9.109-lean2)
+// ============================================================================
+
+// gzipCache — serveStatic used to re-gzip the 205KB chart.umd.min.js on
+// EVERY request.  Cache the compressed bytes per (path, mtime, size).
+type gzipEntry struct {
+        size  int64
+        mtime int64
+        gz    []byte
+}
+
+var (
+        gzipMu    sync.Mutex
+        gzipCache = map[string]*gzipEntry{}
+)
+
+// gzipCached returns the gzip encoding of data for path (level-default,
+// byte-identical to gzip.NewWriter on the same input), cached across
+// requests.  Falls back to nil on cache miss failure (caller streams).
+func gzipCached(path string, data []byte) []byte {
+        var size, mtime int64
+        if fi, err := os.Stat(path); err == nil {
+                size = fi.Size()
+                mtime = fi.ModTime().UnixNano()
+        }
+        gzipMu.Lock()
+        defer gzipMu.Unlock()
+        if e := gzipCache[path]; e != nil && e.size == size && e.mtime == mtime {
+                return e.gz
+        }
+        var buf bytes.Buffer
+        zw := newGzipWriter(&buf)
+        if _, err := zw.Write(data); err != nil {
+                return nil
+        }
+        if err := zw.Close(); err != nil {
+                return nil
+        }
+        gz := buf.Bytes()
+        gzipCache[path] = &gzipEntry{size: size, mtime: mtime, gz: gz}
+        return gz
+}
+
+// resetGzipCacheForTest clears the gzip cache (tests only).
+func resetGzipCacheForTest() {
+        gzipMu.Lock()
+        defer gzipMu.Unlock()
+        gzipCache = map[string]*gzipEntry{}
+}
+
+// newGzipWriter is isolated so the gzip import lives in one place.
+func newGzipWriter(w io.Writer) gzipWriter {
+        return gzipNewWriter(w)
 }
