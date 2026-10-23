@@ -15,6 +15,18 @@ package main
 //
 // On restart, loadCSVTailIntoRingBuffer() reads the last 24h of CSV
 // into the raw ring buffer so 1h/24h charts work immediately.
+//
+// v0.9.111 (measured on al): the ring now holds ONLY selectable buckets
+// (top-8 table buckets + labeled — the set the charts can display).
+// Previously it held entries for ALL BPF-map hosts (324 on al) and:
+//   - saveToDisk() marshaled the whole ring every 10 cycles: a 13MB
+//     JSON marshal + 13MB file write every 5 min (profile: 26.8MB of
+//     cumulative churn, the #2 allocator)
+//   - ~20MB of ring backing arrays sat live for buckets that no chart,
+//     panel or endpoint can read (dashboard.js only ever requests
+//     selectable buckets — see buildSelectable in collect.go)
+// Non-selectable entries (including CSV history loaded at startup) are
+// dropped on the next capture cycle.
 
 import (
         "sync"
@@ -26,18 +38,8 @@ import (
 // ============================================================================
 
 // v0.7.2: arrays instead of maps — saves ~1.5GB memory on 104-bucket hosts.
-// Each map has ~150 bytes overhead; 1.5M maps × 150B = 225MB just for empty
-// map headers.  Arrays are inline in the struct — zero overhead.
-//
-// v0.9.96: Ss/Bs/Ns changed from [16]int to [16]int16. swap_score range
-// is 0-1024 (kernel bpftune defines it as u16 capped at 1024), bad_streak
-// and null_streak are 0-255 (u8). All fit comfortably in int16 (max 32767).
-// Saves 96 bytes per snapshot (3 × 16 × 4B → 3 × 16 × 2B = 96B saved) which
-// is ~3.4 MB on the 1h ring buffer (120 cycles × ~104 buckets × 96 B =
-// ~1.2 MB on a 104-bucket host; up to ~3.4 MB on busier hosts).
-//
-// IMPORTANT: aggregation MUST be done in int (not int16) to avoid overflow
-// when summing many snapshots — see aggregateSnapshots.
+// v0.9.96: Ss/Bs/Ns are int16 (swap_score 0-1024, streaks 0-255).
+// IMPORTANT: aggregation MUST be done in int (not int16) — see aggregateSnapshots.
 type bucketSnapshot struct {
         Ts         int64       `json:"ts"` // wall-clock collected_ts
         BestAlg    string      `json:"best_alg"`
@@ -49,9 +51,9 @@ type bucketSnapshot struct {
         RateBestV  float64     `json:"rate_best_v"`
         TcpRmemMax int         `json:"tcp_rmem_max"`
         Re         [16]float64 `json:"re"` // rate_ema per alg index
-        Ss         [16]int16   `json:"ss"` // v0.9.96: was [16]int — swap_score (0-1024), fits in int16
-        Bs         [16]int16   `json:"bs"` // v0.9.96: was [16]int — bad_streak (0-255), fits in int16
-        Ns         [16]int16   `json:"ns"` // v0.9.96: was [16]int — null_streak (0-255), fits in int16
+        Ss         [16]int16   `json:"ss"` // v0.9.96: was [16]int
+        Bs         [16]int16   `json:"bs"` // v0.9.96: was [16]int
+        Ns         [16]int16   `json:"ns"` // v0.9.96: was [16]int
         Mv         [16]float64 `json:"mv"` // metric_value per alg index
 }
 
@@ -62,17 +64,20 @@ type historyStore struct {
         raw        map[string][]bucketSnapshot // bucketID → last ringCap snapshots (1h)
         cycleCount int
         // v0.7.3: csvAll is loaded once per renderToDisk cycle, then freed.
-        // This avoids holding the 47MB CSV in memory permanently.
         csvAll map[string][]bucketSnapshot
         // v0.7.5p: streamed series for slow ranges (7d/30d/all).
-        // Set by renderSlowToDisk via streamCSVToSeries(), then freed.
-        // renderBucketToDisk uses this instead of readBucketCSVFromMap.
         streamedSeries map[string]map[string]map[string]interface{}
 }
 
 // ringCap is the ring buffer size.  Default 120 = 1h at 30s intervals.
 // Configurable via --ring-cap flag.
 var ringCap = 120
+
+// ringSelectable — v0.9.111: when non-nil, captureSnapshotsFromBPF keeps
+// ring entries ONLY for these bucket keys and drops everything else.
+// Set by collect() each cycle (buildSelectable); nil = keep all (tests).
+// Accessed only from the collect goroutine.
+var ringSelectable map[string]bool
 
 var hist = &historyStore{
         raw: map[string][]bucketSnapshot{},
@@ -86,18 +91,12 @@ func (h *historyStore) addSnapshot(bucketID string, snap bucketSnapshot) {
         h.mu.Lock()
         defer h.mu.Unlock()
 
-        // v0.7.3: ring buffer cap = 120 (1h at 30s).  24h/7d/all charts read
-        // from CSV via static files (rendered every 5 min by renderToDisk).
-        // This cuts memory from ~220MB to ~9MB for the ring buffer.
+        // v0.7.3: ring buffer cap = 120 (1h at 30s).
         h.raw[bucketID] = append(h.raw[bucketID], snap)
         if len(h.raw[bucketID]) > ringCap {
                 s := h.raw[bucketID][len(h.raw[bucketID])-ringCap:]
                 // v0.9.109: compact when the backing array has drifted far
-                // ahead of the visible window.  The old append+reslice kept
-                // the dropped snapshots' backing array alive until Go's
-                // growth cycle reallocated it — up to ~2x ringCap retained
-                // per bucket (~8MB across 68 buckets).  Compacting to
-                // exactly ringCap bounds the waste at one extra copy.
+                // ahead of the visible window (bounds retained dead copies).
                 if cap(s) > 2*ringCap {
                         ns := make([]bucketSnapshot, ringCap)
                         copy(ns, s)
@@ -105,10 +104,6 @@ func (h *historyStore) addSnapshot(bucketID string, snap bucketSnapshot) {
                 }
                 h.raw[bucketID] = s
         }
-
-        // v0.7.3: save to disk every 10 cycles (5 min) for crash recovery.
-        // No more bin5m/bin1h/bin6h — those were for 24h/7d/all which now
-        // come from CSV.
 }
 
 // aggregateSnapshots averages a list of snapshots into a single bin.
@@ -119,7 +114,6 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
         if len(snaps) == 1 {
                 return snaps[0]
         }
-        // v0.7.2: arrays are zero-valued by default — no init needed
         out := bucketSnapshot{
                 BestAlg:    snaps[len(snaps)-1].BestAlg,
                 BestI:      snaps[len(snaps)-1].BestI,
@@ -128,9 +122,7 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
         var sumTs int64
         var sumInst, sumRBI int
         var sumRR, sumMinRtt, sumRBV float64
-        // v0.9.96: Ss/Bs/Ns are int16 in the struct but sum in int to avoid
-        // overflow (120 snapshots × 1024 max swap_score = 122,880 > int16
-        // max of 32,767). Convert back to int16 at the end after averaging.
+        // v0.9.96: sum in int to avoid int16 overflow.
         var sumSs, sumBs, sumNs [16]int
         for _, s := range snaps {
                 sumTs += s.Ts
@@ -139,7 +131,6 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
                 sumRR += s.RefRate
                 sumMinRtt += s.MinRtt
                 sumRBV += s.RateBestV
-                // v0.7.2: array index instead of map key
                 for i := 0; i < 16; i++ {
                         out.Re[i] += s.Re[i]
                         sumSs[i] += int(s.Ss[i])
@@ -155,7 +146,6 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
         out.RefRate = sumRR / float64(n)
         out.MinRtt = sumMinRtt / float64(n)
         out.RateBestV = sumRBV / float64(n)
-        // v0.7.2: divide arrays by n
         for i := 0; i < 16; i++ {
                 out.Re[i] /= float64(n)
                 out.Ss[i] = int16(sumSs[i] / n)
@@ -170,18 +160,15 @@ func aggregateSnapshots(snaps []bucketSnapshot) bucketSnapshot {
 // RANGES — mirrors Python renderer RANGES dict
 // ============================================================================
 
-// v0.7.4: five ranges. 1h+24h are "fast" (every 5 min). 7d+30d+all are
-// "slow" (daily at 4am).  "all" = full history, never pruned.
 var ranges = map[string][2]interface{}{
         "1h":  {3600, 60},          // 1h, 60s bins
         "24h": {86400, 300},        // 24h, 5min bins
         "7d":  {7 * 86400, 3600},   // 7d, 1h bins
         "30d": {30 * 86400, 3600},  // 30d, 1h bins
-        "all": {90 * 86400, 86400}, // 90 days, 24h bins (lightweight overview)
+        "all": {90 * 86400, 86400}, // 90 days, 24h bins
 }
 
 // isFastRange returns true for ranges that update every 5 min (1h, 24h).
-// Slow ranges (7d, 30d, all) only update at 4am daily.
 func isFastRange(rng string) bool {
         return rng == "1h" || rng == "24h"
 }
@@ -197,7 +184,12 @@ func captureSnapshotsFromBPF(hosts []hostEntry, now int64) {
                 if h.Inst < 2 {
                         continue
                 }
-                // v0.7.2: arrays are zero-valued by default — no init needed
+                // v0.9.111: only selectable buckets enter the ring (see
+                // ringSelectable). Non-selectable hosts' series are read
+                // by no chart/panel/endpoint.
+                if ringSelectable != nil && !ringSelectable[h.Addr] {
+                        continue
+                }
                 snap := bucketSnapshot{
                         Ts:        now,
                         BestAlg:   "",
@@ -220,9 +212,6 @@ func captureSnapshotsFromBPF(hosts []hostEntry, now int64) {
                         if !ok {
                                 continue
                         }
-                        // v0.7.2: array index instead of map key
-                        // v0.9.96: cast int → int16 (swap_score 0-1024,
-                        // bad_streak/null_streak 0-255 — all fit in int16).
                         snap.Re[i] = toFloat(mi["rate_ema"])
                         snap.Ss[i] = int16(toInt(mi["swap_score"]))
                         snap.Bs[i] = int16(toInt(mi["bad_streak"]))
@@ -232,10 +221,19 @@ func captureSnapshotsFromBPF(hosts []hostEntry, now int64) {
                 hist.addSnapshot(h.Addr, snap)
         }
 
-        // v0.9.9: prune dead buckets — remove ring buffer entries for hosts
-        // that haven't been seen in the BPF map for 5 cycles (~2.5 min).
-        // This prevents the ring buffer from accumulating entries for
-        // hundreds of dead hosts over weeks of operation.
+        // v0.9.111: converge — drop ring entries outside the selectable
+        // set (clears CSV history loaded at startup and stale labels).
+        if ringSelectable != nil {
+                hist.mu.Lock()
+                for k := range hist.raw {
+                        if !ringSelectable[k] {
+                                delete(hist.raw, k)
+                        }
+                }
+                hist.mu.Unlock()
+        }
+
+        // v0.9.9: prune dead buckets (not seen in the BPF map for 5 cycles).
         hist.cycleCount++  // v0.9.25: increment once per cycle (was per-snapshot)
         if hist.cycleCount%5 == 0 {
                 hist.pruneDeadBuckets(hosts)
@@ -248,7 +246,7 @@ func captureSnapshotsFromBPF(hosts []hostEntry, now int64) {
 
 // pruneDeadBuckets removes ring buffer entries for bucket IDs that are
 // not in the current hosts list and haven't had a snapshot in the last
-// 5 cycles. This frees memory and speeds up ring buffer iteration.
+// 5 cycles.
 func (h *historyStore) pruneDeadBuckets(hosts []hostEntry) {
         alive := make(map[string]bool, len(hosts))
         for _, h := range hosts {
@@ -260,7 +258,6 @@ func (h *historyStore) pruneDeadBuckets(hosts []hostEntry) {
                 if alive[bucketID] {
                         continue
                 }
-                // Keep if last snapshot is recent (< 5 min)
                 if len(snaps) > 0 {
                         last := snaps[len(snaps)-1].Ts
                         if time.Now().Unix()-last < 300 {
