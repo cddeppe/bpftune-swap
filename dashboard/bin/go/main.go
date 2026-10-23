@@ -41,12 +41,6 @@ import (
 	"time"
 )
 
-// gzipNewWriter is the single construction point for gzip writers
-// (used by the static-asset cache in perf_cache.go).
-func gzipNewWriter(w gzipWriterDst) gzipWriter {
-	return gzip.NewWriter(w)
-}
-
 // ============================================================================
 // Configuration
 // ============================================================================

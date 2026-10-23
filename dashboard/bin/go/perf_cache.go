@@ -19,10 +19,10 @@ package main
 
 import (
         "bytes"
+        "compress/gzip"
         "crypto/md5"
         "encoding/json"
         "fmt"
-        "io"
         "os"
         "path/filepath"
         "sort"
@@ -614,7 +614,7 @@ func assembleFullMessage(c *Collector, keyBytes map[string][]byte) []byte {
 // 4. Static-asset gzip cache (v0.9.109-lean2)
 // ============================================================================
 
-// gzipCache — serveStatic used to re-gzip the 205KB chart.umd.min.js on
+// gzipEntry — serveStatic used to re-gzip the 205KB chart.umd.min.js on
 // EVERY request.  Cache the compressed bytes per (path, mtime, size).
 type gzipEntry struct {
         size  int64
@@ -627,9 +627,9 @@ var (
         gzipCache = map[string]*gzipEntry{}
 )
 
-// gzipCached returns the gzip encoding of data for path (level-default,
-// byte-identical to gzip.NewWriter on the same input), cached across
-// requests.  Falls back to nil on cache miss failure (caller streams).
+// gzipCached returns the gzip encoding of data for path (default
+// compression level — byte-identical to gzip.NewWriter on the same
+// input), cached across requests.  Returns nil on error (caller streams).
 func gzipCached(path string, data []byte) []byte {
         var size, mtime int64
         if fi, err := os.Stat(path); err == nil {
@@ -642,7 +642,7 @@ func gzipCached(path string, data []byte) []byte {
                 return e.gz
         }
         var buf bytes.Buffer
-        zw := newGzipWriter(&buf)
+        zw := gzip.NewWriter(&buf)
         if _, err := zw.Write(data); err != nil {
                 return nil
         }
@@ -659,9 +659,4 @@ func resetGzipCacheForTest() {
         gzipMu.Lock()
         defer gzipMu.Unlock()
         gzipCache = map[string]*gzipEntry{}
-}
-
-// newGzipWriter is isolated so the gzip import lives in one place.
-func newGzipWriter(w io.Writer) gzipWriter {
-        return gzipNewWriter(w)
 }
