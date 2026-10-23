@@ -91,7 +91,19 @@ func (h *historyStore) addSnapshot(bucketID string, snap bucketSnapshot) {
         // This cuts memory from ~220MB to ~9MB for the ring buffer.
         h.raw[bucketID] = append(h.raw[bucketID], snap)
         if len(h.raw[bucketID]) > ringCap {
-                h.raw[bucketID] = h.raw[bucketID][len(h.raw[bucketID])-ringCap:]
+                s := h.raw[bucketID][len(h.raw[bucketID])-ringCap:]
+                // v0.9.109: compact when the backing array has drifted far
+                // ahead of the visible window.  The old append+reslice kept
+                // the dropped snapshots' backing array alive until Go's
+                // growth cycle reallocated it — up to ~2x ringCap retained
+                // per bucket (~8MB across 68 buckets).  Compacting to
+                // exactly ringCap bounds the waste at one extra copy.
+                if cap(s) > 2*ringCap {
+                        ns := make([]bucketSnapshot, ringCap)
+                        copy(ns, s)
+                        s = ns
+                }
+                h.raw[bucketID] = s
         }
 
         // v0.7.3: save to disk every 10 cycles (5 min) for crash recovery.
