@@ -28,7 +28,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -265,12 +264,6 @@ func (c *Collector) collect() {
 
 	c.writeCurrentJSON()
 	c.notifySSE()
-
-	// v0.9.106: return freed memory to OS every 10th cycle (5 min).
-	// Cost: ~30ms. Reduces RSS without CPU regression.
-	if cycleCount%10 == 0 {
-		debug.FreeOSMemory()
-	}
 }
 
 // buildLiveBuckets constructs the buckets list (top 8),
