@@ -49,13 +49,11 @@ var (
 // ============================================================================
 
 type Collector struct {
-	mu           sync.RWMutex
-	current      map[string]interface{} // current.json data
-	keyHashes    map[string]string      // per-key md5 for SSE delta
-	sseClients   map[chan []byte]bool
-	startedAt    time.Time    // for uptime_min field
-	cachedJSON   []byte       // v0.9.107
-	cachedJSONMu sync.RWMutex // v0.9.107
+	mu         sync.RWMutex
+	current    map[string]interface{} // current.json data
+	keyHashes  map[string]string      // per-key md5 for SSE delta
+	sseClients map[chan []byte]bool
+	startedAt  time.Time // for uptime_min field
 }
 
 func NewCollector() *Collector {
@@ -77,15 +75,10 @@ func NewCollector() *Collector {
 // current.json writer
 // ============================================================================
 
-// v0.9.107: marshal ONCE, cache for HTTP handlers.
 func (c *Collector) writeCurrentJSON() {
 	c.mu.RLock()
 	data, _ := json.Marshal(c.current)
 	c.mu.RUnlock()
-
-	c.cachedJSONMu.Lock()
-	c.cachedJSON = data
-	c.cachedJSONMu.Unlock()
 
 	path := filepath.Join(histDir, "current.json")
 	tmp := path + ".tmp"
@@ -94,12 +87,6 @@ func (c *Collector) writeCurrentJSON() {
 		return
 	}
 	os.Rename(tmp, path)
-}
-
-func (c *Collector) getCachedJSON() []byte {
-	c.cachedJSONMu.RLock()
-	defer c.cachedJSONMu.RUnlock()
-	return c.cachedJSON
 }
 
 // v0.9.83: slow-changing keys that don't need to be hashed every 30s cycle.
@@ -357,13 +344,9 @@ func (c *Collector) serveStatic(w http.ResponseWriter, r *http.Request, path, co
 }
 
 func (c *Collector) handleCurrentJSON(w http.ResponseWriter, r *http.Request) {
-	// v0.9.107: serve cached JSON
-	data := c.getCachedJSON()
-	if len(data) == 0 {
-		c.mu.RLock()
-		data, _ = json.Marshal(c.current)
-		c.mu.RUnlock()
-	}
+	c.mu.RLock()
+	data, _ := json.Marshal(c.current)
+	c.mu.RUnlock()
 
 	if acceptsGzip(r) {
 		w.Header().Set("Content-Type", "application/json")
