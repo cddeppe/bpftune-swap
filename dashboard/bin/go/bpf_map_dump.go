@@ -5,10 +5,19 @@ package main
 // value struct into the same map[string]interface{} structure that the
 // bpftool JSON parser produces.
 //
-// v0.9.86: eliminates the `bpftool --json map dump` fork in readBPFMap
-// (called every 30s when the entry count changes) and the
-// `bpftool --json map show name remote_host_map` fork (called every 30s
-// to check entry count). Both replaced with in-process syscalls.
+// v0.9.86: eliminates the `bpftool --json map dump` + `map show` forks.
+//
+// v0.9.112 (round 5) — fixes for the field failure on al
+// ("bpfMapGetNextKey: BPF_MAP_GET_NEXT_KEY: invalid argument"):
+//   1. iteration now STARTS with key=NULL (the kernel contract). The old
+//      code passed a 16-byte zero-filled key on the first call — map
+//      types whose get_next_key rejects unknown keys answer EINVAL.
+//   2. curKey no longer ALIASES nextKey (`curKey = nextKey` made both
+//      slices the same memory from iteration 2 on) — now a copy.
+//   3. key/value sizes are validated against BPF_OBJ_GET_INFO_BY_FD
+//      (the real map geometry) instead of being assumed 16/1024.
+//   4. every failure now names the map (name/id/type/sizes) so any
+//      residual fallback is self-diagnosing in the journal.
 //
 // Struct layout (must match streak_writeback.go constants):
 //
@@ -41,20 +50,28 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("getMapFD: %w", err)
 	}
 
-	// Iterate keys with BPF_MAP_GET_NEXT_KEY.
-	// The remote_host_map uses 16-byte keys (in6_addr).
+	// v0.9.112: ask the kernel for the map's real geometry instead of
+	// assuming it. Used for buffer sizing, validation and diagnostics.
+	info, infoErr := bpfMapGetInfoByFD(fd)
 	keySize := 16
 	valueSize := sizeofRemoteHost // 1024 bytes
+	if infoErr == nil {
+		if info.KeySize != uint32(keySize) || info.ValueSize != uint32(valueSize) {
+			return nil, fmt.Errorf("map %q (id=%d type=%d): key_size=%d value_size=%d, parser expects %d/%d",
+				info.Name, info.ID, info.Type, info.KeySize, info.ValueSize, keySize, valueSize)
+		}
+	}
 
+	// v0.9.112: iterate with key=NULL first (kernel contract), then walk
+	// forward with a COPY of the previous nextKey (no aliasing).
 	var entries []map[string]interface{}
-	curKey := make([]byte, keySize)
 	nextKey := make([]byte, keySize)
-	hasKey := false
+	var curKey []byte // nil = start of iteration
 
 	for {
 		ok, err := bpfMapGetNextKey(fd, curKey, nextKey)
 		if err != nil {
-			return nil, fmt.Errorf("bpfMapGetNextKey: %w", err)
+			return nil, mapIterError(info, infoErr, err)
 		}
 		if !ok {
 			break // no more keys
@@ -63,8 +80,7 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		value := make([]byte, valueSize)
 		if err := bpfMapLookupElem(fd, nextKey, value); err != nil {
 			// Key was deleted between GET_NEXT_KEY and LOOKUP_ELEM — skip.
-			curKey = nextKey
-			hasKey = true
+			curKey = append(curKey[:0], nextKey...)
 			continue
 		}
 
@@ -72,28 +88,31 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		entry := parseRawHostEntry(nextKey, value)
 		entries = append(entries, entry)
 
-		curKey = nextKey
-		hasKey = true
+		curKey = append(curKey[:0], nextKey...) // v0.9.112: COPY (was aliasing)
 	}
 
-	if !hasKey && len(entries) == 0 {
-		// Map is empty — that's valid, return empty slice.
+	if entries == nil {
+		// Map is empty — that's valid, return empty slice (v0.9.86 contract).
 		return []map[string]interface{}{}, nil
 	}
-
 	return entries, nil
 }
 
+// mapIterError enriches iteration failures with the map's identity so the
+// rate-limited fallback log line in bpf_reader.go is self-diagnosing.
+func mapIterError(info bpfMapInfo, infoErr, err error) error {
+	if infoErr != nil {
+		return fmt.Errorf("bpfMapGetNextKey: %w (map info unavailable: %v)", err, infoErr)
+	}
+	return fmt.Errorf("bpfMapGetNextKey: %w (map %q id=%d type=%d key_size=%d value_size=%d)",
+		err, info.Name, info.ID, info.Type, info.KeySize, info.ValueSize)
+}
+
 // parseRawHostEntry converts a raw 16-byte key + 1024-byte value into the
-// same "formatted" structure that bpftool --json produces. This allows
-// the existing readBPFMap merge logic to work unchanged.
+// same "formatted" structure that bpftool --json produces.
 func parseRawHostEntry(key, value []byte) map[string]interface{} {
-	// Parse key (in6_addr, 16 bytes) into the same structure as bpftool.
 	keyMap := parseRawKey(key)
-
-	// Parse value (1024 bytes) into field maps.
 	valMap := parseRawValue(value)
-
 	return map[string]interface{}{
 		"formatted": map[string]interface{}{
 			"key":   keyMap,
@@ -121,23 +140,18 @@ func parseRawKey(key []byte) map[string]interface{} {
 func parseRawValue(buf []byte) map[string]interface{} {
 	val := map[string]interface{}{}
 
-	// Parse 14 prefix u64 fields at known offsets.
-	// Each is 8 bytes, little-endian.
+	// Parse 14 prefix u64 fields at known offsets (little-endian).
+	// bpftool outputs these as JSON numbers (float64 after unmarshal).
 	for i, name := range prefixFields {
 		off := i * 8
 		if off+8 > len(buf) {
 			break
 		}
 		v := binary.LittleEndian.Uint64(buf[off : off+8])
-		// bpftool outputs these as JSON numbers (float64 in Go's json.Unmarshal).
-		// Convert to float64 for compatibility with existing code that does
-		// toFloat(val["min_rtt"]) etc.
 		val[name] = float64(v)
 	}
 
 	// Parse rate_hist: 32 × u32 bins + u64 sum.
-	// bpftool outputs these as "rate_hist" → { "bins": [...], "sum": N }.
-	// We put them in the same nested structure.
 	if offRateHist+sizeofRateHist <= len(buf) {
 		bins := make([]interface{}, rateHistBins)
 		for i := 0; i < rateHistBins; i++ {
@@ -152,7 +166,7 @@ func parseRawValue(buf []byte) map[string]interface{} {
 		}
 	}
 
-	// Parse metrics[16]: each 48 bytes with u64 + u64 + u64 + u64 + 5×u16 + u8 + u8 + pad.
+	// Parse metrics[16]: each 48 bytes.
 	metrics := make([]interface{}, numTCPConnMetrics)
 	for i := 0; i < numTCPConnMetrics; i++ {
 		base := offMetricsArray + i*sizeofTCPConnMetric
@@ -177,28 +191,20 @@ func parseRawValue(buf []byte) map[string]interface{} {
 	}
 	val["metrics"] = metrics
 
-	// Also set "instances" and "min_rtt" at top level for code that reads
-	// val["instances"] / val["min_rtt"] directly (these are already in
-	// prefixFields, but bpftool also includes them at the value root —
-	// actually they ARE the prefix fields, so they're already set above).
-
-	// Set V4MinRTT / V6MinRTT — these aren't in the raw struct, they're
-	// computed by readBPFMap's merge logic. Leave them out — the caller
-	// handles them.
-
 	return val
 }
 
 // getMapEntryCountSyscall counts BPF map entries via BPF_MAP_GET_NEXT_KEY
 // iteration. Used to check if the cache is stale without forking bpftool.
+// v0.9.112: same iteration contract as readBPFMapSyscall (nil start, no aliasing).
 func getMapEntryCountSyscall(mapID int) (int, error) {
 	fd, err := getMapFD(mapID)
 	if err != nil {
 		return -1, err
 	}
 	count := 0
-	curKey := make([]byte, 16) // remote_host_map key size
-	nextKey := make([]byte, 16)
+	nextKey := make([]byte, 16) // remote_host_map key size
+	var curKey []byte          // nil = start of iteration
 	for {
 		ok, err := bpfMapGetNextKey(fd, curKey, nextKey)
 		if err != nil {
@@ -208,7 +214,7 @@ func getMapEntryCountSyscall(mapID int) (int, error) {
 			break
 		}
 		count++
-		curKey = nextKey
+		curKey = append(curKey[:0], nextKey...)
 	}
 	return count, nil
 }
