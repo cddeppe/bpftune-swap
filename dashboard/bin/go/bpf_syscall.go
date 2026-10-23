@@ -1,23 +1,35 @@
 package main
 
 // bpf_syscall.go — raw BPF syscalls to read/write BPF map entries without
-// forking bpftool. Replaces 16+ exec.Command("bpftool") calls per 2-min
-// cycle with in-process syscalls (~0.01ms each vs ~15ms per fork).
+// forking bpftool.
 //
 // v0.9.86: introduced to eliminate writebackStreaks forks.
+// v0.9.112: added BPF_OBJ_GET_INFO_BY_FD (map identity + geometry).
+// v0.9.113 (round 5c): VERIFIED FD acquisition.
 //
-// v0.9.112 (round 5): added BPF_OBJ_GET_INFO_BY_FD so callers can validate
-// a map's real key_size/value_size instead of hardcoding 16/1024 — the
-// field diagnostic on al showed the iteration failing with EINVAL and the
-// old error text didn't name the map or its geometry.
+// FIELD EVIDENCE (al, kernel 6.12 x86_64, journal + /proc/<pid>/fd):
+//   - BPF_OBJ_GET_INFO_BY_FD returned EINVAL = the fd used was a valid
+//     open file that is NOT a BPF object
+//   - the process FD table contained NO anon_inode:bpf-map entry at any
+//     time (failure at 00:00:12; FDs 5+ were opened at 00:19), so the
+//     "map fd" in use was one of the pre-opened non-BPF fds (0-4:
+//     /dev/null, journald sockets, buckets.db, eventpoll)
+//   - getMapFD() caches one global FD and never invalidates on EINVAL
+//     (its EBADF check compares a WRAPPED error to unix.EBADF — always
+//     false), so a bad FD was permanent
 //
-// The BPF syscall attr structs are defined here (not in golang.org/x/sys/unix)
-// because the unix package only has the constants. The layout must match the
-// kernel's union bpf_attr — see include/uapi/linux/bpf.h.
+// THE CERTAIN FIX (no guessing): never trust a FD. bpfMapGetFDByIDVerified
+// opens the map AND proves the FD via BPF_OBJ_GET_INFO_BY_FD (id + name
+// match) before returning it. If the proof fails, the FD is closed and the
+// error names exactly what the FD pointed at (readlink /proc/self/fd/N) —
+// so the outcome is always either working syscalls or a self-diagnosing
+// journal line. Callers own their FD and close it when done; there is no
+// shared cache to poison in the read path.
 
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"strings"
 	"unsafe"
 
@@ -75,8 +87,7 @@ type bpfObjGetInfoByFDAttr struct {
 }
 
 // bpfMapInfo is the subset of the kernel's struct bpf_map_info we need
-// for validation + diagnostics (u32 fields at fixed offsets, then the
-// BPF_OBJ_NAME_LEN=16 name at offset 24).
+// (u32 fields at fixed offsets, then the BPF_OBJ_NAME_LEN=16 name at 24).
 type bpfMapInfo struct {
 	Type       uint32
 	ID         uint32
@@ -87,7 +98,8 @@ type bpfMapInfo struct {
 	Name       string
 }
 
-// bpfMapGetFDByID converts a BPF map ID to a file descriptor.
+// bpfMapGetFDByID converts a BPF map ID to a file descriptor (raw).
+// NOTE: the returned FD is UNVERIFIED — prefer bpfMapGetFDByIDVerified.
 func bpfMapGetFDByID(mapID uint32) (int, error) {
 	attr := bpfMapGetFDByIDAttr{ID: mapID}
 	fd, _, errno := unix.Syscall(
@@ -103,12 +115,8 @@ func bpfMapGetFDByID(mapID uint32) (int, error) {
 }
 
 // bpfMapGetInfoByFD queries the map's identity + geometry via
-// BPF_OBJ_GET_INFO_BY_FD.  Used to validate key/value sizes before
-// iterating and to name the map in fallback diagnostics.
+// BPF_OBJ_GET_INFO_BY_FD.  On a non-BPF fd the kernel answers EINVAL.
 func bpfMapGetInfoByFD(fd int) (bpfMapInfo, error) {
-	// struct bpf_map_info (uapi/linux/bpf.h):
-	//   u32 type; u32 id; u32 key_size; u32 value_size;
-	//   u32 max_entries; u32 map_flags; char name[16]; ...
 	buf := make([]byte, 256)
 	attr := bpfObjGetInfoByFDAttr{
 		BpfFd:   uint32(fd),
@@ -136,9 +144,58 @@ func bpfMapGetInfoByFD(fd int) (bpfMapInfo, error) {
 	return info, nil
 }
 
+// bpfCloseFD closes an FD owned by the caller (from bpfMapGetFDByIDVerified).
+func bpfCloseFD(fd int) {
+	if fd >= 0 {
+		unix.Close(fd)
+	}
+}
+
+// bpfMapGetFDByIDVerified — v0.9.113: acquire a map FD and PROVE it before
+// handing it out.  The proof is BPF_OBJ_GET_INFO_BY_FD (which the kernel
+// answers with EINVAL for any non-BPF fd) plus an id/name match.  On
+// failure the FD is closed and the error states exactly what the fd
+// pointed at (readlink /proc/self/fd/N) — either the syscalls work or
+// the journal names the culprit file.  No shared cache: callers own the
+// FD and close it with bpfCloseFD.
+func bpfMapGetFDByIDVerified(mapID uint32, wantName string) (int, bpfMapInfo, error) {
+	fd, err := bpfMapGetFDByID(mapID)
+	if err != nil {
+		return -1, bpfMapInfo{}, err
+	}
+	info, ierr := bpfMapGetInfoByFD(fd)
+	if ierr != nil {
+		target := fdTarget(fd)
+		bpfCloseFD(fd)
+		return -1, bpfMapInfo{}, fmt.Errorf(
+			"fd %d returned by BPF_MAP_GET_FD_BY_ID(%d) is not a BPF object (points at %q): %w",
+			fd, mapID, target, ierr)
+	}
+	if info.ID != mapID {
+		name := info.Name
+		bpfCloseFD(fd)
+		return -1, bpfMapInfo{}, fmt.Errorf(
+			"BPF_MAP_GET_FD_BY_ID(%d) returned wrong map: id=%d name=%q", mapID, info.ID, name)
+	}
+	if wantName != "" && !strings.Contains(info.Name, wantName) {
+		name := info.Name
+		bpfCloseFD(fd)
+		return -1, bpfMapInfo{}, fmt.Errorf(
+			"BPF_MAP_GET_FD_BY_ID(%d) name %q does not contain %q", mapID, name, wantName)
+	}
+	return fd, info, nil
+}
+
+// fdTarget reports what an FD points at (for diagnostics).
+func fdTarget(fd int) string {
+	target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return "<unknown>"
+	}
+	return target
+}
+
 // bpfMapLookupElem reads a single BPF map entry.
-// key must be the exact key bytes (e.g., 4 bytes for v4 /16, 16 for v6 /32).
-// value must be pre-allocated to the map's value size (1016/1024 for remote_host_map).
 func bpfMapLookupElem(mapFD int, key, value []byte) error {
 	if len(key) == 0 || len(value) == 0 {
 		return fmt.Errorf("key and value must be non-empty")
@@ -161,7 +218,7 @@ func bpfMapLookupElem(mapFD int, key, value []byte) error {
 }
 
 // bpfMapUpdateElem writes a single BPF map entry.
-// flags: 0 = any (create or update), BPF_ANY = 0, BPF_NOEXIST = 1, BPF_EXIST = 2.
+// flags: 0 = any (create or update), BPF_NOEXIST = 1, BPF_EXIST = 2.
 func bpfMapUpdateElem(mapFD int, key, value []byte, flags uint64) error {
 	if len(key) == 0 || len(value) == 0 {
 		return fmt.Errorf("key and value must be non-empty")
@@ -180,17 +237,14 @@ func bpfMapUpdateElem(mapFD int, key, value []byte, flags uint64) error {
 	)
 	if errno != 0 {
 		return fmt.Errorf("BPF_MAP_UPDATE_ELEM: %w", errno)
-	 }
+	}
 	return nil
 }
 
 // bpfMapGetNextKey iterates BPF map keys.
-//
-// v0.9.112: contract clarified — pass a NIL key to get the first key,
-// then pass the PREVIOUS nextKey (a COPY of it) to walk forward. The
-// v0.9.86 callers passed a zero-filled key to start and aliased
-// curKey/nextKey, which produced BPF_MAP_GET_NEXT_KEY: EINVAL on the
-// first call on al (forcing the bpftool fallback every cycle).
+// Contract: pass a NIL key to get the first key, then pass a COPY of the
+// previous nextKey to walk forward. (v0.9.86 callers passed a zero-filled
+// key to start and aliased curKey/nextKey — both wrong.)
 // Returns false when there are no more keys (ENOENT).
 func bpfMapGetNextKey(mapFD int, key, nextKey []byte) (bool, error) {
 	var keyPtr unsafe.Pointer

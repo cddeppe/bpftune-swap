@@ -6,22 +6,19 @@ package main
 // bpftool JSON parser produces.
 //
 // v0.9.86: eliminates the `bpftool --json map dump` + `map show` forks.
-//
-// v0.9.112 (round 5) — fixes for the field failure on al
-// ("bpfMapGetNextKey: BPF_MAP_GET_NEXT_KEY: invalid argument"):
-//   1. iteration now STARTS with key=NULL (the kernel contract). The old
-//      code passed a 16-byte zero-filled key on the first call — map
-//      types whose get_next_key rejects unknown keys answer EINVAL.
-//   2. curKey no longer ALIASES nextKey (`curKey = nextKey` made both
-//      slices the same memory from iteration 2 on) — now a copy.
-//   3. key/value sizes are validated against BPF_OBJ_GET_INFO_BY_FD
-//      (the real map geometry) instead of being assumed 16/1024.
-//   4. every failure now names the map (name/id/type/sizes) so any
-//      residual fallback is self-diagnosing in the journal.
+// v0.9.112: iteration contract fixes (nil-key start, no aliasing) +
+// geometry validation via BPF_OBJ_GET_INFO_BY_FD.
+// v0.9.113 (round 5c): VERIFIED FD sourcing — field evidence on al showed
+// the syscalls running against a NON-BPF fd (buckets.db / eventpoll: the
+// process FD table never contained a bpf-map FD, and OBJ_GET_INFO_BY_FD
+// answered EINVAL = "valid file, not a BPF object"). The read path now
+// opens its own FD via bpfMapGetFDByIDVerified (proven to be the right
+// map before use; readlink diagnostic on rejection) and closes it when
+// done — the shared getMapFD() cache is no longer used here.
 //
 // Struct layout (must match streak_writeback.go constants):
 //
-//   0-111:    14 × u64 prefix fields (min_rtt, max_rate_delivered, etc.)
+//   0-111:    14 × u64 prefix fields
 //   112-247:  rate_hist (32 × u32 bins + u64 sum = 136 bytes)
 //   248-1015: metrics[16] (16 × 48 bytes = 768 bytes)
 //   1016-1023: seq (u64)
@@ -44,26 +41,24 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("resolveRemoteHostMapID: %w", err)
 	}
 
-	// Get the map FD (cached until stale).
-	fd, err := getMapFD(mapID)
+	// v0.9.113: VERIFIED FD — proven to be remote_host_map before use;
+	// closed when this read completes (no shared cache to poison).
+	fd, info, err := bpfMapGetFDByIDVerified(uint32(mapID), "remote_host")
 	if err != nil {
 		return nil, fmt.Errorf("getMapFD: %w", err)
 	}
+	defer bpfCloseFD(fd)
 
-	// v0.9.112: ask the kernel for the map's real geometry instead of
-	// assuming it. Used for buffer sizing, validation and diagnostics.
-	info, infoErr := bpfMapGetInfoByFD(fd)
+	// Validate the map's real geometry (the parser assumes 16/1024).
 	keySize := 16
 	valueSize := sizeofRemoteHost // 1024 bytes
-	if infoErr == nil {
-		if info.KeySize != uint32(keySize) || info.ValueSize != uint32(valueSize) {
-			return nil, fmt.Errorf("map %q (id=%d type=%d): key_size=%d value_size=%d, parser expects %d/%d",
-				info.Name, info.ID, info.Type, info.KeySize, info.ValueSize, keySize, valueSize)
-		}
+	if info.KeySize != uint32(keySize) || info.ValueSize != uint32(valueSize) {
+		return nil, fmt.Errorf("map %q (id=%d type=%d): key_size=%d value_size=%d, parser expects %d/%d",
+			info.Name, info.ID, info.Type, info.KeySize, info.ValueSize, keySize, valueSize)
 	}
 
-	// v0.9.112: iterate with key=NULL first (kernel contract), then walk
-	// forward with a COPY of the previous nextKey (no aliasing).
+	// Iterate with key=NULL first (kernel contract), then walk forward
+	// with a COPY of the previous nextKey (no aliasing).
 	var entries []map[string]interface{}
 	nextKey := make([]byte, keySize)
 	var curKey []byte // nil = start of iteration
@@ -71,7 +66,7 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 	for {
 		ok, err := bpfMapGetNextKey(fd, curKey, nextKey)
 		if err != nil {
-			return nil, mapIterError(info, infoErr, err)
+			return nil, mapIterError(info, err)
 		}
 		if !ok {
 			break // no more keys
@@ -88,7 +83,7 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		entry := parseRawHostEntry(nextKey, value)
 		entries = append(entries, entry)
 
-		curKey = append(curKey[:0], nextKey...) // v0.9.112: COPY (was aliasing)
+		curKey = append(curKey[:0], nextKey...) // COPY (v0.9.112: was aliasing)
 	}
 
 	if entries == nil {
@@ -100,10 +95,7 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 
 // mapIterError enriches iteration failures with the map's identity so the
 // rate-limited fallback log line in bpf_reader.go is self-diagnosing.
-func mapIterError(info bpfMapInfo, infoErr, err error) error {
-	if infoErr != nil {
-		return fmt.Errorf("bpfMapGetNextKey: %w (map info unavailable: %v)", err, infoErr)
-	}
+func mapIterError(info bpfMapInfo, err error) error {
 	return fmt.Errorf("bpfMapGetNextKey: %w (map %q id=%d type=%d key_size=%d value_size=%d)",
 		err, info.Name, info.ID, info.Type, info.KeySize, info.ValueSize)
 }
@@ -141,7 +133,6 @@ func parseRawValue(buf []byte) map[string]interface{} {
 	val := map[string]interface{}{}
 
 	// Parse 14 prefix u64 fields at known offsets (little-endian).
-	// bpftool outputs these as JSON numbers (float64 after unmarshal).
 	for i, name := range prefixFields {
 		off := i * 8
 		if off+8 > len(buf) {
@@ -196,12 +187,13 @@ func parseRawValue(buf []byte) map[string]interface{} {
 
 // getMapEntryCountSyscall counts BPF map entries via BPF_MAP_GET_NEXT_KEY
 // iteration. Used to check if the cache is stale without forking bpftool.
-// v0.9.112: same iteration contract as readBPFMapSyscall (nil start, no aliasing).
+// v0.9.113: verified FD (own/close), nil-key start, no aliasing.
 func getMapEntryCountSyscall(mapID int) (int, error) {
-	fd, err := getMapFD(mapID)
+	fd, _, err := bpfMapGetFDByIDVerified(uint32(mapID), "")
 	if err != nil {
 		return -1, err
 	}
+	defer bpfCloseFD(fd)
 	count := 0
 	nextKey := make([]byte, 16) // remote_host_map key size
 	var curKey []byte          // nil = start of iteration
