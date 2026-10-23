@@ -1157,7 +1157,6 @@ func readLogTail(budget int64) string {
 	// slice and concatenated all chunks into one big string per cycle.
 	var sb strings.Builder
 	remaining := budget
-	sb.Grow(int(remaining)) // v0.9.106: pre-grow to avoid 2x buffer doubling
 	for _, p := range files {
 		if remaining <= 0 {
 			break

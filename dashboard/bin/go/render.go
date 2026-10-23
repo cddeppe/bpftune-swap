@@ -104,8 +104,7 @@ func (c *Collector) renderToDisk() {
 // 1h+24h+7d from the CSV.
 func (c *Collector) renderSlowToDisk() {
 	// v0.7.9: rotate CSVs daily to prevent endless growth
-	// v0.9.106: set csvAll to avoid per-bucket full-CSV read
-	// (was 25 GB GC churn per 6h render + 50 MB live leak)
+	// v0.9.107: cache full CSV read to avoid per-bucket re-read
 	{
 		hist.mu.Lock()
 		hist.csvAll = readCSVTail(86400)

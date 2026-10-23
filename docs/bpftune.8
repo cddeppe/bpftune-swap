@@ -1,0 +1,181 @@
+.\" Man page generated from reStructuredText.
+.
+.
+.nr rst2man-indent-level 0
+.
+.de1 rstReportMargin
+\\$1 \\n[an-margin]
+level \\n[rst2man-indent-level]
+level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
+-
+\\n[rst2man-indent0]
+\\n[rst2man-indent1]
+\\n[rst2man-indent2]
+..
+.de1 INDENT
+.\" .rstReportMargin pre:
+. RS \\$1
+. nr rst2man-indent\\n[rst2man-indent-level] \\n[an-margin]
+. nr rst2man-indent-level +1
+.\" .rstReportMargin post:
+..
+.de UNINDENT
+. RE
+.\" indent \\n[an-margin]
+.\" old: \\n[rst2man-indent\\n[rst2man-indent-level]]
+.nr rst2man-indent-level -1
+.\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
+.in \\n[rst2man-indent\\n[rst2man-indent-level]]u
+..
+.TH "BPFTUNE" "8" "" ""
+.SH NAME
+BPFTUNE \- tool for auto-tuning of Linux kernel parameters via BPF
+.SH SYNOPSIS
+.INDENT 0.0
+.INDENT 3.5
+\fBbpftune\fP [\fIOPTIONS\fP]
+.sp
+\fIOPTIONS\fP := { { \fB\-V\fP | \fB\-\-version\fP } | { \fB\-h\fP | \fB\-\-help\fP }
+| { [\fB\-s\fP | \fB\-\-stderr\fP } | { [\fB\-c\fP | \fB\-\-cgroup\fP] cgroup} |
+{ [\fB\-l\fP | \fB\-\-libdir\fP ] libdir} | { \fB\-\-print\-libdir\fP }
+| [{ \fB\-d\fP | \fB\-\-debug\fP }] }
+{ [\fB\-r\fP | \fB\-\-learning_rate\fP ] learning_rate}
+{ [\fB\-R\fP | \fB\-\-rollback\fP ]}
+{ [\fB\-S\fP | \fB\-\-support\fP ]}
+{ [\fB\-p\fP | \fB\-\-port\fP ] port}
+{ [\fB\-q\fP | \fB\-\-query\fP] query}
+.UNINDENT
+.UNINDENT
+.SH DESCRIPTION
+.INDENT 0.0
+.INDENT 3.5
+\fIbpftune\fP supports a set of \(dqtuners\(dq for sysctl parameters,
+congestion control algorithms etc to optimize performance
+and avoid imposing unnecessary limits on tunables.
+.sp
+\fBbpftune\fP requires \fICAP_BPF\fP and \fICAP_TRACING\fP capabilities,
+or \fICAP_SYS_ADMIN\fP on older systemes.  It is run via a systemd
+service, but can also be run standalone if required.  To probe
+if your system supports the BPF features required for bpftune,
+run \(dqbpftune \-S\(dq.  Basic bptune support requires BPF ring buffer,
+BPF hashmap and BPF sock ops and k[ret]probe support.  On more
+modern systems, BPF tracing programs and BPF iterators are used.
+Individual tuners support legacy mode operation where possible.
+In order to support per\-network\-namespace tuning, netns cookie
+support is required; without that, only global tuning is
+supported.
+.UNINDENT
+.UNINDENT
+.SH OPTIONS
+.INDENT 0.0
+.INDENT 3.5
+.INDENT 0.0
+.TP
+.B  \-h\fP,\fB  \-\-help
+Show help information
+.TP
+.B  \-V\fP,\fB  \-\-version
+Show version.
+.TP
+.B  \-d\fP,\fB  \-\-debug
+Show debug output.
+.TP
+.B  \-a\fP,\fB  \-\-allow
+Allow tuner only, e.g. foo.so . Multiple \-a options can
+be supplied to allow specific tuners.  Used for testing.
+.TP
+.B  \-c\fP,\fB  \-\-cgroup
+Filter events for cgroup.
+.TP
+.B  \-D\fP,\fB  \-\-daemon
+Run in daemon mode.
+.TP
+.B  \-s\fP,\fB  \-\-stderr
+Log to standard error instead of syslog.
+.TP
+.B  \-S\fP,\fB  \-\-support
+Scan system to see what level of bpftune support is present.
+.TP
+.B  \-l\fP,\fB  \-\-libdir
+bpftune extra plugin directory; defaults to
+/usr/local/lib64/bpftune . Both /usr/lib64/bpftune and
+/usr/local/lib64/bpftune can be used to install plugin tuners;
+if an alternative to /usr/local/lib64/bpftune is wanted,
+it must be specified via library path. Plugin directories must
+be absolute paths whose components and plugin
+files are root\-owned, are not group\- or other\-writable, and
+have no POSIX ACLs. Symbolic links are rejected.
+.UNINDENT
+\(em print\-libdir
+Print the compiled\-in standard plugin directory and exit.
+.UNINDENT
+.UNINDENT
+.INDENT 0.0
+.INDENT 3.5
+.INDENT 0.0
+.TP
+.B  \-r\fP,\fB  \-\-learning_rate
+.INDENT 7.0
+.INDENT 3.5
+Specify learning rate; supported values range from
+.INDENT 0.0
+.INDENT 3.5
+0: tunables are changed by/within 1.0625 % of limit
+.sp
+1: tunables are changed by/within 3.125% of limit
+.sp
+2: tunables are changed by/within 6.25% of limit
+.sp
+3: tunables are changed by/within 12.5% of limit
+.sp
+4: tunables are changed by/within 25% of limit
+.UNINDENT
+.UNINDENT
+.UNINDENT
+.UNINDENT
+.sp
+So for example at rate 4, if we are within 25% of a limit,
+the limit is increased by 25%.  Default learning rate is 4.
+Lower values are more conservative as they change only when
+closer to limits, but may require more frequent changes as
+a result.
+.TP
+.B  \-R\fP,\fB  \-\-rollback
+.INDENT 7.0
+.INDENT 3.5
+Roll back sysctl settings on exit; this allows us to explore
+tunable updates bpftune makes without making long\-term changes
+to the system.  On exit, bpftune summarizes the changes made
+and rolls back to the sysctl values that were set prior to
+bpftune running.
+.UNINDENT
+.UNINDENT
+.INDENT 7.0
+.TP
+.B  \-p\fP,\fB  \-\-port
+TCP port to listen on for queries.  If not specified, use an
+ephemeral localhost port.
+.TP
+.B  \-q\fP,\fB  \-\-query
+Query bpftune.  Supported queries include
+.sp
+help        \- show supported queries
+summary     \- show summary of changes made by tuners
+tuners      \- show loaded tuners and their state
+tunables    \- show supported tunables for loaded tuners
+jtunables   \- show supported tunables in json format
+status      \- show current status of tunables
+jstatus     \- show current status of tunables in json format
+rollback    \- show changes needed to roll back bpftune changes
+.UNINDENT
+.UNINDENT
+.UNINDENT
+.UNINDENT
+.SH SEE ALSO
+.INDENT 0.0
+.INDENT 3.5
+\fBbpf\fP(2), \fBbpftune\fP(8),
+.UNINDENT
+.UNINDENT
+.\" Generated by docutils manpage writer.
+.
