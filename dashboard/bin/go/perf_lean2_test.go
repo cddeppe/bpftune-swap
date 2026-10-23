@@ -23,6 +23,7 @@ import (
         "os"
         "path/filepath"
         "testing"
+        "time"
 )
 
 // perf2Sandbox redirects histDir to a temp dir and restores globals.
@@ -166,11 +167,8 @@ func TestPerf2SlowKeyCarryForward(t *testing.T) {
         if !ok {
                 t.Fatal("write 1 failed")
         }
-        // bucket_live is a slow key — on a non-full cycle it must be
-        // absent from the fresh hashes... (first push hashes everything
-        // since prevHashes is empty? No: the skip applies regardless.
-        // v0.9.104 semantics: computeKeyHashes skips slow keys on
-        // non-full cycles; carry-forward fills from prev when present.)
+        // v0.9.104 semantics: computeKeyHashes skips slow keys on non-full
+        // cycles; carry-forward fills from prev when present.
         if _, ok := cy1.newHashes["bucket_live"]; ok {
                 t.Fatal("slow key must not be hashed on a non-full cycle")
         }
@@ -300,10 +298,15 @@ func TestPerf2GzipCacheIdentical(t *testing.T) {
         if !bytes.Equal(got, got2) {
                 t.Fatal("cache hit returned different bytes")
         }
-        // File change invalidates the cache.
-        data2 := append(data, []byte("more")...)
-        os.WriteFile(path, data2, 0644)
-        os.Chtimes(path, timeNowPlus(), timeNowPlus())
+        // File change invalidates the cache (size + mtime differ).
+        data2 := append(bytes.Clone(data), []byte("more")...)
+        if err := os.WriteFile(path, data2, 0644); err != nil {
+                t.Fatal(err)
+        }
+        newer := time.Now().Add(2 * time.Second)
+        if err := os.Chtimes(path, newer, newer); err != nil {
+                t.Fatal(err)
+        }
         got3 := gzipCached(path, data2)
         var ref3 bytes.Buffer
         zw3 := gzip.NewWriter(&ref3)
@@ -313,9 +316,6 @@ func TestPerf2GzipCacheIdentical(t *testing.T) {
                 t.Fatal("cache did not re-compress after file change")
         }
 }
-
-// timeNowPlus returns a distinct mtime for cache-invalidation tests.
-func timeNowPlus() (t timeTime) { return }
 
 // ---------------------------------------------------------------------------
 // Benchmarks — streaming writer vs the previous work patterns
