@@ -498,6 +498,20 @@ EOF
     fi
 fi
 
+# ---------- Step 4: Remove stale GODEBUG=madvdontneed (v0.9.107) ----------
+# v0.9.105 added GODEBUG=madvdontneed=1 to the service file. This caused
+# CPU spikes every few seconds (Go's background scavenger works harder with
+# MADV_DONTNEED). v0.9.107 removed it from update.sh, but hosts that ran
+# the v0.9.105 update still have the line. Remove it now.
+if [ "$DO_DASHBOARD" = 1 ]; then
+    COLLECTOR_SVC=/etc/systemd/system/bpftune-collector-go.service
+    if [ -f "$COLLECTOR_SVC" ] && grep -q 'GODEBUG=madvdontneed' "$COLLECTOR_SVC" 2>/dev/null; then
+        sed -i '/GODEBUG=madvdontneed/d' "$COLLECTOR_SVC"
+        systemctl daemon-reload
+        ok "removed stale GODEBUG=madvdontneed=1 from collector service (fixes CPU spikes)"
+    fi
+fi
+
 # ---------- Summary ----------
 step "Update Complete"
 printf "  bpftune:   %s\n" "$(dpkg-query -W -f='${Version}' bpftune 2>/dev/null || echo 'not installed')"
