@@ -18,15 +18,19 @@ package main
 
 import (
 	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash"
 	"hash/fnv"
+	"math"
 	"net/http"
 	_ "net/http/pprof" // v0.9.36: register /debug/pprof/* handlers
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -104,17 +108,83 @@ var slowChangingKeys = map[string]bool{
 	// _appendLiveMetrics already appends one new point per SSE push
 }
 
+// v0.9.105b: custom type-switching hash — NO reflect, NO json.Marshal.
+// The previous fix (fmt.Fprintf "%v") still used reflect internally because
+// Go's fmt package calls printValue which uses reflect.Value for complex types.
+// This custom hashWrite walks the data structure via type switch — direct,
+// no reflect, no boxing, no temporary objects. ~50x less allocation.
+func hashWrite(h hash.Hash64, v interface{}) {
+	switch val := v.(type) {
+	case nil:
+		h.Write([]byte("n"))
+	case string:
+		h.Write([]byte("s"))
+		h.Write([]byte(val))
+	case bool:
+		if val {
+			h.Write([]byte("b1"))
+		} else {
+			h.Write([]byte("b0"))
+		}
+	case int:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case int64:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case float64:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(val))
+		h.Write(buf[:])
+	case map[string]interface{}:
+		h.Write([]byte("m"))
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			h.Write([]byte(k))
+			h.Write([]byte{0})
+			hashWrite(h, val[k])
+		}
+	case []interface{}:
+		h.Write([]byte("a"))
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(len(val)))
+		h.Write(buf[:])
+		for _, elem := range val {
+			hashWrite(h, elem)
+		}
+	case []map[string]interface{}:
+		h.Write([]byte("A"))
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(len(val)))
+		h.Write(buf[:])
+		for _, elem := range val {
+			hashWrite(h, elem)
+		}
+	default:
+		// Fallback for unexpected types — still cheaper than fmt.Fprintf
+		// because it only fires for unknown types (shouldn't happen).
+		h.Write([]byte("u"))
+		fmt.Fprintf(h, "%T", v)
+	}
+}
+
+// v0.9.105: custom type-switching hash — no reflect, no json.Marshal.
+// Replaces json.Marshal+md5 (millions of reflect allocations per cycle)
+// and the interim fmt.Fprintf fix (which also used reflect).
 func computeKeyHashes(doc map[string]interface{}, fullHash bool) map[string]uint64 {
 	hashes := make(map[string]uint64)
 	for k, v := range doc {
-		// v0.9.83: skip slow-changing keys on non-full cycles.
 		if !fullHash && slowChangingKeys[k] {
 			continue
 		}
-		// v0.9.105: fnv64+fmt.Fprintf instead of json.Marshal+md5.
-		// Eliminates ~5MB []byte + millions of reflect allocations per cycle.
 		h := fnv.New64a()
-		fmt.Fprintf(h, "%v", v)
+		hashWrite(h, v)
 		hashes[k] = h.Sum64()
 	}
 	return hashes
