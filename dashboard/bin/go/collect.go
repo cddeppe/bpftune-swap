@@ -3,27 +3,9 @@ package main
 // collect.go — the per-cycle collection pipeline.
 //
 // v0.7.0 fixes:
-//   - Parse the log tail ONCE per cycle. Previously:
-//       parseLogs()      -> parsed swaps + mets + srates (1st parse)
-//       buildRate(text)  -> re-scanned text for midsamp lines (2nd parse)
-//       writeSrateCSV(text) -> re-parsed text for srate events (3rd parse)
-//       buildChurnFromParsed(allSwaps) -> ok (uses parsed)
-//       buildDivergenceFromParsed(...) -> ok (uses parsed)
-//     Now we parse ONCE, then pass parsed data to all consumers. This
-//     eliminates ~2/3 of the per-cycle CPU cost (was hitting 40% peak
-//     every 30s; now <15%).
-//
-//   - Single source of truth for label resolution.  All addresses from
-//     BPF map are resolved once in readBPFMap → hostEntry.Addr.  No
-//     downstream code re-applies ResolveBucket (which was the root cause
-//     of "custom bucket disappears" — see bucketing.go comment).
-//
-//   - Ring buffer cap raised to 2880 entries (24h at 30s) was already
-//     correct; the 17h-of-data bug was actually caused by CSV rows
-//     being keyed inconsistently (raw vs labeled) across label changes.
-//     Now CSV writes the labeled form and CSV reads use the stored
-//     label as-is (no re-resolve), so historical data accumulates
-//     under a single key per bucket.
+//   - Parse the log tail ONCE per cycle.
+//   - Single source of truth for label resolution.
+//   - Consistent CSV row keys across label changes.
 //
 // v0.9.108-lean changes (pure performance, byte-identical output):
 //   - readLogTailCached(): incremental tail cache (no 8MB disk re-read +
@@ -32,6 +14,25 @@ package main
 //     writeCurrentJSON + computeKeyHashes + notifySSE assembly)
 //   - rebuildBucketLiveFromRing(): typed slices instead of []interface{}
 //     boxing; per-host column maps only built when snapshots exist
+//
+// v0.9.109-lean2 changes:
+//   - bucket_live + metric_by_bucket are restricted to SELECTABLE buckets
+//     (the top-8 table buckets + custom-labeled buckets). Frontend audit
+//     of dashboard.js (v0.9.109):
+//       * the bucket dropdown is built ONLY from meta.json buckets (top-8)
+//         plus custom labels (_populateBucketSelect) — unlabeled non-top-8
+//         buckets are not selectable anywhere in the UI
+//       * renderBucket()/renderScoreNow()/renderNow()/_appendLiveMetrics
+//         read bucket_live/metric_by_bucket only for the SELECTED bucket
+//         (always in the selectable set) and fall back to the static
+//         bucket_<id>.json series when absent
+//     On a 68-bucket host that meant ~60 dead entries x 7,700 numbers
+//     (~2-4MB of JSON) marshaled + hashed + written EVERY 30s cycle.
+//     Nothing observable changes; entries for unselectable buckets were
+//     consumed by no code path in the UI.
+//   - the document is now written via writeCurrentJSONStream() (hash-as-
+//     you-go, single encode per key, retained bytes only for changed
+//     keys) with the v0.9.108 path as fallback.
 
 import (
         "fmt"
@@ -55,8 +56,6 @@ func (c *Collector) collect() {
 
         // v0.9.41: ensure cookie_dest map is loaded BEFORE readBPFMap()
         // so v6ToV4Label() can cross-reference v6 entries to v4 labels.
-        // Without this, the first readBPFMap() call has a nil cookieDestDiskMap
-        // and all v6 entries stay as "v6:xxxx" instead of merging with v4.
         ensureCookieDestLoaded()
 
         hosts, err := readBPFMap()
@@ -66,12 +65,7 @@ func (c *Collector) collect() {
         }
 
         // ----- Parse log tail ONCE for the entire cycle ---------------------
-        // v0.9.9: single-pass parser — eliminates 8 redundant strings.Split
-        // calls on the 2-16MB log tail. Was: parseSwapsMetsSrates +
-        // cookieDestMap + buildRecentProofRows + proofEvents +
-        // buildProofsRawEvents + buildRate + buildBucketIPs + readBPFClock
-        // = 9 scans × 237K lines = 2.1M allocations per cycle.
-        // Now: 1 scan, all data extracted into parsedLog struct.
+        // v0.9.9: single-pass parser.
         // v0.9.108: incremental tail cache — unchanged files are not
         // re-read and the assembled string is reused when nothing changed.
         logText := readLogTailCached(collectorMode.LogTailBytes)
@@ -79,15 +73,13 @@ func (c *Collector) collect() {
         allSwaps := pl.Swaps
         allMets := pl.MetByCookie
         allSrates := pl.SrateByCookie
-        // v0.9.0: persist cookie→dest map across cycles so proofs with
-        // cookies established before the 2 MB log tail still get a dest.
         cdest := persistCookieDest(pl.Cdest)
 
         // ----- Build live buckets + metric_by_bucket + bucket_live ---------
         buckets, metricByBucket, bucketLive, liveLeaders := buildLiveBuckets(hosts, now)
 
-        // v0.9.36: build route health ONCE — was called twice (line 97 + line 104).
-        // This halves the work for the route health panel which iterates all hosts.
+        // v0.9.36: build route health ONCE (uses the FULL metricByBucket —
+        // route health is per-host and must not be filtered).
         routeHealth := buildRouteHealth(hosts, metricByBucket)
 
         // ----- Build current.json document -----------------------------------
@@ -119,18 +111,12 @@ func (c *Collector) collect() {
         }
 
         // ----- Log-derived panels (single parse, multiple consumers) --------
-        // v0.9.9: set currentParsedLog so buildLogPanels uses the single-pass
-        // parsed data instead of re-scanning text 4 more times.
         currentParsedLog = pl
         defer func() { currentParsedLog = nil }()
 
         topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText, now)
 
-        // v0.7.6: streak writeback — patch BPF map bad_streak/null_streak from
-        // sustained outcomes (60-300s after swap). Mirrors deleted Python
-        // streak_writeback.py. Async to avoid blocking the 30s collect cycle.
-        // v0.9.89: run every 2nd cycle (60s) — was every 4th (2 min).
-        // Safe now that v0.9.86 uses raw BPF syscalls.
+        // v0.7.6: streak writeback — async to avoid blocking the 30s cycle.
         if cycleCount % 2 == 0 {
                 go c.writebackStreaks(allSwaps, allMets, allSrates)
         }
@@ -143,8 +129,6 @@ func (c *Collector) collect() {
         doc["proof"] = proofsRaw
 
         // ----- Other data panels (reuse parsed log results) ----------------
-        // v0.9.6: fall back to CSVs when the log tail is sparse, so churn
-        // and divergence panels always show data after a restart.
         churnResult := buildChurnFromParsed(allSwaps)
         if collectorMode.CSVFallback && len(allSwaps) < 50 {
                 csvChurn := buildChurnFromCSV(200)
@@ -155,9 +139,6 @@ func (c *Collector) collect() {
                 }
         }
         doc["churn"] = churnResult
-        // v0.9.7: rate progression now falls back to midsamp.csv when the
-        // log tail is sparse, so the panel always shows data after restart.
-        // v0.9.9: use single-pass parsed midsamp data instead of re-scanning text.
         rateResult := pl.GetRate()
         if collectorMode.CSVFallback && len(rateResult) == 0 {
                 csvRate := buildRateFromCSVCached()
@@ -166,33 +147,31 @@ func (c *Collector) collect() {
                 }
         }
         doc["rate"] = rateResult
-        // v0.9.23: add rate_raw for bucket filtering in the frontend.
-        // proofs_raw already exists; rate_raw was missing, causing the
-        // rate progression panel to go empty when a specific bucket
-        // was selected (frontend's _filterByBucket looks for rate_raw).
         doc["rate_raw"] = pl.GetRateRaw()
-        // v0.9.88: divergence panel was removed in v0.9.82; skip computation
         doc["tunables"] = buildTunables()
 
         // ----- Capture snapshots for the in-memory ring buffer --------------
         captureSnapshotsFromBPF(hosts, now)
 
         // ----- Rebuild bucket_live from ring buffer (full 1h time series) --
-        // This replaces the single-point bucketLive built above with the
-        // real time-series from the ring buffer.
-        rebuildBucketLiveFromRing(bucketLive, hosts, now)
+        // v0.9.109: only selectable buckets (see header). The ring rebuild
+        // skips non-selectable hosts entirely; the maps below are filtered
+        // again at the doc level to drop the placeholder entries too.
+        selectable := buildSelectable(buckets, metricByBucket)
+        selHosts := make([]hostEntry, 0, len(hosts))
+        for _, h := range hosts {
+                if selectable[h.Addr] {
+                        selHosts = append(selHosts, h)
+                }
+        }
+        rebuildBucketLiveFromRing(bucketLive, selHosts, now)
+        doc["metric_by_bucket"] = selectKeys(metricByBucket, selectable)
+        doc["bucket_live"] = selectKeys(bucketLive, selectable)
 
         // ----- Write CSV + SQLite rows (write labeled form; reader trusts label) ----
-        // v0.9.9: throttle buckets.csv writes to every 2nd cycle (every ~60s
-        // instead of ~30s). The ring buffer already captures 30s resolution
-        // for the 1h chart, so the CSV only needs 60s resolution for the
-        // 24h+ charts. Halves CSV write CPU and file growth.
-        //
-        // v0.9.10: dual-write to SQLite — SQLite gets every cycle (30s res),
-        // CSV gets every 2nd cycle (60s res for backward compat). Eventually
-        // CSV will be phased out.
+        // v0.9.9: throttle buckets.csv writes to every 2nd cycle.
+        // v0.9.10: dual-write to SQLite (30s res) + CSV (60s res).
         // v0.9.33: throttle CSV writes to every Nth cycle when configured.
-        // Default (normal mode): N=1, every cycle. normal-light: N=2, every 60s.
         csvN := collectorMode.CSVWriteEveryN
         if csvN <= 0 { csvN = 1 }
         doCSV := (cycleCount % csvN) == 0
@@ -211,13 +190,10 @@ func (c *Collector) collect() {
                         writeBucketsCSV(hosts, now)
                 }
         }
-        // v0.7.6: enrich swaps with outcome/direction/srate_before before CSV write.
-        // Mirrors Python _resolve_pending enrichment logic.
         enrichSwapsForCSV(allSwaps, allMets, allSrates, cdest)
         if doCSV {
                 writeSwapsCSV(allSwaps, now)
-                writeSrateCSVFromParsed(allSrates, now) // v0.7: no re-parse
-                // v0.9.24: write midsamp.csv from parsed events (was never called!)
+                writeSrateCSVFromParsed(allSrates, now)
                 if len(pl.MidsampRows) > 0 {
                         midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
                         for _, mr := range pl.MidsampRows {
@@ -234,15 +210,7 @@ func (c *Collector) collect() {
                 }
 
                 // v0.9.5: write proofs.csv for the recent-proofs panel fallback
-                // v0.9.91: write ONLY the log-derived proofs to proofs.csv. Previously
-                // we wrote topProofs (the merged list of log proofs + CSV fallback),
-                // which created a feedback loop: empty-dest entries from the CSV
-                // fallback (proofs that had (unknown) dest) were written back to the
-                // CSV with empty dest, then re-merged in next cycle, persisting
-                // forever. Now we write only the log-derived proofs. When pl is nil
-                // (fallback path), write an empty slice — the CSV retains its
-                // existing entries and just doesn't get new ones this cycle. The BPF
-                // tuner is working correctly; this is purely a dashboard code issue.
+                // v0.9.91: write ONLY the log-derived proofs to proofs.csv.
                 var logProofs []interface{}
                 if pl != nil {
                         logProofs = pl.GetProofRows(cdest)
@@ -250,35 +218,76 @@ func (c *Collector) collect() {
                 writeProofsCSVFromInterface(logProofs, now)
         }
 
-        // v0.9.7: write midsamp.csv for the rate progression panel fallback
-
         // v0.9.7: one-time backfill from log tail on first collect cycle.
-        // Parses the 16MB log tail and writes any proof/midsamp events
-        // that aren't already in the CSVs. This populates the CSVs with
-        // historical data immediately after deploy, instead of waiting
-        // for new events to accumulate.
         backfillDone.Do(func() {
                 backfillProofsFromLog(logText, cdest)
                 backfillMidsampFromLog(logText)
         })
 
         // ----- Update current state + push to SSE --------------------------
-        // v0.9.9 fix: do NOT update keyHashes here — notifySSE() computes
+        // v0.9.9 fix: do NOT update keyHashes here — notifySSE* computes
         // new hashes and compares against the PREVIOUS cycle's hashes.
-        // If we update here, prevHashes == newHashes and delta is always empty.
         //
-        // v0.9.108: marshal the document ONCE (was 3-4x per cycle across
-        // writeCurrentJSON + computeKeyHashes + notifySSE). The cached
-        // per-key bytes feed hashing (identical md5 values), current.json
-        // and the SSE messages — all byte-identical to v0.9.104 output.
-        docBytes, keyBytes := buildDocRaw(doc)
+        // v0.9.108: marshal the document ONCE (was 3-4x per cycle).
+        // v0.9.109: streaming hash-as-you-go writer — each key is encoded
+        // once into a reused buffer, hashed (identical md5 values) and
+        // streamed to current.json in one pass; raw bytes are retained
+        // only for changed keys. Falls back to the v0.9.108 reference
+        // path on any marshal/write failure.
+        c.mu.RLock()
+        prevHashes := c.keyHashes
+        c.mu.RUnlock()
 
-        c.mu.Lock()
-        c.current = doc
-        c.mu.Unlock()
+        if cy, ok := writeCurrentJSONStream(doc, prevHashes); ok {
+                c.mu.Lock()
+                c.current = doc
+                c.mu.Unlock()
+                c.notifySSEFromCycle(cy)
+        } else {
+                docBytes, keyBytes := buildDocRaw(doc)
+                c.mu.Lock()
+                c.current = doc
+                c.mu.Unlock()
+                c.writeCurrentJSONFromRaw(docBytes)
+                c.notifySSEFromRaw(keyBytes)
+        }
+}
 
-        c.writeCurrentJSONFromRaw(docBytes)
-        c.notifySSEFromRaw(keyBytes)
+// buildSelectable returns the set of bucket keys the frontend can
+// actually display: the top-8 table buckets plus custom-labeled buckets.
+// See the v0.9.109 notes in the file header for the dashboard.js audit.
+func buildSelectable(buckets []bucketRow, metricByBucket map[string]interface{}) map[string]bool {
+        selectable := make(map[string]bool, 16)
+        for _, b := range buckets {
+                if b.Dest != "" {
+                        selectable[b.Dest] = true
+                }
+        }
+        // Custom labels (labels map values) are selectable via the dropdown.
+        for _, lbl := range loadLabels() {
+                if lbl != "" {
+                        selectable[lbl] = true
+                }
+        }
+        // Belt-and-suspenders: any addr whose labelFor resolves non-empty
+        // (covers raw-IP keys that carry a label).
+        for addr := range metricByBucket {
+                if labelFor(addr) != "" {
+                        selectable[addr] = true
+                }
+        }
+        return selectable
+}
+
+// selectKeys returns a copy of m containing only the keys in keep.
+func selectKeys(m map[string]interface{}, keep map[string]bool) map[string]interface{} {
+        out := make(map[string]interface{}, len(keep))
+        for k, v := range m {
+                if keep[k] {
+                        out[k] = v
+                }
+        }
+        return out
 }
 
 // buildLiveBuckets constructs the buckets list (top 8),
@@ -286,11 +295,7 @@ func (c *Collector) collect() {
 // live_leaders. All in a single pass over sorted hosts.
 //
 // v0.7.5e: STABLE SORT to match meta.json's order (n_alg desc,
-// inst desc, id asc). Previously this was just Inst desc, which meant
-// current.json's buckets[] array had a DIFFERENT order than meta.json's
-// buckets[] array — the dropdown (from meta, every 5 min) and the table
-// (from current, every 30s) disagreed. Now both use the same order so
-// they stop "fighting" each other.
+// inst desc, id asc).
 func buildLiveBuckets(hosts []hostEntry, now int64) (
         buckets []bucketRow, metricByBucket map[string]interface{},
         bucketLive map[string]interface{}, liveLeaders []interface{},
@@ -326,8 +331,8 @@ func buildLiveBuckets(hosts []hostEntry, now int64) (
                 sortedHosts[i] = hostWithAlg{hostEntry: h, nAlg: n}
         }
         // Stable sort: n_alg desc, inst desc, id asc — matches meta.json's
-        // (n_alg desc, inst_mean desc, id asc) order closely enough that
-        // the live buckets list and the 5-min meta list no longer disagree.
+        // order closely enough that the live buckets list and the 5-min
+        // meta list no longer disagree.
         sort.SliceStable(sortedHosts, func(i, j int) bool {
                 if sortedHosts[i].nAlg != sortedHosts[j].nAlg {
                         return sortedHosts[i].nAlg > sortedHosts[j].nAlg
@@ -575,8 +580,8 @@ func buildLiveLeadersEntry(addr string, inst int, metrics []interface{}) map[str
 //
 // v0.9.108: typed series arrays ([]float64 / []int16 / []int64) instead
 // of []interface{} boxing, and the 64-entry column map is only built for
-// hosts that actually have ring snapshots.  JSON output is identical:
-// encoding/json renders []int16 and []interface{}{int16} the same way.
+// hosts that actually have ring snapshots.  JSON output is identical.
+// v0.9.109: callers pass only the selectable hosts (see buildSelectable).
 func rebuildBucketLiveFromRing(bucketLive map[string]interface{}, hosts []hostEntry, now int64) {
         cutoff := now - 3600
         for _, h := range hosts {
