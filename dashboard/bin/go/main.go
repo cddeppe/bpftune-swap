@@ -18,10 +18,10 @@ package main
 
 import (
 	"compress/gzip"
-	"crypto/md5"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	_ "net/http/pprof" // v0.9.36: register /debug/pprof/* handlers
 	"os"
@@ -51,7 +51,7 @@ var (
 type Collector struct {
 	mu         sync.RWMutex
 	current    map[string]interface{} // current.json data
-	keyHashes  map[string]string      // per-key md5 for SSE delta
+	keyHashes  map[string]uint64      // per-key fnv64 for SSE delta
 	sseClients map[chan []byte]bool
 	startedAt  time.Time // for uptime_min field
 }
@@ -59,7 +59,7 @@ type Collector struct {
 func NewCollector() *Collector {
 	c := &Collector{
 		current:    make(map[string]interface{}),
-		keyHashes:  make(map[string]string),
+		keyHashes:  make(map[string]uint64),
 		sseClients: make(map[chan []byte]bool),
 		startedAt:  time.Now(),
 	}
@@ -104,18 +104,18 @@ var slowChangingKeys = map[string]bool{
 	// _appendLiveMetrics already appends one new point per SSE push
 }
 
-func computeKeyHashes(doc map[string]interface{}, fullHash bool) map[string]string {
-	hashes := make(map[string]string)
+func computeKeyHashes(doc map[string]interface{}, fullHash bool) map[string]uint64 {
+	hashes := make(map[string]uint64)
 	for k, v := range doc {
 		// v0.9.83: skip slow-changing keys on non-full cycles.
-		// Their hash from the previous cycle is reused (the caller
-		// merges newHashes with prevHashes for slow keys).
 		if !fullHash && slowChangingKeys[k] {
 			continue
 		}
-		data, _ := json.Marshal(v)
-		sum := md5.Sum(data)
-		hashes[k] = fmt.Sprintf("%x", sum)
+		// v0.9.105: fnv64+fmt.Fprintf instead of json.Marshal+md5.
+		// Eliminates ~5MB []byte + millions of reflect allocations per cycle.
+		h := fnv.New64a()
+		fmt.Fprintf(h, "%v", v)
+		hashes[k] = h.Sum64()
 	}
 	return hashes
 }
