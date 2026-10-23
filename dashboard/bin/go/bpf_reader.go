@@ -16,14 +16,28 @@ package main
 // labeled "controld" back to itself (no harm) BUT would also remap a raw
 // "2606:1a40::" (no label) to "controld" if a label was added later,
 // creating duplicate entries in the ring buffer.
+//
+// v0.9.111 (measured on al): bpftool output buffers are now POOLED.
+// cmd.Output() allocated a fresh bytes.Buffer per fork and grew it by
+// doubling to the map-dump size (~8MB on a 324-bucket host) — profile
+// showed 382MB cumulative garbage from 26 forks (the single largest
+// allocator in steady state, >50% of all churn). runBpftoolJSON reuses
+// pooled buffers and parses before returning them to the pool, so the
+// steady-state fork costs zero buffer allocations. Also: the raw-syscall
+// fallback is now logged (rate-limited) so the reason the syscall path
+// fails on a host is visible in the journal instead of silently forking
+// bpftool forever.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,9 +50,6 @@ import (
 // with the most instances, not whichever appeared first.
 //
 // v0.9.38: V4MinRTT and V6MinRTT track per-protocol min_rtt separately.
-// Before this, the merge only kept one min_rtt (from the entry with more
-// instances, usually v4). This meant v6 RTT was always 0, and the route
-// monitor could never switch to v6 because it had no v6 data.
 type hostEntry struct {
 	Inst     int
 	MaxInst  int    // B3-fix: largest single inst across folded entries
@@ -48,6 +59,71 @@ type hostEntry struct {
 	V6MinRTT float64 // v0.9.38: separate v6 min_rtt (microseconds)
 	V4Inst   int     // v0.9.38: v4-only instance count
 	V6Inst   int     // v0.9.38: v6-only instance count
+}
+
+// v0.9.111: pooled bpftool output buffers.  The pool entry is a
+// *bytes.Buffer that keeps its capacity across forks — after warmup the
+// 8MB map dump is parsed from a reused buffer with zero growth garbage.
+type bpftoolBufs struct {
+	out *bytes.Buffer
+	err *bytes.Buffer
+}
+
+var bpftoolBufPool = sync.Pool{
+	New: func() interface{} {
+		return &bpftoolBufs{out: &bytes.Buffer{}, err: &bytes.Buffer{}}
+	},
+}
+
+// runBpftoolJSON forks bpftool with the given args and unmarshals its
+// stdout into out.  Semantics preserved from the old cmd.Output() path:
+// exec failures return "bpftool: <err>[: stderr]", parse failures return
+// "bpftool json: <err>".  Buffers return to the pool AFTER parsing so
+// concurrent callers can never observe each other's bytes.
+func runBpftoolJSON(ctx context.Context, out interface{}, args ...string) error {
+	b := bpftoolBufPool.Get().(*bpftoolBufs)
+	defer bpftoolBufPool.Put(b)
+	b.out.Reset()
+	b.err.Reset()
+
+	cmd := exec.CommandContext(ctx, "bpftool", args...)
+	cmd.Stdout = b.out
+	cmd.Stderr = b.err
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(b.err.String())
+		if msg != "" {
+			return fmt.Errorf("bpftool: %w: %s", err, msg)
+		}
+		return fmt.Errorf("bpftool: %w", err)
+	}
+	if err := json.Unmarshal(b.out.Bytes(), out); err != nil {
+		return fmt.Errorf("bpftool json: %w", err)
+	}
+	return nil
+}
+
+// logBpfSyscallFallback — rate-limited diagnostic: WHY is the raw-syscall
+// path falling back to bpftool forks on this host?  Logged at most once
+// per 10 minutes so the journal shows the reason without being flooded.
+var (
+	bpfFallbackMu   sync.Mutex
+	bpfFallbackLast time.Time
+	bpfFallbackN    int
+)
+
+func logBpfSyscallFallback(err error) {
+	if err == nil {
+		return
+	}
+	bpfFallbackMu.Lock()
+	defer bpfFallbackMu.Unlock()
+	if time.Since(bpfFallbackLast) < 10*time.Minute {
+		return
+	}
+	bpfFallbackLast = time.Now()
+	bpfFallbackN++
+	fmt.Fprintf(os.Stderr, "readBPFMap: raw syscall path failed (fallback #%d): %v — forking bpftool\n",
+		bpfFallbackN, err)
 }
 
 // readBPFMap runs bpftool, parses the JSON, applies ResolveBucket + merges
@@ -67,7 +143,8 @@ func readBPFMap() ([]hostEntry, error) {
 	// v0.9.86: try raw BPF syscalls first (no fork), fall back to bpftool.
 	// The syscall path uses BPF_MAP_GET_NEXT_KEY + BPF_MAP_LOOKUP_ELEM to
 	// iterate the map and parse raw bytes. Identical output to bpftool dump.
-	if raw, err := readBPFMapSyscall(); err == nil && len(raw) >= 0 {
+	raw, sysErr := readBPFMapSyscall()
+	if sysErr == nil && len(raw) >= 0 {
 		// Check cache: if entry count matches, return cache.
 		if collectorMode.CacheBPFMap && bpfMapCache != nil && len(raw) == bpfMapCacheSize {
 			return bpfMapCache, bpfMapCacheErr
@@ -75,6 +152,8 @@ func readBPFMap() ([]hostEntry, error) {
 		bpfMapCacheSize = len(raw)
 		return mergeBPFMapEntries(raw)
 	}
+	// v0.9.111: tell the operator WHY we are forking bpftool (once/10min).
+	logBpfSyscallFallback(sysErr)
 
 	// Fallback: bpftool fork path (used when syscalls fail — e.g.,
 	// kernel < 4.4 without BPF_MAP_GET_FD_BY_ID, or map FD is stale).
@@ -82,44 +161,31 @@ func readBPFMap() ([]hostEntry, error) {
 	if collectorMode.CacheBPFMap && bpfMapCache != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "bpftool", "--json", "map", "show", "name", "remote_host_map")
-		output, err := cmd.Output()
-		if err == nil {
-			var mapInfo []map[string]interface{}
-			if json.Unmarshal(output, &mapInfo) == nil && len(mapInfo) > 0 {
-				sz := toInt(mapInfo[0]["entries"])
-				if sz == bpfMapCacheSize {
-					return bpfMapCache, bpfMapCacheErr
-				}
-				bpfMapCacheSize = sz
+		var mapInfo []map[string]interface{}
+		if runBpftoolJSON(ctx, &mapInfo, "--json", "map", "show", "name", "remote_host_map") == nil && len(mapInfo) > 0 {
+			sz := toInt(mapInfo[0]["entries"])
+			if sz == bpfMapCacheSize {
+				return bpfMapCache, bpfMapCacheErr
 			}
+			bpfMapCacheSize = sz
 		}
 	}
 
 	// v0.9.27: add 10s timeout to prevent collector hanging on bpftool
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bpftool", "--json", "map", "dump", "name", "remote_host_map")
-	output, err := cmd.Output()
-	if err != nil {
+	var rawDump []map[string]interface{}
+	if err := runBpftoolJSON(ctx, &rawDump, "--json", "map", "dump", "name", "remote_host_map"); err != nil {
 		if collectorMode.CacheBPFMap {
 			bpfMapCache = nil
 			bpfMapCacheErr = err
 		}
-		return nil, fmt.Errorf("bpftool: %w", err)
-	}
-	var raw []map[string]interface{}
-	if err := json.Unmarshal(output, &raw); err != nil {
-		if collectorMode.CacheBPFMap {
-			bpfMapCache = nil
-			bpfMapCacheErr = err
-		}
-		return nil, fmt.Errorf("bpftool json: %w", err)
+		return nil, err
 	}
 	if collectorMode.CacheBPFMap {
-		bpfMapCacheSize = len(raw)
+		bpfMapCacheSize = len(rawDump)
 	}
-	return mergeBPFMapEntries(raw)
+	return mergeBPFMapEntries(rawDump)
 }
 
 // mergeBPFMapEntries takes raw bpftool-formatted entries (either from
@@ -174,10 +240,7 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 		}
 		// v0.9.41: If this is a v6 entry that didn't get a label
 		// (still starts with "v6:"), try to find its v4 counterpart
-		// via the cookie_dest map. The cookie_dest map tracks
-		// (cookie → v4_dest, v6_dest) from estab log lines. If a
-		// cookie has both v4 and v6 dests, they're the same
-		// destination — so the v6 entry should get the v4's label.
+		// via the cookie_dest map.
 		if strings.HasPrefix(final, "v6:") {
 			if v4Label := v6ToV4Label(addr); v4Label != "" {
 				final = v4Label
@@ -189,14 +252,12 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 		if existing, ok := merged[final]; ok {
 			existing.Inst += inst
 			// B3-fix: keep the entry with the largest single inst as the
-			// representative for non-instance fields (best_alg, min_rtt,
-			// max_rate_delivered, metrics[]).
+			// representative for non-instance fields.
 			if inst > existing.MaxInst {
 				existing.MaxInst = inst
 				existing.V = val
 			}
-			// v0.9.38: track v4 and v6 min_rtt separately so the route
-			// monitor has real v6 data even when v4 has more connections.
+			// v0.9.38: track v4 and v6 min_rtt separately.
 			if isV6 {
 				existing.V6Inst += inst
 				if rttUs > 0 && (existing.V6MinRTT == 0 || rttUs < existing.V6MinRTT) {
@@ -208,8 +269,7 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 					existing.V4MinRTT = rttUs
 				}
 			}
-			// v0.9.39: merge ALL metrics across v4+v6 so the dashboard
-			// shows combined dual-stack throughput, not just v4.
+			// v0.9.39: merge ALL metrics across v4+v6.
 			existing.V = mergeHostValues(existing.V, val)
 		} else {
 			he := &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val}
@@ -246,26 +306,15 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 // mergeHostValues combines two BPF map values (v4 + v6) into a single
 // value that reflects the combined dual-stack traffic.
 //
-// v0.9.39: Before this, the merge only kept the "winner's" metrics (the
-// entry with more instances, usually v4). This meant v6 throughput,
-// rate_ema, socket counts, and per-algorithm metrics were silently
-// discarded. Now we properly sum/merge all fields:
+// v0.9.39: before this, the merge only kept the "winner's" metrics.
+// Now we properly sum/merge all fields:
 //
-//	Summed (v4 + v6):
-//	  - instances, selection_count
-//	  - metrics[i].rate_ema, metric_count, sockets_alive/good/proved
-//	  - rate_hist bins
-//
-//	Min (best of both):
-//	  - min_rtt (lower = better)
-//
-//	Max (best of both):
-//	  - max_rate_delivered (higher = better)
-//	  - metrics[i].swap_score, bad_streak, null_streak (worst case)
-//
-//	Recomputed after merge:
-//	  - best_i / best_v (from merged metrics)
-//	  - rate_best_i / rate_best_v (from merged rate_ema)
+//	Summed (v4 + v6): instances, selection_count,
+//	  metrics[i].rate_ema/metric_count/sockets_*, rate_hist bins
+//	Min:  min_rtt, rtt_low_min (lower = better; 0 = no data)
+//	Max:  max_rate_delivered (higher = better), rtt_low_streak,
+//	  metrics[i].swap_score/bad_streak/null_streak (worst case)
+//	Recomputed: best_i/best_v, rate_best_i/rate_best_v
 func mergeHostValues(existing, incoming map[string]interface{}) map[string]interface{} {
 	if existing == nil {
 		return incoming
@@ -281,31 +330,26 @@ func mergeHostValues(existing, incoming map[string]interface{}) map[string]inter
 	}
 
 	// --- Prefix fields (u64) ---
-	// instances: sum
 	merged["instances"] = toInt(existing["instances"]) + toInt(incoming["instances"])
-
-	// selection_count: sum
 	merged["selection_count"] = toInt(existing["selection_count"]) + toInt(incoming["selection_count"])
 
-	// min_rtt: min (lower = better), but 0 means "no data" so prefer nonzero
+	// min_rtt: min (lower is better), 0 means "no data" so prefer nonzero
 	eRTT := toFloat(existing["min_rtt"])
 	iRTT := toFloat(incoming["min_rtt"])
 	if iRTT > 0 && (eRTT == 0 || iRTT < eRTT) {
 		merged["min_rtt"] = iRTT
 	}
 
-	// max_rate_delivered: max (higher = better)
+	// max_rate_delivered: max
 	eMaxRate := toFloat(existing["max_rate_delivered"])
 	iMaxRate := toFloat(incoming["max_rate_delivered"])
 	if iMaxRate > eMaxRate {
 		merged["max_rate_delivered"] = iMaxRate
 	}
 
-	// rtt_low_streak: max (worst case)
 	if toInt(incoming["rtt_low_streak"]) > toInt(existing["rtt_low_streak"]) {
 		merged["rtt_low_streak"] = toInt(incoming["rtt_low_streak"])
 	}
-	// rtt_low_min: min (lower = better)
 	eRLM := toFloat(existing["rtt_low_min"])
 	iRLM := toFloat(incoming["rtt_low_min"])
 	if iRLM > 0 && (eRLM == 0 || iRLM < eRLM) {
@@ -360,7 +404,6 @@ func mergeHostValues(existing, incoming map[string]interface{}) map[string]inter
 			if toInt(im["null_streak"]) > toInt(em["null_streak"]) {
 				mm["null_streak"] = toInt(im["null_streak"])
 			}
-			// state_flags, greedy_count, metric_value: take from existing (winner)
 			outMetrics[i] = mm
 		}
 		merged["metrics"] = outMetrics
@@ -378,7 +421,6 @@ func mergeHostValues(existing, incoming map[string]interface{}) map[string]inter
 			if toInt(m["metric_count"]) == 0 {
 				continue
 			}
-			// best_v: weighted score (same formula as BPF kernel)
 			rv := toInt(m["rate_ema"])
 			ss := toInt(m["swap_score"])
 			ssEff := ss
@@ -394,7 +436,6 @@ func mergeHostValues(existing, incoming map[string]interface{}) map[string]inter
 				bestV = weighted
 				bestI = i
 			}
-			// rate_best: just highest rate_ema
 			if rv > rateBestV {
 				rateBestV = rv
 				rateBestI = i
@@ -436,27 +477,14 @@ func mergeHostValues(existing, incoming map[string]interface{}) map[string]inter
 // the label of its v4 counterpart (if any).
 //
 // v0.9.41: The BPF map has separate entries for v4 and v6 connections to
-// the same destination (e.g. YouTube). The v4 entry might have a label
-// (from aliases) like "142.250.0.0", but the v6 entry stays as "v6:2606xxxx"
-// because there's no v6 alias. This function uses the cookie_dest map to
-// find the v4 counterpart and returns its label so the v6 entry can be
-// merged with the v4 entry.
-//
-// The cookie_dest map (built from estab log lines) records:
-//
-//	cookie → ["v4_dest", "v6_dest", "v6b_dest"]
-//
-// If a cookie has both v4 and v6 dests, they're the same destination.
-// We look for any cookie where the v6 dest matches the input v6 address,
-// then resolve the v4 dest to its label.
+// the same destination. The v4 entry might have a label (from aliases),
+// but the v6 entry stays as "v6:2606xxxx" because there's no v6 alias.
+// This function uses the cookie_dest map to find the v4 counterpart and
+// returns its label so the v6 entry can be merged with the v4 entry.
 func v6ToV4Label(v6Addr string) string {
 	if cookieDestDiskMap == nil {
 		return ""
 	}
-	// The v6 addr from the BPF map is "v6:XXXXXXXX" (8 hex chars = first 4 bytes of v6)
-	// The cookie_dest map stores v6 as "dest6=<number>" from the estab log line,
-	// which is also the first 4 bytes as a decimal number.
-	// Convert the hex to the same format used in cdest.
 	hexPart := strings.TrimPrefix(v6Addr, "v6:")
 	v6Num, err := strconv.ParseUint(hexPart, 16, 64)
 	if err != nil {
@@ -467,17 +495,14 @@ func v6ToV4Label(v6Addr string) string {
 	// Search cookie_dest map for a cookie that has this v6 dest
 	for _, entry := range cookieDestDiskMap {
 		if len(entry) >= 2 && entry[1] == v6Str {
-			// Found a cookie with this v6 dest. Get the v4 dest.
 			v4Dest := entry[0]
 			if v4Dest == "" || v4Dest == "0" {
 				continue
 			}
-			// Resolve the v4 dest to its label
 			label := ResolveBucket(v4Dest)
 			if label != "" && !strings.HasPrefix(label, "v6:") {
 				return label
 			}
-			// If no label, return the raw v4 address (still better than "v6:xxxx")
 			return v4Dest
 		}
 	}
