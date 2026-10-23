@@ -508,7 +508,8 @@ if [ "$DO_DASHBOARD" = 1 ]; then
     if [ -f "$COLLECTOR_SVC" ] && grep -q 'GODEBUG=madvdontneed' "$COLLECTOR_SVC" 2>/dev/null; then
         sed -i '/GODEBUG=madvdontneed/d' "$COLLECTOR_SVC"
         systemctl daemon-reload
-        ok "removed stale GODEBUG=madvdontneed=1 from collector service (fixes CPU spikes)"
+        systemctl restart bpftune-collector-go 2>/dev/null || true
+        ok "removed stale GODEBUG=madvdontneed=1 + restarted collector"
     fi
 fi
 
