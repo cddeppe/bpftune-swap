@@ -31,22 +31,32 @@ package main
 //   );
 //   CREATE INDEX idx_buckets_ts_bucket ON buckets(ts, bucket_id);
 //   CREATE INDEX idx_buckets_bucket ON buckets(bucket_id);
+//
+// v0.9.108-lean: dedup now runs BEFORE serialization.  v0.9.104 built the
+// five JSON arrays and hashed them for every host on every write cycle,
+// THEN checked whether the data had changed — so the common (unchanged)
+// case still paid 5x json.Marshal + hashing per host per cycle.  Now a
+// cheap pre-check hash over the raw field values (same equivalence class
+// as the JSON hash — it covers exactly the values that get serialized)
+// short-circuits the whole serialization path when nothing changed.
+// When a write IS needed, the original v0.9.104 hash is computed and
+// stored in lastWriteHash with identical semantics and values.
 
 import (
-	"bufio"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"hash/fnv"
-	"os"
-	"path/filepath"
-	"runtime/debug"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
+        "bufio"
+        "database/sql"
+        "encoding/json"
+        "fmt"
+        "hash/fnv"
+        "os"
+        "path/filepath"
+        "runtime/debug"
+        "strconv"
+        "strings"
+        "sync"
+        "time"
 
-	_ "modernc.org/sqlite"
+        _ "modernc.org/sqlite"
 )
 
 var (
@@ -61,6 +71,13 @@ var (
 	// write on first cycle, then incremental after).
 	lastWriteHash   map[string]uint64
 	lastWriteHashMu sync.Mutex
+
+	// v0.9.108: pre-check hash over the raw (pre-serialization) values.
+	// Keyed by host addr; stored only after a successful INSERT (or when
+	// the original hash proves the row is already in the DB).  Equivalent
+	// to lastWriteHash up to hash collision: it covers exactly the values
+	// that are serialized into the row.
+	lastPreHash map[string]uint64
 
 	// sqliteMaxBytes — hard cap before aggressive prune.
 	// 50 MB chosen because (a) modernc.org/sqlite baseline allocator
@@ -86,6 +103,8 @@ func initSQLite() {
 	sqliteOnce.Do(func() {
 		// v0.9.104: initialize dedup map
 		lastWriteHash = make(map[string]uint64, 64)
+		// v0.9.108: initialize pre-check dedup map
+		lastPreHash = make(map[string]uint64, 64)
 
 		dbPath := sqlitePath()
 		// Ensure parent directory exists
@@ -325,6 +344,45 @@ func extractAlgArray(fields []string, colIdx map[string]int, prefix string) stri
 	return string(data)
 }
 
+// appendPreVal appends the canonical form of one array element to the
+// pre-check hash buffer.  nil is encoded distinctly from any value so a
+// nil↔0 transition changes the hash exactly like it changes the JSON.
+func appendPreVal(buf []byte, v interface{}) []byte {
+	switch t := v.(type) {
+	case nil:
+		return append(buf, 'n')
+	case float64:
+		return strconv.AppendFloat(buf, t, 'g', -1, 64)
+	case int:
+		return strconv.AppendInt(buf, int64(t), 10)
+	default:
+		return append(buf, fmt.Sprintf("%v", t)...)
+	}
+}
+
+// snapshotPreHash hashes the exact values that would be serialized into
+// the buckets row (mv/re/ss/bs/ns arrays + the scalar fold fields).
+// Equal pre-hash ⇔ equal serialized row (up to fnv64 collision — the
+// same collision class as v0.9.104's JSON-byte dedup hash).
+func snapshotPreHash(mv, re, ss, bs, ns []interface{}, bestI int, bestAlg string,
+	inst int, minRtt, refMbps, rateBestV float64) uint64 {
+	h := fnv.New64a()
+	var buf []byte
+	for i := 0; i < 16; i++ {
+		buf = appendPreVal(buf, mv[i])
+		buf = appendPreVal(buf, re[i])
+		buf = appendPreVal(buf, ss[i])
+		buf = appendPreVal(buf, bs[i])
+		buf = appendPreVal(buf, ns[i])
+		buf = append(buf, '|')
+	}
+	// Same scalar fold as the v0.9.104 JSON hash.
+	buf = fmt.Fprintf(h, "%s|%d|%s|%d|%g|%g|%g", buf, bestI, bestAlg, inst,
+		minRtt, refMbps, rateBestV)
+	_ = buf
+	return h.Sum64()
+}
+
 // writeBucketSQLite inserts a bucket snapshot into the SQLite database.
 // Called from writeBucketsCSV (dual-write during transition).
 func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
@@ -387,6 +445,20 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 			rateBestV = toFloat(mi["rate_ema"])
 		}
 	}
+	minRtt := toFloat(v["min_rtt"])
+	refMbps := toFloat(v["max_rate_delivered"]) / bpsToMbps
+
+	// v0.9.108: cheap pre-check BEFORE serialization.  Covers exactly the
+	// values that go into the row (arrays + scalar fold); when unchanged,
+	// skip the 5x json.Marshal + hashing entirely.
+	pre := snapshotPreHash(mv, re, ss, bs, ns, bestI, bestAlg, h.Inst, minRtt, refMbps, rateBestV)
+	lastWriteHashMu.Lock()
+	prevPre, preSeen := lastPreHash[h.Addr]
+	prev, seen := lastWriteHash[h.Addr]
+	lastWriteHashMu.Unlock()
+	if preSeen && prevPre == pre && seen {
+		return // data unchanged — skip serialization + INSERT
+	}
 
 	mvJSON, _ := json.Marshal(mv)
 	reJSON, _ := json.Marshal(re)
@@ -394,7 +466,10 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 	bsJSON, _ := json.Marshal(bs)
 	nsJSON, _ := json.Marshal(ns)
 
-	// v0.9.103: dedup — skip INSERT if data hasn't changed
+	// v0.9.103: dedup — skip INSERT if data hasn't changed.
+	// v0.9.108: the hash VALUE is computed with the exact v0.9.104
+	// algorithm (JSON bytes + scalar fold) so lastWriteHash keeps
+	// identical semantics and values.
 	h64 := fnv.New64a()
 	h64.Write(mvJSON)
 	h64.Write(reJSON)
@@ -403,14 +478,16 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 	h64.Write(nsJSON)
 	// Fold in scalar fields (exclude ts — it always changes)
 	fmt.Fprintf(h64, "|%d|%s|%d|%g|%g|%g", bestI, bestAlg, h.Inst,
-		toFloat(v["min_rtt"]), toFloat(v["max_rate_delivered"])/bpsToMbps, rateBestV)
+		minRtt, refMbps, rateBestV)
 	snapHash := h64.Sum64()
 
-	lastWriteHashMu.Lock()
-	prev, seen := lastWriteHash[h.Addr]
-	lastWriteHashMu.Unlock()
 	if seen && prev == snapHash {
-		return // data unchanged — skip INSERT
+		// Same hash as a previous successful write — the row is already
+		// stored.  Record the pre-hash so future cycles skip serialization.
+		lastWriteHashMu.Lock()
+		lastPreHash[h.Addr] = pre
+		lastWriteHashMu.Unlock()
+		return
 	}
 
 	sqliteMu.Lock()
@@ -421,8 +498,8 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 		 rate_best_i, rate_best_v, mv, re, ss, bs, ns,
 		 tcp_rmem_min, tcp_rmem_def, tcp_rmem_max)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		now, h.Addr, h.Inst, toFloat(v["min_rtt"]),
-		toFloat(v["max_rate_delivered"])/bpsToMbps, bestI, bestAlg,
+		now, h.Addr, h.Inst, minRtt,
+		refMbps, bestI, bestAlg,
 		rateBestI, rateBestV, string(mvJSON), string(reJSON),
 		string(ssJSON), string(bsJSON), string(nsJSON),
 		rmemMin, rmemDef, rmemMax,
@@ -431,9 +508,10 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 		fmt.Fprintf(os.Stderr, "sqlite: insert failed: %v\n", err)
 		return
 	}
-	// Record hash only after successful INSERT
+	// Record hashes only after successful INSERT
 	lastWriteHashMu.Lock()
 	lastWriteHash[h.Addr] = snapHash
+	lastPreHash[h.Addr] = pre
 	lastWriteHashMu.Unlock()
 }
 
@@ -577,6 +655,7 @@ func resetSQLiteForTest() {
 	}
 	sqliteDB = nil
 	lastWriteHash = nil
+	lastPreHash = nil
 	// Note: sqliteOnce cannot be reset without reassignment, so tests
 	// that need a fresh init must run in a separate process or use
 	// build tags to swap the initOnce.
