@@ -1,16 +1,22 @@
 package main
 
-// perf_lean2_test.go — v0.9.109-lean2: byte-identity tests + benchmarks.
+// perf_lean2_test.go — v0.9.109/110-lean: byte-identity tests + benchmarks.
 //
-// Proves the v0.9.109 changes produce IDENTICAL output to v0.9.104:
+// Proves the v0.9.109+ changes produce IDENTICAL output to v0.9.104:
 //   - writeCurrentJSONStream() vs json.Marshal (document bytes) and
 //     md5(json.Marshal(v)) (hash bytes => identical SSE delta decisions)
 //   - notifySSEFromCycle() wire format vs json.Marshal of the v0.9.104
 //     message maps (full + delta + slow-key carry-forward + removed keys)
 //   - fullMessageFromDisk() vs json.Marshal({"__t":"f","v":doc})
 //   - gzipCached() vs gzip.NewWriter output
-// Plus behavioural tests for the v0.9.109 bucket_live filter and the
-// ring-buffer compaction.
+// Plus behavioural tests for the bucket_live filter and ring compaction.
+//
+// v0.9.110: the selectable-filter test now uses IP-SHAPED negative cases.
+// The v0.9.109 test used "no-select-me" (non-IP) as its negative —
+// labelFor() rejects non-IP strings but returns the canonical form for
+// any IP-shaped addr, so the test passed while the filter was a no-op
+// on real hosts (324/324 keys kept on al). The negative case must be
+// IP-shaped or it cannot catch that bug class.
 //
 // All helpers prefixed "perf2" to avoid collisions with existing suites.
 
@@ -188,17 +194,10 @@ func TestPerf2SlowKeyCarryForward(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // 3. bucket_live filter — selectable = top-8 + labeled
+//    (IP-shaped negative cases — see file header)
 // ---------------------------------------------------------------------------
 
 func TestPerf2SelectableFilter(t *testing.T) {
-        // Labels file in a sandbox so loadLabels() can't touch production.
-        oldLabels := labelsFile
-        labelsFile = filepath.Join(t.TempDir(), "labels.json")
-        if err := os.WriteFile(labelsFile, []byte(`{"9.9.9.9":"my-label"}`), 0644); err != nil {
-                t.Fatal(err)
-        }
-        defer func() { labelsFile = oldLabels }()
-
         buckets := make([]bucketRow, 0, 8)
         metricByBucket := map[string]interface{}{}
         for i := 0; i < 8; i++ {
@@ -206,24 +205,41 @@ func TestPerf2SelectableFilter(t *testing.T) {
                 buckets = append(buckets, bucketRow{Dest: id})
                 metricByBucket[id] = []interface{}{}
         }
-        metricByBucket["no-select-me"] = []interface{}{} // unlabeled non-top-8
+        // Negative cases MUST be IP-shaped: a non-IP string is rejected by
+        // labelFor() unconditionally and cannot catch the v0.9.109 bug where
+        // labelFor() passed every IP-shaped addr.
+        metricByBucket["172.16.9.9"] = []interface{}{} // unlabeled non-top-8
+        metricByBucket["192.168.5.5"] = []interface{}{} // unlabeled non-top-8
 
-        sel := buildSelectable(buckets, metricByBucket)
+        labels := map[string]string{
+                "9.9.9.9":  "my-label", // labeled IP: key + value both selectable
+                "10.1.1.1": "",          // deleted label: key still selectable (insurance)
+        }
+        sel := buildSelectable(buckets, labels)
         for i := 0; i < 8; i++ {
                 id := fmt.Sprintf("10.0.0.%d", i+1)
                 if !sel[id] {
                         t.Fatalf("top-8 bucket %s must be selectable", id)
                 }
         }
-        if sel["no-select-me"] {
-                t.Fatal("unlabeled non-top-8 bucket must NOT be selectable")
+        if sel["172.16.9.9"] || sel["192.168.5.5"] {
+                t.Fatalf("unlabeled non-top-8 buckets must NOT be selectable: %v", sel)
         }
         if !sel["my-label"] {
-                t.Fatal("custom-labeled bucket must be selectable")
+                t.Fatal("custom-labeled bucket (labels value) must be selectable")
+        }
+        if !sel["9.9.9.9"] {
+                t.Fatal("labels key must be selectable (un-resolved addr insurance)")
+        }
+        if !sel["10.1.1.1"] {
+                t.Fatal("labels key must be selectable even when its value is empty")
         }
 
         filtered := selectKeys(metricByBucket, sel)
-        if _, ok := filtered["no-select-me"]; ok {
+        if _, ok := filtered["172.16.9.9"]; ok {
+                t.Fatal("selectKeys must drop non-selectable keys")
+        }
+        if _, ok := filtered["192.168.5.5"]; ok {
                 t.Fatal("selectKeys must drop non-selectable keys")
         }
         if len(filtered) != 8 {

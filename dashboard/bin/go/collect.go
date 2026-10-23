@@ -8,31 +8,32 @@ package main
 //   - Consistent CSV row keys across label changes.
 //
 // v0.9.108-lean changes (pure performance, byte-identical output):
-//   - readLogTailCached(): incremental tail cache (no 8MB disk re-read +
-//     string rebuild every cycle when nothing changed)
-//   - buildDocRaw(): marshal each document key ONCE per cycle (was 3-4x:
-//     writeCurrentJSON + computeKeyHashes + notifySSE assembly)
+//   - readLogTailCached(): incremental tail cache
+//   - buildDocRaw(): marshal each document key ONCE per cycle
 //   - rebuildBucketLiveFromRing(): typed slices instead of []interface{}
 //     boxing; per-host column maps only built when snapshots exist
 //
-// v0.9.109-lean2 changes:
-//   - bucket_live + metric_by_bucket are restricted to SELECTABLE buckets
-//     (the top-8 table buckets + custom-labeled buckets). Frontend audit
-//     of dashboard.js (v0.9.109):
-//       * the bucket dropdown is built ONLY from meta.json buckets (top-8)
-//         plus custom labels (_populateBucketSelect) — unlabeled non-top-8
-//         buckets are not selectable anywhere in the UI
-//       * renderBucket()/renderScoreNow()/renderNow()/_appendLiveMetrics
-//         read bucket_live/metric_by_bucket only for the SELECTED bucket
-//         (always in the selectable set) and fall back to the static
-//         bucket_<id>.json series when absent
-//     On a 68-bucket host that meant ~60 dead entries x 7,700 numbers
-//     (~2-4MB of JSON) marshaled + hashed + written EVERY 30s cycle.
-//     Nothing observable changes; entries for unselectable buckets were
-//     consumed by no code path in the UI.
-//   - the document is now written via writeCurrentJSONStream() (hash-as-
-//     you-go, single encode per key, retained bytes only for changed
-//     keys) with the v0.9.108 path as fallback.
+// v0.9.109-lean2: bucket_live + metric_by_bucket restricted to selectable
+// buckets (the set the frontend dropdown can contain).
+//
+// v0.9.110-lean3 FIX (field bug, measured on al):
+//   The v0.9.109 buildSelectable() included `labelFor(addr) != ""` as a
+//   belt-and-suspenders clause.  labelFor() returns the canonical/masked
+//   form for ANY IP-shaped addr — so the clause passed every bucket and
+//   the filter was a no-op (324/324 keys kept, current.json stayed at
+//   6.9MB).  The v0.9.109 test missed it because its negative case used
+//   a non-IP string ("no-select-me") which labelFor() rejects.
+//
+//   Real dropdown construction (dashboard.js):
+//     _populateBucketSelect: meta.json bucket ids (= top-8 table buckets)
+//                          + window.__labels VALUES (custom labels)
+//     _syncBucketDropdown:   + doc.buckets "(live)" (= top-8 again)
+//   So the selectable set is exactly: top-8 dests ∪ labels keys/values.
+//   loadLabels() is map[ip]label — keys are the raw IPs (insurance for
+//   un-resolved addrs), values are the label forms the dropdown shows.
+//
+//   On al (labels=0, 324 active buckets): doc 6.9MB → ~0.4MB, and the
+//   per-cycle marshal/hash/copy work drops ~17x.
 
 import (
         "fmt"
@@ -48,8 +49,7 @@ import (
 // aborting the entire cycle. We still update generated_ts, run log-derived
 // panels (recent_swaps, recent_proofs, etc.), push an SSE event, and write
 // current.json. We only skip BPF-derived panels (buckets, metric_by_bucket,
-// bucket_live, live_leaders) and CSV appends. This prevents the frontend
-// from freezing for 30+ seconds on a transient bpftool failure.
+// bucket_live, live_leaders) and CSV appends.
 func (c *Collector) collect() {
         cycleCount++  // v0.9.25: increment cycle counter (was never incremented — throttle was dead)
         now := time.Now().Unix()
@@ -65,7 +65,6 @@ func (c *Collector) collect() {
         }
 
         // ----- Parse log tail ONCE for the entire cycle ---------------------
-        // v0.9.9: single-pass parser.
         // v0.9.108: incremental tail cache — unchanged files are not
         // re-read and the assembled string is reused when nothing changed.
         logText := readLogTailCached(collectorMode.LogTailBytes)
@@ -154,10 +153,10 @@ func (c *Collector) collect() {
         captureSnapshotsFromBPF(hosts, now)
 
         // ----- Rebuild bucket_live from ring buffer (full 1h time series) --
-        // v0.9.109: only selectable buckets (see header). The ring rebuild
-        // skips non-selectable hosts entirely; the maps below are filtered
-        // again at the doc level to drop the placeholder entries too.
-        selectable := buildSelectable(buckets, metricByBucket)
+        // v0.9.109/110: only selectable buckets (see header). The ring
+        // rebuild skips non-selectable hosts entirely; the maps below are
+        // filtered again at the doc level to drop the placeholders too.
+        selectable := buildSelectable(buckets, loadLabels())
         selHosts := make([]hostEntry, 0, len(hosts))
         for _, h := range hosts {
                 if selectable[h.Addr] {
@@ -171,7 +170,6 @@ func (c *Collector) collect() {
         // ----- Write CSV + SQLite rows (write labeled form; reader trusts label) ----
         // v0.9.9: throttle buckets.csv writes to every 2nd cycle.
         // v0.9.10: dual-write to SQLite (30s res) + CSV (60s res).
-        // v0.9.33: throttle CSV writes to every Nth cycle when configured.
         csvN := collectorMode.CSVWriteEveryN
         if csvN <= 0 { csvN = 1 }
         doCSV := (cycleCount % csvN) == 0
@@ -225,10 +223,6 @@ func (c *Collector) collect() {
         })
 
         // ----- Update current state + push to SSE --------------------------
-        // v0.9.9 fix: do NOT update keyHashes here — notifySSE* computes
-        // new hashes and compares against the PREVIOUS cycle's hashes.
-        //
-        // v0.9.108: marshal the document ONCE (was 3-4x per cycle).
         // v0.9.109: streaming hash-as-you-go writer — each key is encoded
         // once into a reused buffer, hashed (identical md5 values) and
         // streamed to current.json in one pass; raw bytes are retained
@@ -253,27 +247,28 @@ func (c *Collector) collect() {
         }
 }
 
-// buildSelectable returns the set of bucket keys the frontend can
-// actually display: the top-8 table buckets plus custom-labeled buckets.
-// See the v0.9.109 notes in the file header for the dashboard.js audit.
-func buildSelectable(buckets []bucketRow, metricByBucket map[string]interface{}) map[string]bool {
+// buildSelectable returns exactly the set of bucket keys the frontend
+// dropdown can contain:
+//   - the top-8 table buckets (meta.json bucket ids, doc.buckets "(live)")
+//   - custom-labeled buckets (labels map VALUES — the dropdown shows them)
+//   - labels map KEYS (raw IPs — insurance for addrs not yet label-resolved)
+//
+// v0.9.110: the previous `labelFor(addr) != ""` clause is REMOVED —
+// labelFor() returns the canonical form for any IP-shaped addr, which
+// made the filter a no-op on real hosts (see file header).
+func buildSelectable(buckets []bucketRow, labels map[string]string) map[string]bool {
         selectable := make(map[string]bool, 16)
         for _, b := range buckets {
                 if b.Dest != "" {
                         selectable[b.Dest] = true
                 }
         }
-        // Custom labels (labels map values) are selectable via the dropdown.
-        for _, lbl := range loadLabels() {
+        for ip, lbl := range labels {
+                if ip != "" {
+                        selectable[ip] = true
+                }
                 if lbl != "" {
                         selectable[lbl] = true
-                }
-        }
-        // Belt-and-suspenders: any addr whose labelFor resolves non-empty
-        // (covers raw-IP keys that carry a label).
-        for addr := range metricByBucket {
-                if labelFor(addr) != "" {
-                        selectable[addr] = true
                 }
         }
         return selectable
@@ -578,10 +573,8 @@ func buildLiveLeadersEntry(addr string, inst int, metrics []interface{}) map[str
 // the full 1h time-series from the ring buffer (fixes "charts go empty
 // every 30s" — SSE now pushes real time-series data).
 //
-// v0.9.108: typed series arrays ([]float64 / []int16 / []int64) instead
-// of []interface{} boxing, and the 64-entry column map is only built for
-// hosts that actually have ring snapshots.  JSON output is identical.
-// v0.9.109: callers pass only the selectable hosts (see buildSelectable).
+// v0.9.108: typed series arrays instead of []interface{} boxing.
+// v0.9.109/110: callers pass only the selectable hosts (see buildSelectable).
 func rebuildBucketLiveFromRing(bucketLive map[string]interface{}, hosts []hostEntry, now int64) {
         cutoff := now - 3600
         for _, h := range hosts {
