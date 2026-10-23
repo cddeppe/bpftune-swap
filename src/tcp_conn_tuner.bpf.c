@@ -34,10 +34,27 @@ BPF_MAP_DEF(sk_storage_map, BPF_MAP_TYPE_SK_STORAGE, int, struct conn_state, 0, 
 
 BPF_MAP_DEF(midsamp_map, BPF_MAP_TYPE_SK_STORAGE, int, __u64, 0, BPF_F_NO_PREALLOC);
 
+<<<<<<< Updated upstream
 /* 0.4.64: runtime config map.  Currently a single __u32 at key 0:
  * exploration percent for fresh sockets.  Pinned by the userspace
  * daemon so 'bpftune --exp=N' can update it live. */
 BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 1, 0);
+=======
+/* 0.4.64: runtime config map.  Pinned by the userspace daemon so
+ * 'bpftune --exp=N', --prefix4=N, --prefix6=N, --bpf-debug=N can
+ * update values live without restarting.
+ * slot 0 = exp_pct, slot 1 = prefix4, slot 2 = prefix6,
+ * slot 3 = bpf_debug (0=quiet, 1=verbose). */
+BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
+
+/* 0.4.79: alias table.  Key is the raw destination as it arrives
+ * from the socket (v4-mapped or v6/32 top bits); value is the
+ * canonical bucket key to use instead.  Lets multiple public IPs
+ * that the operator knows are the same physical destination share
+ * one bucket.  Loaded from /etc/bpftune/aliases at daemon start. */
+BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
+            struct in6_addr, 1024, 0);
+>>>>>>> Stashed changes
 
 /* per-CPU scratch buffer used to initialize new remote_host entries without
  * placing a >512B struct temporary on the BPF stack (NUM_TCP_CONG_ALGS=16

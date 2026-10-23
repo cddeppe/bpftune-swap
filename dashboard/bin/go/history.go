@@ -268,14 +268,12 @@ func (h *historyStore) saveToDisk() {
 	defer h.mu.RUnlock()
 
 	path := historyPath("collector-go-history.json")
-	writeFileAtomic(path, func() []byte {
-		type persistData struct {
-			Raw map[string][]bucketSnapshot `json:"raw"`
-		}
-		data := persistData{Raw: h.raw}
-		out, _ := jsonMarshal(data)
-		return out
-	})
+	type persistData struct {
+		Raw map[string][]bucketSnapshot `json:"raw"`
+	}
+	data := persistData{Raw: h.raw}
+	// v0.9.107: stream to file (no 9 MB []byte allocation)
+	_ = writeFileAtomicJSON(path, data)
 }
 
 func (h *historyStore) loadFromDisk() {

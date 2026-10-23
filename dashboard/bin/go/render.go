@@ -876,6 +876,29 @@ func writeFileAtomic(path string, build func() []byte) {
 	_ = os.Rename(tmp, path)
 }
 
+// v0.9.107: stream JSON to file — no []byte allocation.
+// Same reflect work as json.Marshal, but writes directly to file
+// instead of allocating a 9 MB []byte that gets freed 50ms later.
+func writeFileAtomicJSON(path string, v interface{}) error {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func jsonMarshal(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
 }
