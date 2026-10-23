@@ -361,6 +361,7 @@ Wants=bpftune.service
 Type=simple
 WorkingDirectory=$DASH_BIN
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Environment=GODEBUG=madvdontneed=1  # v0.9.105: return freed pages to OS immediately
 ExecStart=$DASH_BIN/bpftune-collector-go --port 8080 --bind 0.0.0.0
 Restart=always
 RestartSec=5

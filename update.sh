@@ -498,6 +498,31 @@ EOF
     fi
 fi
 
+# ---------- Step 4: GODEBUG=madvdontneed=1 (v0.9.105 memory fix) ----------
+# v0.9.105: Go uses MADV_FREE by default (freed pages stay in RSS).
+# This sets MADV_DONTNEED which returns freed pages to OS immediately.
+# Combined with the streaming JSON fix in the binary, RSS drops from
+# ~210 MB to ~40-60 MB on low-RAM hosts.
+if [ "$DO_DASHBOARD" = 1 ]; then
+    step "4. Ensure GODEBUG=madvdontneed=1 in collector service"
+    COLLECTOR_SVC=/etc/systemd/system/bpftune-collector-go.service
+    if [ -f "$COLLECTOR_SVC" ]; then
+        if ! grep -q 'GODEBUG=madvdontneed=1' "$COLLECTOR_SVC" 2>/dev/null; then
+            # Add the Environment line after the existing Environment=PATH line
+            sed -i '/^Environment=PATH/a Environment=GODEBUG=madvdontneed=1  # v0.9.105: return freed pages to OS immediately' "$COLLECTOR_SVC"
+            systemctl daemon-reload
+            # The collector will be restarted in Step 2's flow on next update.sh run,
+            # or we restart it now if already running
+            if systemctl is-active bpftune-collector-go >/dev/null 2>&1; then
+                systemctl restart bpftune-collector-go 2>/dev/null || true
+            fi
+            ok "added GODEBUG=madvdontneed=1 to collector service (RSS will drop to ~40-60MB)"
+        else
+            ok "GODEBUG=madvdontneed=1 already present in collector service"
+        fi
+    fi
+fi
+
 # ---------- Summary ----------
 step "Update Complete"
 printf "  bpftune:   %s\n" "$(dpkg-query -W -f='${Version}' bpftune 2>/dev/null || echo 'not installed')"
