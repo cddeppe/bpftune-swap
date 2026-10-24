@@ -248,7 +248,9 @@ void event_handler(struct bpftuner *tuner,
 		udp_in = in + in6;
 		udp_drops = drops + drops6;
 		udp_drop_rate = (udp_drops * 1000)/udp_in;
-		bpftune_log(BPFTUNE_LOG_LEVEL, "netns: %lu UDP in %lu, drops %lu drop rate %lu\n",
+		/* v0.4.107 (T3b): demoted to DEBUG -- fired at normal level per
+		 * event (up to 40/min under the 25ms dedup during UDP pressure). */
+		bpftune_log(LOG_DEBUG, "netns: %lu UDP in %lu, drops %lu drop rate %lu\n",
 			    event->netns_cookie, udp_in, udp_drops, udp_drop_rate);
 		switch (scenario) {
 		case UDP_BUFFER_INCREASE:

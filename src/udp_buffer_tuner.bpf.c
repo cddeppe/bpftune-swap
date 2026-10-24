@@ -84,7 +84,7 @@ static __always_inline bool udp_nearly_out_of_memory(struct sock *sk,
 
 	if (NEARLY_FULL(allocated, limit_sk_mem_quantum[2])) {
 		/* approaching memory exhaustion event; dial down mem/rmem
- 		 * buffer limits to limit per-socket costs.
+		 * buffer limits to limit per-socket costs.
 		 */
 		near_memory_exhaustion = true;
 		near_memory_pressure = true;
@@ -224,9 +224,15 @@ int BPF_PROG(bpftune_udp_fail_rcv, int ret, struct sock *sk)
 {
 	if (ret == 0)
 		return 0;
-	/* only sample subset of events to reduce overhead. */
-	if (ret != -ENOBUFS)
-		bpftune_sample(udp_fail_rcv_sample);
+	/* v0.4.107 (T3): sample ALL failure paths.  Was:
+	 *   if (ret != -ENOBUFS) bpftune_sample(...);
+	 * i.e. the ENOBUFS path -- the exact buffer-exhaustion STORM case --
+	 * was the only unsampled one.  Pressure detection is not weakened:
+	 * the sock_exceed_buf_limit hook below feeds udp_fail_rcv(-ENOBUFS)
+	 * directly (never sampled), and the adaptive sampler escalates under
+	 * bursts (1/8, 1/16 ...) while the 25ms event dedup still bounds
+	 * userspace work. */
+	bpftune_sample(udp_fail_rcv_sample);
 
 	return udp_fail_rcv(ret, sk);
 }

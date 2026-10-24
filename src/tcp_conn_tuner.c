@@ -208,9 +208,13 @@ static int pin_explore_map(struct bpftuner *tuner)
                                     "prefix6: pinned at %s, pfx6=%u\n",
                                     EXPLORE_PIN_PATH, pfx6);
         }
-        /* 0.4.91: slot 3 = bpf_debug (0=quiet, 1=verbose). */
+        /* 0.4.91: slot 3 = bpf_debug (0=quiet, 1=verbose).
+         * v0.4.107: DEFAULT NOW 0 (quiet) -- the BPF feed lines are
+         * unconditional; slot 3 only gates high-volume diagnostics
+         * (cwnd/swapctx/swapscore/closport).  'bpftune --bpf-debug=1'
+         * restores full verbosity. */
         {
-                __u32 dbg = 1;
+                __u32 dbg = 0;
                 FILE *df = fopen(DEBUG_STATE, "r");
                 if (df) {
                         unsigned int v;
@@ -448,48 +452,6 @@ int init(struct bpftuner *tuner)
         err = bpftuner_cgroup_attach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
         if (err)
                 goto out;
-
-    /* 0.4.107fix-program-split: populate the PROG_ARRAY so the prep
-     * phase can tail-call into the metric-aggregation program.  The
-     * tail program is NOT attached to a cgroup; it is reached only
-     * via bpf_tail_call().  Libbpf loads all SEC("sockops") programs
-     * in the object regardless of cgroup attach status.  Index 0 of
-     * the map must hold the tail program's fd before the first sock
-     * connection is established.  Failure to populate the map is
-     * non-fatal: the prep phase falls through to `return 1` on
-     * bpf_tail_call failure (the connection is established but no
-     * metric is computed for that one event). */
-    {
-        struct bpf_program *tail_prog;
-        struct bpf_map *tail_map;
-        int tail_fd, tail_idx = 0;
-
-        tail_prog = bpf_object__find_program_by_name(tuner->obj,
-                                                    CONN_TUNER_TAIL_BPF);
-        if (!tail_prog) {
-                bpftune_log(LOG_ERR,
-                            "conn_tuner_tail: program not found; "
-                            "metric aggregation will be skipped\n");
-        } else {
-                tail_fd = bpf_program__fd(tail_prog);
-                tail_map = bpftuner_bpf_map_get(tcp_conn, tuner,
-                                                conn_tuner_tail_map);
-                if (tail_map && tail_fd >= 0) {
-                        if (bpf_map_update_elem(bpf_map__fd(tail_map),
-                                                 &tail_idx, &tail_fd,
-                                                 BPF_ANY))
-                                bpftune_log(LOG_ERR,
-                                            "conn_tuner_tail: failed to "
-                                            "populate PROG_ARRAY: %s\n",
-                                            strerror(errno));
-                        else
-                                bpftune_log(BPFTUNE_LOG_LEVEL,
-                                            "conn_tuner_tail: populated "
-                                            "PROG_ARRAY[0] with fd %d\n",
-                                            tail_fd);
-                }
-        }
-    }
 
         /* 0.4.79: verify both progs actually landed on the root cgroup.
          * Observed on fast systemctl restart: the attaches return 0 but
@@ -1049,7 +1011,7 @@ retry:
 
                         /* 0.4.63: initialize stale swap_score=0 entries that have
 
-                         * votes.  0.4.62 set the score in set_cong(), but an algo
+                         * votes.  0.4.62 set the score in set_cong(), but an alg
 
                          * already in the state file with score=0 only inits when
 
@@ -1095,7 +1057,12 @@ retry:
                                 r.rate_second_v == new_r2v)
                                         continue;
                 }
-                bpftune_log(BPFTUNE_LOG_LEVEL,
+                /* v0.4.107 (T2): per-bucket detail demoted to DEBUG --
+                 * this line fired once per changed bucket per 30s cycle
+                 * at normal level (journal spam).  The per-cycle
+                 * aggregate below (promoted to normal level, only when
+                 * something changed) replaces it. */
+                bpftune_log(LOG_DEBUG,
                             "reanchor: best_i=%llu best_v=%llu (was %llu/%llu) second_i=%llu second_v=%llu (was %llu/%llu)\n",
                             (unsigned long long)new_bi,
                             (unsigned long long)new_bv,
@@ -1143,8 +1110,16 @@ retry:
         if (seq_skipped)
                 bpftune_log(LOG_DEBUG, "reanchor: %u buckets skipped (seq busy)\n",
                             seq_skipped);
-        bpftune_log(LOG_DEBUG, "reanchor: cycle scanned=%u updated=%u\n",
-                    scanned, updated);
+        /* v0.4.107 (T2): one aggregate line per cycle at normal level,
+         * only when something changed -- strictly fewer journal lines
+         * than the old per-bucket line (which fired once per updated
+         * bucket).  A quiet cycle logs nothing. */
+        if (updated)
+                bpftune_log(BPFTUNE_LOG_LEVEL, "reanchor: cycle scanned=%u updated=%u\n",
+                            scanned, updated);
+        else
+                bpftune_log(LOG_DEBUG, "reanchor: cycle scanned=%u updated=0\n",
+                            scanned);
 }
 
 static void *reanchor_worker(void *arg)
