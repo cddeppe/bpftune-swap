@@ -93,8 +93,7 @@ typeof(name(0)) name(struct pt_regs *ctx)                                   \
         return ____##name(___bpf_kprobe_args(args));                        \
         _Pragma("GCC diagnostic pop")                                       \
 }                                                                           \
-static __attribute__((always_inline)) typeof(name(0))                       \
-____##name(struct pt_regs *ctx, ##args)
+static __attribute__((always_inline)) typeof(name(0)) ____##name(struct pt_regs *ctx, ##args)
 #endif /* BPF_KPROBE */
 
 #ifndef BPF_KRETPROBE
@@ -157,11 +156,11 @@ static __always_inline typeof(name(0)) ____##name(struct pt_regs *ctx, ##args)
 		__type(key, _key);					\
 		__type(value, _value);					\
 		__uint(max_entries, _max_entries);			\
-		__uint(map_flags, _flags);				\
+		__uint(map_flags, _flags);				 \
         } _name SEC(".maps")
 
 #define BPF_RINGBUF(_name, _max_entries)				\
-	struct {							\
+        struct {							\
 		__uint(type, BPF_MAP_TYPE_RINGBUF);			\
 		__uint(max_entries, _max_entries);			\
 	} _name SEC(".maps")
@@ -194,10 +193,10 @@ static __always_inline typeof(name(0)) ____##name(struct pt_regs *ctx, ##args)
 			save_result = 0;				\
 	} while (0)
 
-#define del_entry_struct(save_map)					\
+#define del_entry_struct(save_map)				\
 	do {								\
 		__u64 current = bpf_get_current_task();			\
-		bpf_map_delete_elem(&save_map, &current);		\
+		bpf_map_delete_elem(&save_map, &current);	\
 	} while (0)
 
 /* must be specified prior to including bpftune.h */
@@ -306,21 +305,30 @@ unsigned int bpftune_sample_rate = 4;
  * rate such that we only sample 1/8 etc.  Similarly lower the sample
  * rate if we have previously increased it and not seen as many samples
  * in that window.
+ *
+ * v0.4.107 (T10): the adaptive rate is now CLAMPED at 256x base.
+ * Unclamped, a sustained burst (~30 back-to-back events closer than
+ * 10ms apart -- exactly the storm case this macro exists for) wrapped
+ * the u32 rate to 0; `count % 0` then let EVERY event through, so the
+ * sampler collapsed precisely when it mattered.  With the clamp the
+ * rate stays in [base, base<<8] and the modulo is always well-defined.
  */
 #define bpftune_sample(sample)					\
 do {								\
 	__u64 last_ts = 0;					\
 								\
 	if (!sample.rate)					\
-		sample.rate = bpftune_sample_rate;		\
-	if (((sample.count++) % sample.rate) != 0)		\
+		sample.rate = bpftune_sample_rate;	\
+	if (((sample.count++) % sample.rate) != 0)	\
 		return 0;					\
 	last_ts = sample.ts;					\
-	sample.ts = bpf_ktime_get_ns();				\
-	if ((sample.ts - last_ts) < TEN_MSEC)			\
-		sample.rate = sample.rate << 1;			\
-	else if (sample.rate > bpftune_sample_rate)		\
-		sample.rate = sample.rate >> 1;			\
+	sample.ts = bpf_ktime_get_ns();			\
+	if ((sample.ts - last_ts) < TEN_MSEC) {		\
+		if (sample.rate < (bpftune_sample_rate << 8))	\
+			sample.rate = sample.rate << 1;		\
+	}						\
+	else if (sample.rate > bpftune_sample_rate)	\
+		sample.rate = sample.rate >> 1;		\
 } while (0)
 
 #define __barrier asm volatile("" ::: "memory")
