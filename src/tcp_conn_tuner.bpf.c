@@ -480,8 +480,9 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
         return 1;
 
     {
-        __u64 metric_min = ~((__u64)0x0);
-        __u8 i, minindex = 0, s;
+        __u64 metric_min;
+        __u64 min2;
+        __u8 minindex, s;
 
         if (remote_host->selection_count < 2 * NUM_TCP_CONN_METRICS) {
             __u8 forced = remote_host->selection_count & (NUM_TCP_CONN_METRICS - 1);
@@ -505,67 +506,77 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
             return 1;
         }
 
+        /* v0.4.108: pick + anchor from the MAINTAINED TRACKER instead of
+         * the 16-iteration min/second-min rescan that lived here.  That
+         * loop dominated this program's verifier budget (25.5K states,
+         * >1M processed insns = E2BIG at load -- the same wall the old
+         * v0.4.107 died against).  It was also redundant by design:
+         *
+         *   - the VOTE path updates best_i/best_v/second_i/second_v
+         *     incrementally on every vote (its tracker block runs AFTER
+         *     the EMA update, so the tracker is exactly as fresh as the
+         *     map values the scan would have read);
+         *   - userspace reanchor_best() re-derives the full leaderboard
+         *     every 30s -- with MIN_LEADER_TRUST gating this scan
+         *     lacked -- and the C1 seq protocol keeps the two consistent.
+         *
+         * The struct comment says it outright: "Vote path reads these
+         * for a live swap target without a 16-iter loop."  The same now
+         * applies to the ESTABLISHED pick.  Decisions stay instant and
+         * in-kernel; what disappears is a duplicate rescan whose job the
+         * maintenance layer already owns.
+         *
+         * Behavior delta (bounded, self-correcting):
+         *   - normal buckets: pick identical (tracker == scan within one
+         *     vote);
+         *   - all-sentinel bucket: identical (minindex 0, boost fires);
+         *   - rare "tracker empty, raw values exist" window (reanchor
+         *     zeroing vs vote repopulation race): pick falls to 0 and the
+         *     tight-bucket boost fires -- old code picked the scanned
+         *     min -- until the next vote or the next 30s reanchor.
+         * The forced-exploration phase (first 32 conns) and explore_pct
+         * behavior are unchanged. */
+        metric_min = remote_host->best_v;
+        min2 = remote_host->second_v;
+        minindex = (__u8)(remote_host->best_i & (NUM_TCP_CONN_METRICS - 1));
+        if (!(remote_host->metrics[minindex].metric_count > 0 &&
+              metric_min != 0 && metric_min != ~((__u64)0))) {
+            /* No usable anchor: mirror the old empty state exactly
+             * (best_v=0 written, min2=~0 so the boost fires, pick=0). */
+            __sync_fetch_and_add(&remote_host->seq, 1);
+            remote_host->best_v = 0;
+            __sync_fetch_and_add(&remote_host->seq, 1);
+            metric_min = 0;
+            min2 = ~((__u64)0);
+            minindex = 0;
+        }
         {
-            __u64 min2 = ~((__u64)0);
-            for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
-                __u64 v = remote_host->metrics[i].metric_value;
-                /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
-                 * Was: treated as real value, causing best_v=~0, which
-                 * made the swap gate fire and swap everything to cubic. */
-                if (v == 0 || v == ~((__u64)0))
-                    continue;
-                if (v < metric_min) {
-                    min2 = metric_min;
-                    metric_min = v;
-                    minindex = i;
-                } else if (v < min2) {
-                    min2 = v;
-                }
-            }
-            minindex &= (NUM_TCP_CONN_METRICS - 1);
-            /* Re-anchor the swap-target tracker to the true best on every
-             * ESTABLISHED.  The incremental update in the vote path only
-             * compares best vs second, so a third algorithm can drift into
-             * a lower position without ever being promoted through the
-             * pair.  No new variables — the loop already found minindex
-             * and metric_min; we just persist them. */
-            if (remote_host->metrics[minindex].metric_count > 0 &&
-                metric_min != 0 && metric_min != ~((__u64)0)) {
-                __sync_fetch_and_add(&remote_host->seq, 1);
-                remote_host->best_i = minindex;
-                remote_host->best_v = metric_min;
-                __sync_fetch_and_add(&remote_host->seq, 1);
-            } else {
-                __sync_fetch_and_add(&remote_host->seq, 1);
-                remote_host->best_v = 0;
-                __sync_fetch_and_add(&remote_host->seq, 1);
-            }
-            {
-                __u32 zero = 0;
-                __u32 pct = EXPLORE_PCT_DEFAULT;
-                __u32 *pctp = bpf_map_lookup_elem(&tuner_config_map, &zero);
-                if (pctp)
-                    pct = *pctp;
-                if (pct > EXPLORE_PCT_MAX)
-                    pct = EXPLORE_PCT_MAX;
-                /* 0.4.22 tight-bucket boost: at --exp=100 the boost
-                 * is a no-op because pct is already 100. */
-                if ((min2 == ~((__u64)0) || metric_min * 5 > min2 * 4) &&
-                    pct < EXPLORE_BOOST_PCT)
-                    pct = EXPLORE_BOOST_PCT;
-                s = epsilon_greedy_pct(minindex, NUM_TCP_CONN_METRICS, pct);
-            }
+            __u32 zero = 0;
+            __u32 pct = EXPLORE_PCT_DEFAULT;
+            __u32 *pctp = bpf_map_lookup_elem(&tuner_config_map, &zero);
+            if (pctp)
+                pct = *pctp;
+            if (pct > EXPLORE_PCT_MAX)
+                pct = EXPLORE_PCT_MAX;
+            /* 0.4.22 tight-bucket boost: at --exp=100 the boost
+             * is a no-op because pct is already 100.  min2 is now the
+             * tracker's second_v (same definition: second-lowest valid
+             * value, which by construction is >= the minimum). */
+            if ((min2 == ~((__u64)0) || metric_min * 5 > min2 * 4) &&
+                pct < EXPLORE_BOOST_PCT)
+                pct = EXPLORE_BOOST_PCT;
+            s = epsilon_greedy_pct(minindex, NUM_TCP_CONN_METRICS, pct);
+        }
 
-            s &= (NUM_TCP_CONG_ALGS - 1);
-            if (set_cong(ops, remote_host, s)) {
-                remote_host->metrics[s].metric_value = ~((__u64)0);
-            } else {
-                /* v0.4.107: feed line -- unconditional (was bpftune_debug). */
-                bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
-                           bpf_get_socket_cookie(ops), (__u32)s,
-                           is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
-                           (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
-            }
+        s &= (NUM_TCP_CONG_ALGS - 1);
+        if (set_cong(ops, remote_host, s)) {
+            remote_host->metrics[s].metric_value = ~((__u64)0);
+        } else {
+            /* v0.4.107: feed line -- unconditional (was bpftune_debug). */
+            bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
+                       bpf_get_socket_cookie(ops), (__u32)s,
+                       is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                       (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
         }
     }
     return 1;
