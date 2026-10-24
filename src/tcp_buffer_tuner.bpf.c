@@ -31,6 +31,12 @@ int sk_mem_quantum;
 int sk_mem_quantum_shift;
 unsigned long long nr_free_buffer_pages;
 
+/* v0.4.107 (T4): adaptive sampling for tcp_sndbuf_expand.  The hook
+ * fires on every sndbuf expansion (bulk flows, ~per-RTT during ramp)
+ * and was the only unsampled hot hook in this tuner; its sibling
+ * tcp_rcv_space_adjust has sampled since day one. */
+struct bpftune_sample sndbuf_expand_sample = { };
+
 #define tcp_tunable_corr(__id, __cookie, __newval, __tp, __field_type, __field)\
 	{								\
 		__field_type __field;					\
@@ -85,7 +91,7 @@ static __always_inline bool tcp_nearly_out_of_memory(struct sock *sk,
 
 	if (NEARLY_FULL(allocated, limit_sk_mem_quantum[2])) {
 		/* approaching memory exhaustion event; dial down wmem/rmem
- 		 * buffer limits to limit per-socket costs.
+		 * buffer limits to limit per-socket costs.
 		 */
 		near_memory_exhaustion = true;
 		near_memory_pressure = true;
@@ -111,8 +117,8 @@ static __always_inline bool tcp_nearly_out_of_memory(struct sock *sk,
 		mem_new[1] = mem[1];
 		mem_new[2] = BPFTUNE_SHRINK_BY_DELTA(mem[2]);
 		send_sk_sysctl_event(sk, TCP_BUFFER_DECREASE,
-				     TCP_BUFFER_TCP_WMEM,
-				     mem, mem_new, event);
+					     TCP_BUFFER_TCP_WMEM,
+					     mem, mem_new, event);
 		if (!net)
 			return true;
 		mem[0] = (long)BPFTUNE_CORE_READ(net, ipv4.sysctl_tcp_rmem[0]);
@@ -122,8 +128,8 @@ static __always_inline bool tcp_nearly_out_of_memory(struct sock *sk,
 		mem_new[1] = mem[1];
 		mem_new[2] = BPFTUNE_SHRINK_BY_DELTA(mem[2]);
 		send_sk_sysctl_event(sk, TCP_BUFFER_DECREASE,
-				     TCP_BUFFER_TCP_RMEM,
-				     mem, mem_new, event);
+					     TCP_BUFFER_TCP_RMEM,
+					     mem, mem_new, event);
 		return true;
 	} else if (NEARLY_FULL(allocated, limit_sk_mem_quantum[1])) {
 		/* send approaching memory pressure event; we also increase
@@ -144,8 +150,8 @@ static __always_inline bool tcp_nearly_out_of_memory(struct sock *sk,
 		mem_new[2] = min(nr_free_buffer_pages >> 2,
 				 BPFTUNE_GROW_BY_DELTA(mem[2]));
 		send_sk_sysctl_event(sk, TCP_MEM_PRESSURE,
-				     TCP_BUFFER_TCP_MEM, mem, mem_new,
-				     event);
+					     TCP_BUFFER_TCP_MEM, mem, mem_new,
+					     event);
 		near_memory_pressure = true;
 		return true;
 	}
@@ -181,6 +187,14 @@ BPF_FENTRY(tcp_sndbuf_expand, struct sock *sk)
 	struct tcp_sock *tp = (struct tcp_sock *)sk;
 	long wmem[3], wmem_new[3];
 	long sndbuf;
+
+	/* v0.4.107 (T4): only sample a subset of events to reduce overhead --
+	 * this hook fires per sndbuf expansion on bulk flows (~per-RTT during
+	 * ramp) and was the only unsampled hot hook in this tuner.  Mirrors
+	 * tcp_rcv_space_adjust.  Memory-pressure detection is unaffected:
+	 * tcp_enter_memory_pressure (above) and tcp_init_sock (below) are
+	 * both unsampled and remain the authoritative detectors. */
+	bpftune_sample(sndbuf_expand_sample);
 
 	if (!sk || !net || tcp_nearly_out_of_memory(sk, &event))
 		return 0;

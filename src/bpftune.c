@@ -393,7 +393,8 @@ static int do_prefix6(const char *arg)
         fd = bpf_obj_get(EXPLORE_PIN_PATH);
         if (fd < 0) {
                 fprintf(stderr,
-                        "bpftune: no pinned map at %s\n", EXPLORE_PIN_PATH);
+                        "bpftune: no pinned map at %s\n",
+                        EXPLORE_PIN_PATH);
                 return 1;
         }
         if (bpf_map_lookup_elem(fd, &key, &pfx)) {
@@ -449,7 +450,8 @@ static int do_prefix4(const char *arg)
         fd = bpf_obj_get(EXPLORE_PIN_PATH);
         if (fd < 0) {
                 fprintf(stderr,
-                        "bpftune: no pinned map at %s\n", EXPLORE_PIN_PATH);
+                        "bpftune: no pinned map at %s\n",
+                        EXPLORE_PIN_PATH);
                 return 1;
         }
         if (bpf_map_lookup_elem(fd, &key, &pfx)) {
@@ -505,11 +507,14 @@ static int do_bpf_debug(const char *arg)
 
 	fd = bpf_obj_get(EXPLORE_PIN_PATH);
 	if (fd < 0) {
-		fprintf(stderr, "bpftune: no pinned map at %s\n", EXPLORE_PIN_PATH);
+		fprintf(stderr,
+			"bpftune: no pinned map at %s\n",
+			EXPLORE_PIN_PATH);
 		return 1;
 	}
 	if (bpf_map_lookup_elem(fd, &key, &val)) {
-		fprintf(stderr, "bpftune: read failed: %s\n", strerror(errno));
+		fprintf(stderr, "bpftune: read failed: %s\n",
+			strerror(errno));
 		close(fd);
 		return 1;
 	}
@@ -530,7 +535,8 @@ static int do_bpf_debug(const char *arg)
 		}
 		nv = (__u32)v;
 		if (bpf_map_update_elem(fd, &key, &nv, BPF_ANY)) {
-			fprintf(stderr, "bpftune: update failed: %s\n", strerror(errno));
+			fprintf(stderr, "bpftune: update failed: %s\n",
+				strerror(errno));
 			close(fd);
 			return 1;
 		}
@@ -559,15 +565,15 @@ int main(int argc, char *argv[])
 		{ "daemon", 	no_argument,		NULL,	'D' },
 		{ "debug",	no_argument,		NULL,	'd' },
 		{ "legacy",	no_argument,		NULL,	'L' },
-		{ "help",	no_argument,		NULL,	'h' },
+		{ "help",		no_argument,		NULL,	'h' },
 		{ "libdir",	required_argument,	NULL,	'l' },
 		{ "learning_rate", required_argument,	NULL,	'r' },
-		{ "port",	required_argument,	NULL,	'p' },
+		{ "port",		required_argument,	NULL,	'p' },
 		{ "print-libdir", no_argument,		NULL,	'P' },
 		{ "query",	required_argument,	NULL,	'q' },
 		{ "rollback",	no_argument,		NULL,	'R' },
-		{ "stderr", 	no_argument,		NULL,	's' },
-		{ "support",	no_argument,		NULL,	'S' },
+		{ "stderr",	no_argument,		NULL,	's' },
+		{ "support",		no_argument,		NULL,	'S' },
 		{ "version",	no_argument,		NULL,	'V' },
             { "reset-state", no_argument,        NULL,   'x' },
             { "explore",    optional_argument,   NULL,   'e' },
@@ -596,7 +602,13 @@ int main(int argc, char *argv[])
 
 	const char *bpf_debug_arg = NULL;
 	bool explore_seen = false;
-	int interval = 100;
+	/* v0.4.107 (T9): ringbuf poll timeout 100ms -> 1000ms.  This is a
+	 * MAX wait, not a cadence: poll still wakes immediately on events,
+	 * so event latency is unchanged.  What it removes is the 10 idle
+	 * wakeups/sec the daemon paid while waiting.  The only side effect
+	 * is that a shutdown that is not signal-interrupted waits up to 1s
+	 * to notice ring_buffer_done (signals still interrupt poll). */
+	int interval = 1000;
 	unsigned short port = 0;
 	int err, opt;
 

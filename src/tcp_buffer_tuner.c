@@ -194,6 +194,9 @@ int init(struct bpftuner *tuner)
 			     nr_free_buffer_pages(true));
 	bpftuner_bpf_sample_add(tcp_buffer, tuner, rcv_space_sample);
 	bpftuner_bpf_sample_add(tcp_buffer, tuner, syn_flood_action_sample);
+	/* v0.4.107 (T4): register the new sndbuf-expand sample so the fini()
+	 * summary reports it alongside the others. */
+	bpftuner_bpf_sample_add(tcp_buffer, tuner, sndbuf_expand_sample);
 	err = bpftuner_bpf_attach(tcp_buffer, tuner);
 	if (err)
 		return err;
