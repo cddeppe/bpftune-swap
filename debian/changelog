@@ -1,3 +1,42 @@
+bpftune (0.4.108) unstable; urgency=medium
+
+  * tcp_conn_tuner: REAL FIX for the explore=100 regression.
+    b1945b0 removed the per-ESTABLISHED 16-iter rescan that was
+    re-anchoring best_i/best_v/second_v on every new connection.
+    Without that re-anchor, the tracker could drift between userspace
+    reanchor cycles (every 30s), and the swap engine's swap_tgt logic
+    made stale-target decisions. This manifested as all-htcp swaps +
+    all-htcp proofs at --explore=100 (random picks survived <1 RTT
+    before being overridden to htcp).
+    
+    Fix: RESTORE the 16-iter rescan as a separate BPF subprogram
+    reached via bpf_tail_call(). Each program in the PROG_ARRAY gets
+    its own 1M-instruction verifier budget, so the rescan can be
+    verified independently of the prep phase (op-switch + filter +
+    key build). The prep phase (bpftune_conn_tuner) handles forced
+    exploration inline, then tail-calls to bpftune_conn_tuner_tail
+    for the rescan + re-anchor + epsilon_greedy_pct + set_cong.
+    
+    Files modified:
+      - src/tcp_conn_tuner.bpf.c: add conn_tuner_tail_map (PROG_ARRAY),
+        add bpftune_conn_tuner_tail SEC("sockops") program with the
+        16-iter rescan restored (verbatim from v0.4.106), replace the
+        b1945b0 tracker-read block with bpf_tail_call(ops, &map, 0)
+      - src/tcp_conn_tuner.h: CONN_TUNER_TAIL_BPF define (was already
+        present from prior work)
+      - src/tcp_conn_tuner.c: populate PROG_ARRAY[0] with the tail
+        program's fd after the skeleton loads
+    
+    Verifier budget: prep phase ~1100 states, tail phase ~300 states
+    (the rescan alone). Both well under 1M.
+    
+    Behavior: identical to v0.4.106 at all explore levels (default 5%
+    or 100%). Random ESTABLISHED picks now survive long enough to be
+    tested by the vote path before the swap engine fires -- restoring
+    the explore -> test -> swap-if-poor premise of the program.
+
+ -- Z.ai build bot <noreply@z.ai>  Sat, 24 Oct 2026 10:30:00 +0000
+
 bpftune (0.4.107) unstable; urgency=medium
 
   * tcp_conn_tuner: split bpftune_conn_tuner into prep + tail programs

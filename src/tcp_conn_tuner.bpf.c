@@ -66,6 +66,18 @@ BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
 BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
             struct in6_addr, 1024, 0);
 
+/* v0.4.108-tailcall: PROG_ARRAY for the tail-call split of bpftune_conn_tuner.
+ * Index 0 holds the fd of bpftune_conn_tuner_tail, populated by the userspace
+ * loader after the skeleton is loaded. Each tail-called program gets its own
+ * 1M-instruction verifier budget, so the 16-iter min loop + best_i/second_v
+ * re-anchor + set_cong can be verified independently of the prep-phase
+ * op-switch / RFC1918 filter / bucket-key build. This RESTORES the per-ESTABLISHED
+ * rescan that b1945b0 removed (which caused best_i to drift and broke the
+ * swap engine's accuracy at high explore). Stack and registers are NOT preserved
+ * across the tail boundary; the tail program re-derives is_v4_mapped /
+ * v4_addr_from_v6 / key / remote_host from ops. */
+BPF_MAP_DEF(conn_tuner_tail_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 1, 0);
+
 /* per-CPU scratch buffer used to initialize new remote_host entries without
  * placing a >512B struct temporary on the BPF stack (NUM_TCP_CONG_ALGS=16
  * makes struct remote_host 792 bytes, exceeding the 512-byte stack limit).
@@ -479,105 +491,181 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     if (!remote_host)
         return 1;
 
-    {
-        __u64 metric_min;
-        __u64 min2;
-        __u8 minindex, s;
-
-        if (remote_host->selection_count < 2 * NUM_TCP_CONN_METRICS) {
-            __u8 forced = remote_host->selection_count & (NUM_TCP_CONN_METRICS - 1);
-            /* 0.4.89 (C1): seq-wrap selection_count++. */
-            __sync_fetch_and_add(&remote_host->seq, 1);
-            remote_host->selection_count++;
-            __sync_fetch_and_add(&remote_host->seq, 1);
-            if (set_cong(ops, remote_host, forced)) {
-                remote_host->metrics[forced].metric_value = ~((__u64)0);
-            } else {
-                /* 0.4.94: for v4-in-v6 connections, ops->remote_ip4 is 0
-                 * (the kernel only fills it for AF_INET).  Log the v4
-                 * address we extracted from remote_ip6[3] instead so the
-                 * dashboard's cdest map gets the right dest= field.
-                 * v0.4.107: feed line -- unconditional (was bpftune_debug). */
-                bpf_printk("estab cookie=%llu alg=%u forced=1 dest=%u dest6=%u dest6b=%u",
-                           bpf_get_socket_cookie(ops), (__u32)forced,
-                           is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
-                           (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
-            }
-            return 1;
-        }
-
-        /* v0.4.108: pick + anchor from the MAINTAINED TRACKER instead of
-         * the 16-iteration min/second-min rescan that lived here.  That
-         * loop dominated this program's verifier budget (25.5K states,
-         * >1M processed insns = E2BIG at load -- the same wall the old
-         * v0.4.107 died against).  It was also redundant by design:
-         *
-         *   - the VOTE path updates best_i/best_v/second_i/second_v
-         *     incrementally on every vote (its tracker block runs AFTER
-         *     the EMA update, so the tracker is exactly as fresh as the
-         *     map values the scan would have read);
-         *   - userspace reanchor_best() re-derives the full leaderboard
-         *     every 30s -- with MIN_LEADER_TRUST gating this scan
-         *     lacked -- and the C1 seq protocol keeps the two consistent.
-         *
-         * The struct comment says it outright: "Vote path reads these
-         * for a live swap target without a 16-iter loop."  The same now
-         * applies to the ESTABLISHED pick.  Decisions stay instant and
-         * in-kernel; what disappears is a duplicate rescan whose job the
-         * maintenance layer already owns.
-         *
-         * Behavior delta (bounded, self-correcting):
-         *   - normal buckets: pick identical (tracker == scan within one
-         *     vote);
-         *   - all-sentinel bucket: identical (minindex 0, boost fires);
-         *   - rare "tracker empty, raw values exist" window (reanchor
-         *     zeroing vs vote repopulation race): pick falls to 0 and the
-         *     tight-bucket boost fires -- old code picked the scanned
-         *     min -- until the next vote or the next 30s reanchor.
-         * The forced-exploration phase (first 32 conns) and explore_pct
-         * behavior are unchanged. */
-        metric_min = remote_host->best_v;
-        min2 = remote_host->second_v;
-        minindex = (__u8)(remote_host->best_i & (NUM_TCP_CONN_METRICS - 1));
-        if (!(remote_host->metrics[minindex].metric_count > 0 &&
-              metric_min != 0 && metric_min != ~((__u64)0))) {
-            /* No usable anchor: mirror the old empty state exactly
-             * (best_v=0 written, min2=~0 so the boost fires, pick=0). */
-            __sync_fetch_and_add(&remote_host->seq, 1);
-            remote_host->best_v = 0;
-            __sync_fetch_and_add(&remote_host->seq, 1);
-            metric_min = 0;
-            min2 = ~((__u64)0);
-            minindex = 0;
-        }
-        {
-            __u32 zero = 0;
-            __u32 pct = EXPLORE_PCT_DEFAULT;
-            __u32 *pctp = bpf_map_lookup_elem(&tuner_config_map, &zero);
-            if (pctp)
-                pct = *pctp;
-            if (pct > EXPLORE_PCT_MAX)
-                pct = EXPLORE_PCT_MAX;
-            /* 0.4.22 tight-bucket boost: at --exp=100 the boost
-             * is a no-op because pct is already 100.  min2 is now the
-             * tracker's second_v (same definition: second-lowest valid
-             * value, which by construction is >= the minimum). */
-            if ((min2 == ~((__u64)0) || metric_min * 5 > min2 * 4) &&
-                pct < EXPLORE_BOOST_PCT)
-                pct = EXPLORE_BOOST_PCT;
-            s = epsilon_greedy_pct(minindex, NUM_TCP_CONN_METRICS, pct);
-        }
-
-        s &= (NUM_TCP_CONG_ALGS - 1);
-        if (set_cong(ops, remote_host, s)) {
-            remote_host->metrics[s].metric_value = ~((__u64)0);
+    /* v0.4.108-tailcall: the forced-exploration phase (first 32 conns)
+     * runs inline here; the non-forced path tail-calls into
+     * bpftune_conn_tuner_tail which restores the 16-iter rescan. */
+    if (remote_host->selection_count < 2 * NUM_TCP_CONN_METRICS) {
+        __u8 forced = remote_host->selection_count & (NUM_TCP_CONN_METRICS - 1);
+        /* 0.4.89 (C1): seq-wrap selection_count++. */
+        __sync_fetch_and_add(&remote_host->seq, 1);
+        remote_host->selection_count++;
+        __sync_fetch_and_add(&remote_host->seq, 1);
+        if (set_cong(ops, remote_host, forced)) {
+            remote_host->metrics[forced].metric_value = ~((__u64)0);
         } else {
-            /* v0.4.107: feed line -- unconditional (was bpftune_debug). */
-            bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
-                       bpf_get_socket_cookie(ops), (__u32)s,
+            /* 0.4.94: for v4-in-v6 connections, ops->remote_ip4 is 0
+             * (the kernel only fills it for AF_INET).  Log the v4
+             * address we extracted from remote_ip6[3] instead so the
+             * dashboard's cdest map gets the right dest= field.
+             * v0.4.107: feed line -- unconditional (was bpftune_debug). */
+            bpf_printk("estab cookie=%llu alg=%u forced=1 dest=%u dest6=%u dest6b=%u",
+                       bpf_get_socket_cookie(ops), (__u32)forced,
                        is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                        (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
         }
+        return 1;
+    }
+
+    /* v0.4.108-tailcall: hand off to the tail program for the 16-iter
+     * rescan + best_i/second_v re-anchor + tight-bucket boost +
+     * epsilon_greedy_pct + set_cong. The tail program gets its own
+     * 1M verifier budget (PROG_ARRAY tail calls are verified
+     * independently), so the rescan that b1945b0 removed (causing
+     * best_i drift and breaking the swap engine's accuracy at high
+     * explore) can be RESTORED without blowing the verifier limit.
+     *
+     * Stack and registers are NOT preserved across the tail boundary;
+     * the tail program re-derives is_v4_mapped / v4_addr_from_v6 /
+     * key / remote_host from ops. The re-derivation is byte-for-byte
+     * identical to the prep phase's logic above.
+     *
+     * bpf_tail_call never returns on success; the return below is a
+     * fallback for the rare case where the tail map is empty or the
+     * tail-call limit is reached. The connection is established
+     * (cb_flags already set) but no metric is computed for that one
+     * event -- graceful degradation, not a crash. */
+    bpf_tail_call(ops, &conn_tuner_tail_map, 0);
+    return 1;
+}
+
+/* v0.4.108-tailcall: continuation of bpftune_conn_tuner. Entered via
+ * bpf_tail_call from bpftune_conn_tuner after the prep phase (op-switch,
+ * address parse, loopback filter, bucket-key build, remote_host lookup).
+ * Re-derives the prep-phase outputs from ops because tail calls do not
+ * preserve stack or registers. This program is NOT attached to a cgroup
+ * -- it is reached only via the PROG_ARRAY tail call.
+ *
+ * RESTORES the per-ESTABLISHED rescan that b1945b0 removed. The rescan
+ * re-anchors best_i/best_v/second_i/second_v on every new connection,
+ * which keeps the swap engine's tracker fresh. Without this (b1945b0's
+ * state), best_i could drift between reanchor cycles (every 30s) and
+ * the swap engine made stale-target decisions, manifesting as all-htcp
+ * swaps at high explore. */
+SEC("sockops")
+int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
+{
+    struct remote_host *remote_host;
+    struct in6_addr raddr = {};
+    struct in6_addr *key = &raddr;
+    bool is_v4_mapped = false;
+    __u32 v4_addr_from_v6 = 0;
+    __u64 metric_min = ~((__u64)0x0);
+    __u64 min2 = ~((__u64)0);
+    __u8 i, minindex = 0, s;
+
+    /* Re-derive is_v4_mapped + v4_addr_from_v6 (matches prep phase verbatim).
+     * is_v4_mapped only fires for AF_INET6 sockets where the upper 96 bits
+     * are ::ffff: and the lower 32 bits carry an IPv4 address. */
+    if (ops->family == AF_INET6 &&
+        ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
+        ops->remote_ip6[2] == bpf_htonl(0xffff)) {
+        is_v4_mapped = true;
+        v4_addr_from_v6 = ops->remote_ip6[3];
+    }
+
+    /* Re-derive the bucket key (matches prep phase verbatim).
+     * bucket_key_alias_or_prefix is idempotent -- re-applying it here
+     * produces the same key the prep phase already used to do its
+     * get_remote_host(key, true). */
+    switch (ops->family) {
+    case AF_INET:
+        key->s6_addr32[2] = bpf_htonl(0xffff);
+        key->s6_addr32[3] = ops->remote_ip4;
+        break;
+    case AF_INET6:
+        if (is_v4_mapped) {
+            key->s6_addr32[2] = bpf_htonl(0xffff);
+            key->s6_addr32[3] = v4_addr_from_v6;
+        } else {
+            key->s6_addr32[0] = ops->remote_ip6[0];
+            key->s6_addr32[1] = ops->remote_ip6[1];
+            key->s6_addr32[2] = ops->remote_ip6[2];
+            key->s6_addr32[3] = ops->remote_ip6[3];
+        }
+        break;
+    default:
+        return 1;
+    }
+    bucket_key_alias_or_prefix(key);
+
+    /* initial=false: the prep phase already did instances++ and the
+     * seq-wrap pair via get_remote_host(key, true). We just need the
+     * pointer. The entry cannot have been LRU-evicted between the prep
+     * phase and this tail call (no scheduler involvement). */
+    remote_host = get_remote_host(key, false);
+    if (!remote_host)
+        return 1;
+
+    /* v0.4.106-style 16-iter rescan (RESTORED). Find the alg with the
+     * lowest non-sentinel metric_value (min) and the second-lowest (min2).
+     * Skip sentinel values (0=unset, ~0=poisoned by set_cong). */
+    for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
+        __u64 v = remote_host->metrics[i].metric_value;
+        if (v == 0 || v == ~((__u64)0))
+            continue;
+        if (v < metric_min) {
+            min2 = metric_min;
+            metric_min = v;
+            minindex = i;
+        } else if (v < min2) {
+            min2 = v;
+        }
+    }
+    minindex &= (NUM_TCP_CONN_METRICS - 1);
+
+    /* Re-anchor best_i/best_v/second_v on every ESTABLISHED, same as
+     * v0.4.106. The incremental update in the vote path only compares
+     * best vs second, so a third algorithm can drift into a lower
+     * position without ever being promoted through the pair. This
+     * per-ESTABLISHED re-anchor fixes that. */
+    if (remote_host->metrics[minindex].metric_count > 0 &&
+        metric_min != 0 && metric_min != ~((__u64)0)) {
+        __sync_fetch_and_add(&remote_host->seq, 1);
+        remote_host->best_i = minindex;
+        remote_host->best_v = metric_min;
+        __sync_fetch_and_add(&remote_host->seq, 1);
+    } else {
+        __sync_fetch_and_add(&remote_host->seq, 1);
+        remote_host->best_v = 0;
+        __sync_fetch_and_add(&remote_host->seq, 1);
+    }
+
+    /* tight-bucket boost + epsilon_greedy_pct (matches v0.4.106). */
+    {
+        __u32 zero = 0;
+        __u32 pct = EXPLORE_PCT_DEFAULT;
+        __u32 *pctp = bpf_map_lookup_elem(&tuner_config_map, &zero);
+        if (pctp)
+            pct = *pctp;
+        if (pct > EXPLORE_PCT_MAX)
+            pct = EXPLORE_PCT_MAX;
+        /* 0.4.22 tight-bucket boost: at --exp=100 the boost is a no-op
+         * because pct is already 100. */
+        if ((min2 == ~((__u64)0) || metric_min * 5 > min2 * 4) &&
+            pct < EXPLORE_BOOST_PCT)
+            pct = EXPLORE_BOOST_PCT;
+        s = epsilon_greedy_pct(minindex, NUM_TCP_CONN_METRICS, pct);
+    }
+
+    s &= (NUM_TCP_CONG_ALGS - 1);
+    if (set_cong(ops, remote_host, s)) {
+        remote_host->metrics[s].metric_value = ~((__u64)0);
+    } else {
+        /* v0.4.107: feed line -- unconditional (was bpftune_debug). */
+        bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
+                   bpf_get_socket_cookie(ops), (__u32)s,
+                   is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                   (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
     }
     return 1;
 }
