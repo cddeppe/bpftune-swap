@@ -8,13 +8,16 @@ package main
 // v0.9.86: eliminates the `bpftool --json map dump` + `map show` forks.
 // v0.9.112: iteration contract fixes (nil-key start, no aliasing) +
 // geometry validation via BPF_OBJ_GET_INFO_BY_FD.
-// v0.9.113 (round 5c): VERIFIED FD sourcing — field evidence on al showed
-// the syscalls running against a NON-BPF fd (buckets.db / eventpoll: the
-// process FD table never contained a bpf-map FD, and OBJ_GET_INFO_BY_FD
-// answered EINVAL = "valid file, not a BPF object"). The read path now
-// opens its own FD via bpfMapGetFDByIDVerified (proven to be the right
-// map before use; readlink diagnostic on rejection) and closes it when
-// done — the shared getMapFD() cache is no longer used here.
+// v0.9.113: VERIFIED FD sourcing.
+// v0.9.115: the syscall path came alive for the first time (the v0.9.86
+// cmd-12 bug had kept it dead) and IMMEDIATELY exposed a second latent
+// bug that had been hiding behind it: parseRawKey stored raw key bytes
+// as uint8, but toInt() only understands float64/int — every key decoded
+// to 0.0.0.0, all hosts merged into one "0.0.0.0" bucket, and
+// buildLiveBuckets dropped it -> empty dashboard. Fixed at the root:
+// key bytes are converted to int at parse time (the same numeric type
+// the bpftool-JSON path produces via float64). Regression test:
+// perf_lean6_test.go (a raw entry must merge to a real address).
 //
 // Struct layout (must match streak_writeback.go constants):
 //
@@ -41,7 +44,7 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("resolveRemoteHostMapID: %w", err)
 	}
 
-	// v0.9.113: VERIFIED FD — proven to be remote_host_map before use;
+	// VERIFIED FD — proven to be remote_host_map before use;
 	// closed when this read completes (no shared cache to poison).
 	fd, info, err := bpfMapGetFDByIDVerified(uint32(mapID), "remote_host")
 	if err != nil {
@@ -83,7 +86,7 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
 		entry := parseRawHostEntry(nextKey, value)
 		entries = append(entries, entry)
 
-		curKey = append(curKey[:0], nextKey...) // COPY (v0.9.112: was aliasing)
+		curKey = append(curKey[:0], nextKey...) // COPY (no aliasing)
 	}
 
 	if entries == nil {
@@ -114,11 +117,18 @@ func parseRawHostEntry(key, value []byte) map[string]interface{} {
 }
 
 // parseRawKey converts a 16-byte in6_addr key into bpftool's key structure.
+//
+// v0.9.115 CRITICAL FIX: the bytes are converted to INT, not stored as
+// raw uint8.  toInt() only understands float64/int — a uint8 falls
+// through to its default (0), which silently decoded EVERY key as
+// 0.0.0.0 on the first-ever live run of this path (v0.9.114).  The
+// bpftool-JSON path never hit this because JSON numbers decode to
+// float64.  Regression test: perf_lean6_test.go.
 func parseRawKey(key []byte) map[string]interface{} {
 	// bpftool outputs: { "in6_u": { "u6_addr8": [b0, b1, ..., b15] } }
 	addrBytes := make([]interface{}, len(key))
 	for i, b := range key {
-		addrBytes[i] = b
+		addrBytes[i] = int(b) // v0.9.115: was `b` (uint8 — invisible to toInt)
 	}
 	return map[string]interface{}{
 		"in6_u": map[string]interface{}{
@@ -129,6 +139,8 @@ func parseRawKey(key []byte) map[string]interface{} {
 
 // parseRawValue converts a 1024-byte remote_host struct into bpftool's
 // value field map. Uses the same offsets as streak_writeback.go.
+// All numeric fields are emitted as float64 — the exact type the
+// bpftool-JSON path produces — so both paths are interchangeable.
 func parseRawValue(buf []byte) map[string]interface{} {
 	val := map[string]interface{}{}
 
@@ -186,8 +198,7 @@ func parseRawValue(buf []byte) map[string]interface{} {
 }
 
 // getMapEntryCountSyscall counts BPF map entries via BPF_MAP_GET_NEXT_KEY
-// iteration. Used to check if the cache is stale without forking bpftool.
-// v0.9.113: verified FD (own/close), nil-key start, no aliasing.
+// iteration. VERIFIED FD (own/close), nil-key start, no aliasing.
 func getMapEntryCountSyscall(mapID int) (int, error) {
 	fd, _, err := bpfMapGetFDByIDVerified(uint32(mapID), "")
 	if err != nil {
