@@ -146,9 +146,29 @@ static __always_inline __u32 explore_protect_votes(void)
                 pct = *p;
         if (pct > EXPLORE_PCT_MAX)
                 pct = EXPLORE_PCT_MAX;
-        if (pct >= 100)
-                return 0;
-        return (EXPLORE_PROTECT_VOTES * (100 - pct)) / 95;
+        /* v0.4.108 FIX: always protect new picks for EXPLORE_PROTECT_VOTES.
+         *
+         * v0.4.66's formula `(EXPLORE_PROTECT_VOTES * (100 - pct)) / 95`
+         * returned 3 votes at pct<=5 (good for the 5% of random picks
+         * that happen at default explore) but 0 votes at pct=100 (bad
+         * — at exp=100, EVERY pick is random and NEEDS protection to
+         * be tested before the swap engine second-guesses it).
+         *
+         * With zero protection at exp=100, the swap engine fired on
+         * the first vote — overriding every random pick before it
+         * could be tested. This defeated the entire premise of
+         * exploration: pick random, TEST it, swap if poor.
+         *
+         * The simplest correct fix: always return EXPLORE_PROTECT_VOTES.
+         *   pct=5:   3 votes (same as v0.4.106 at default explore) ✓
+         *   pct=50:  3 votes
+         *   pct=100: 3 votes (FIXES the bug — random picks get tested)
+         *
+         * This matches v0.4.106's behavior at low explore (where it
+         * "worked") and fixes the regression at high explore (where
+         * v0.4.66-v0.4.107 all broke the exploration premise).
+         */
+        return EXPLORE_PROTECT_VOTES;
 }
 
 /* 0.4.79: v4 bucket prefix, read live from tuner_config_map[1].

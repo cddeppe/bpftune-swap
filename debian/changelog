@@ -1,3 +1,21 @@
+bpftune (0.4.108) unstable; urgency=medium
+
+  * tcp_conn_tuner: FIX explore_protect_votes — v0.4.66's formula
+    (EXPLORE_PROTECT_VOTES * (100 - pct)) / 95 returned 3 votes at
+    pct<=5 (correct for the 5% random picks at default explore) but
+    0 votes at pct=100 (BUG — at exp=100 every pick is random and
+    NEEDS protection to be tested). With zero protection at exp=100,
+    the swap engine fired on the first vote, overriding every
+    random pick before it could be tested — defeating the entire
+    premise of exploration: pick random, TEST it, swap if poor.
+    Fix: always return EXPLORE_PROTECT_VOTES (3 votes). Matches
+    v0.4.106's working behavior at default explore AND fixes the
+    bug at high explore. Bug present since v0.4.66 (2025-Q4);
+    discovered at runtime after --explore=100 produced all-htcp
+    swaps instead of the expected distribution across all 16 algs.
+
+ -- Z.ai build bot <noreply@z.ai>  Sat, 24 Oct 2026 09:55:00 +0000
+
 bpftune (0.4.107) unstable; urgency=medium
 
   * tcp_conn_tuner: split bpftune_conn_tuner into prep + tail programs
