@@ -31,10 +31,19 @@ long long tcp_thin_lto = 0;
 /* 0.4.91: debug toggle.  Stored in tuner_config_map slot 3 (not a
  * BPF global) so the CLI can update it live via 'bpftune --bpf-debug=N'
  * without restarting the daemon.  BPF reads it from the map on every
- * ESTABLISHED and vote, and updates this local variable.  Default 1
- * (verbose, matching pre-0.4.89 behavior).  Set to 0 to silence all
- * bpf_printk calls. */
-__u32 bpftune_debug = 1;
+ * ESTABLISHED and vote, and updates this local variable.
+ *
+ * v0.4.107: semantics split.  The dashboard FEED lines (estab, met,
+ * srate, midsamp, swap, proof) are now UNCONDITIONAL -- they are the
+ * data source for the dashboard pipeline (log -> collector -> charts)
+ * and must never be silenced.  Only the high-volume DIAGNOSTIC lines
+ * (cwnd, swapctx, swapscore, closport) are gated by this flag, and its
+ * default flipped to 0 (quiet).  Rationale: at peak, diagnostics were
+ * 40-50% of all log volume per vote/swap/close, all parsed and thrown
+ * away by the collector.  Action records (freeze, heal_*) stay
+ * unconditional -- they are rare and mark real tuning decisions.
+ * 'bpftune --bpf-debug=1' restores the full pre-0.4.107 verbosity. */
+__u32 bpftune_debug = 0;
 
 BPF_MAP_DEF(remote_host_map, BPF_MAP_TYPE_LRU_HASH, struct in6_addr, struct remote_host, 4096, 0);
 
@@ -56,17 +65,6 @@ BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
  * one bucket.  Loaded from /etc/bpftune/aliases at daemon start. */
 BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
             struct in6_addr, 1024, 0);
-
-/* 0.4.107fix-program-split: PROG_ARRAY for the tail-call split of
- * bpftune_conn_tuner.  Index 0 holds the fd of bpftune_conn_tuner_tail,
- * populated by the userspace loader after the skeleton is loaded.
- * Each tail-called program gets its own 1M-instruction verifier budget,
- * so the 16-iter min loop + set_cong + tracker update can be verified
- * independently of the prep-phase op-switch / RFC1918 filter / bucket
- * key build.  Stack and registers are NOT preserved across the tail
- * boundary; the tail program re-derives is_v4_mapped / v4_addr_from_v6
- * / key / remote_host from ops. */
-BPF_MAP_DEF(conn_tuner_tail_map, BPF_MAP_TYPE_PROG_ARRAY, __u32, __u32, 1, 0);
 
 /* per-CPU scratch buffer used to initialize new remote_host entries without
  * placing a >512B struct temporary on the BPF stack (NUM_TCP_CONG_ALGS=16
@@ -327,31 +325,7 @@ __u64 tcp_thin_lto_choices;
 SEC("sockops")
 int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 {
-    /* 0.4.107fix-program-split: skip loopback (127.0.0.0/8 + ::1) at
-     * function entry, before any map lookups.  Hoisting this check
-     * here (out of the 0.4.95 filter block at L403) was rejected by
-     * the verifier in the unsplit version because the prep + metric
-     * aggregation in one function pushed peak_states to 1198 and
-     * the additional branch pushed it over the 1M-instruction budget.
-     * Splitting via tail call gives the prep half its own budget, so
-     * adding this branch here is safe. */
-    if (ops->family == AF_INET) {
-        __u32 ip4 = bpf_ntohl(ops->remote_ip4);
-        if ((ip4 & 0xff000000) == 0x7f000000)
-            return 1;
-    } else if (ops->family == AF_INET6) {
-        if (ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
-            ops->remote_ip6[2] == 0 && ops->remote_ip6[3] == bpf_htonl(1))
-            return 1;
-    }
     int cb_flags = BPF_SOCK_OPS_STATE_CB_FLAG|BPF_SOCK_OPS_RETRANS_CB_FLAG|BPF_SOCK_OPS_RTT_CB_FLAG;
-    /* 0.4.91: read debug flag from tuner_config_map slot 3 so the
-     * CLI can toggle it live via 'bpftune --bpf-debug=0'. */
-    {
-        __u32 dk = 3;
-        __u32 *dv = bpf_map_lookup_elem(&tuner_config_map, &dk);
-        if (dv) bpftune_debug = *dv;
-    }
     struct remote_host *remote_host;
     struct in6_addr raddr = {};
     struct in6_addr *key = &raddr;
@@ -505,79 +479,6 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
     if (!remote_host)
         return 1;
 
-    /* 0.4.107fix-program-split: tail-call to the metric-aggregation
-     * continuation.  The tail program gets its own verifier budget
-     * (1M instructions), so the 16-iter min loop + set_cong + tracker
-     * update can be verified independently.  Stack and registers are
-     * NOT preserved across the boundary; the tail program re-derives
-     * is_v4_mapped / v4_addr_from_v6 / key / remote_host from ops.
-     * bpf_tail_call never returns on success; the return statement
-     * below is a fallback for the (rare) case where the tail map is
-     * empty or the tail-call limit is reached. */
-    bpf_tail_call(ops, &conn_tuner_tail_map, 0);
-    return 1;
-}
-
-/* 0.4.107fix-program-split: continuation of bpftune_conn_tuner.
- * Entered via bpf_tail_call from bpftune_conn_tuner after the prep
- * phase (op-switch, debug-flag reload, address parse, loopback
- * filter, bucket-key build, remote_host lookup).  Re-derives the
- * prep-phase outputs from ops because tail calls do not preserve
- * stack or registers.  This program is NOT attached to a cgroup —
- * it is reached only via the PROG_ARRAY tail call. */
-SEC("sockops")
-int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
-{
-    struct remote_host *remote_host;
-    struct in6_addr raddr = {};
-    struct in6_addr *key = &raddr;
-    bool is_v4_mapped = false;
-    __u32 v4_addr_from_v6 = 0;
-
-    /* Re-derive is_v4_mapped + v4_addr_from_v6 (matches the prep
-     * phase's L427-447 logic verbatim).  is_v4_mapped only fires
-     * for AF_INET6 sockets where the upper 96 bits are ::ffff: and
-     * the lower 32 bits carry an IPv4 address. */
-    if (ops->family == AF_INET6 &&
-        ops->remote_ip6[0] == 0 && ops->remote_ip6[1] == 0 &&
-        ops->remote_ip6[2] == bpf_htonl(0xffff)) {
-        is_v4_mapped = true;
-        v4_addr_from_v6 = ops->remote_ip6[3];
-    }
-
-    /* Re-derive the bucket key (matches prep phase L448-474 verbatim).
-     * bucket_key_alias_or_prefix is idempotent — re-applying it here
-     * produces the same key the prep phase already used to do its
-     * get_remote_host(key, true). */
-    switch (ops->family) {
-    case AF_INET:
-        key->s6_addr32[2] = bpf_htonl(0xffff);
-        key->s6_addr32[3] = ops->remote_ip4;
-        break;
-    case AF_INET6:
-        if (is_v4_mapped) {
-            key->s6_addr32[2] = bpf_htonl(0xffff);
-            key->s6_addr32[3] = v4_addr_from_v6;
-        } else {
-            key->s6_addr32[0] = ops->remote_ip6[0];
-            key->s6_addr32[1] = ops->remote_ip6[1];
-            key->s6_addr32[2] = ops->remote_ip6[2];
-            key->s6_addr32[3] = ops->remote_ip6[3];
-        }
-        break;
-    default:
-        return 1;
-    }
-    bucket_key_alias_or_prefix(key);
-    /* initial=false: the prep phase already did instances++ and the
-     * seq-wrap pair via get_remote_host(key, true).  We just need
-     * the pointer.  The entry cannot have been LRU-evicted between
-     * the prep phase and this tail call (no scheduler involvement). */
-    remote_host = get_remote_host(key, false);
-    if (!remote_host)
-        return 1;
-
-    /* --- BEGIN moved metric aggregation + set_cong code (orig L480-569) --- */
     {
         __u64 metric_min = ~((__u64)0x0);
         __u8 i, minindex = 0, s;
@@ -591,11 +492,11 @@ int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
             if (set_cong(ops, remote_host, forced)) {
                 remote_host->metrics[forced].metric_value = ~((__u64)0);
             } else {
-                if (bpftune_debug)
                 /* 0.4.94: for v4-in-v6 connections, ops->remote_ip4 is 0
                  * (the kernel only fills it for AF_INET).  Log the v4
                  * address we extracted from remote_ip6[3] instead so the
-                 * dashboard's cdest map gets the right dest= field. */
+                 * dashboard's cdest map gets the right dest= field.
+                 * v0.4.107: feed line -- unconditional (was bpftune_debug). */
                 bpf_printk("estab cookie=%llu alg=%u forced=1 dest=%u dest6=%u dest6b=%u",
                            bpf_get_socket_cookie(ops), (__u32)forced,
                            is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
@@ -606,7 +507,6 @@ int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
 
         {
             __u64 min2 = ~((__u64)0);
-            #pragma unroll
             for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
                 __u64 v = remote_host->metrics[i].metric_value;
                 /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
@@ -660,7 +560,7 @@ int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
             if (set_cong(ops, remote_host, s)) {
                 remote_host->metrics[s].metric_value = ~((__u64)0);
             } else {
-                if (bpftune_debug)
+                /* v0.4.107: feed line -- unconditional (was bpftune_debug). */
                 bpf_printk("estab cookie=%llu alg=%u forced=0 dest=%u dest6=%u dest6b=%u",
                            bpf_get_socket_cookie(ops), (__u32)s,
                            is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
@@ -669,7 +569,6 @@ int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
         }
     }
     return 1;
-    /* --- END moved metric aggregation + set_cong code --- */
 }
 
 /* 0.4.56: score the pending swap once >=60s have elapsed.  Cur rate
@@ -836,13 +735,10 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     bool allow_ref = false;
     __u64 tc_progress = 0;
 
-    /* 0.4.91: read debug flag from tuner_config_map slot 3 so the
-     * CLI can toggle it live via 'bpftune --bpf-debug=0'. */
-    {
-        __u32 dk = 3;
-        __u32 *dv = bpf_map_lookup_elem(&tuner_config_map, &dk);
-        if (dv) bpftune_debug = *dv;
-    }
+    /* v0.4.107 (T6): the tuner_config_map debug read moved BELOW the
+     * early-exit gates (was here at the top of the handler, paid on
+     * every RTT_CB invocation including the ~90% that return at the
+     * rung/time-check gate).  Now only full votes + closes read it. */
 
     switch (ops->op) {
     case BPF_SOCK_OPS_RTT_CB: {
@@ -893,10 +789,10 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                  * credit this srate sample directly, without joining
                  * through a possibly-stale recent met line.  statep
                  * is not yet populated on this code path, so look it
-                 * up here. */
+                 * up here.
+                 * v0.4.107: feed line -- unconditional (was bpftune_debug). */
                 struct conn_state *sp_al = bpf_sk_storage_get(&sk_storage_map, sk, 0, 0);
                 int alg_idx = sp_al ? (int)(sp_al->state & (NUM_TCP_CONG_ALGS - 1)) : -1;
-                if (bpftune_debug)
                 bpf_printk("midsamp cookie=%llu port=%u rport=%u alg=%d thr=%llu segs=%llu smin=%llu savg=%llu srate=%llu",
                            bpf_get_socket_cookie(ops), ops->local_port, bpf_ntohl(ops->remote_port),
                            alg_idx, next, segs, smin, savg, srate);
@@ -935,6 +831,13 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
 
     if (!sk)
         return 1;
+    /* v0.4.107 (T6): debug flag read here -- past the early-exit gates,
+     * so only full votes + closes pay for it. */
+    {
+        __u32 dk = 3;
+        __u32 *dv = bpf_map_lookup_elem(&tuner_config_map, &dk);
+        if (dv) bpftune_debug = *dv;
+    }
     tp = bpf_skc_to_tcp_sock(sk);
     /* 0.4.94: detect IPv4-mapped IPv6 (see comment in active_estab path). */
     bool is_v4_mapped = false;
@@ -1182,6 +1085,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
         rate_delivered = rate_interval_us ?
             (rd * mss * 1000000ULL) / rate_interval_us : 0;
     }
+    /* v0.4.107 (T7): socket cookie hoisted -- was fetched via
+     * bpf_get_socket_cookie() once per printk (up to 5x per vote). */
+    __u64 cookie = bpf_get_socket_cookie(ops);
 
         /* 0.4.44: proof tracking.  Non-close votes only.  If the
          * socket's delivered rate crosses a tier on the alg it is
@@ -1214,9 +1120,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                                 remote_host->metrics[s].sockets_good++;
                         }
                         __sync_fetch_and_add(&remote_host->seq, 1);
-                        if (bpftune_debug)
-                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2 dest=%u dest6=%u dest6b=%u",
-                                   bpf_get_socket_cookie(ops), s, rate_delivered,
+                        /* v0.4.107: feed line -- unconditional. */
+                        bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=2 dest=%u dest6=%u dest6b=%u",
+                                   cookie, s, rate_delivered,
                                    is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                 } else if (rate_delivered >= get_proof_good_bps() && !(statep->good_bitmap & bit)) {
@@ -1225,9 +1131,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         __sync_fetch_and_add(&remote_host->seq, 1);
                         remote_host->metrics[s].sockets_good++;
                         __sync_fetch_and_add(&remote_host->seq, 1);
-                        if (bpftune_debug)
-                                bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1 dest=%u dest6=%u dest6b=%u",
-                                   bpf_get_socket_cookie(ops), s, rate_delivered,
+                        /* v0.4.107: feed line -- unconditional. */
+                        bpf_printk("proof cookie=%llu alg=%d rate=%llu tier=1 dest=%u dest6=%u dest6b=%u",
+                                   cookie, s, rate_delivered,
                                    is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                 }
@@ -1236,16 +1142,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
      * midsamp only fires on rung crossings; sockets past the last
      * rung only vote via the 60s time-check and had no raw rate
      * for post-swap measurement.  This companion line carries it
-     * for every vote. */
-    {
-        __u64 _sinter = (__u64)tp->rate_interval_us;
-        __u64 _sraw   = (__u64)tp->rate_delivered;
-        __u64 _smss   = (__u64)tp->mss_cache;
-        __u64 _srate  = _sinter ? (_sraw * _smss * 1000000ULL) / _sinter : 0;
-        if (bpftune_debug)
-                bpf_printk("srate cookie=%llu alg=%u srate=%llu",
-                   bpf_get_socket_cookie(ops), s, _srate);
-    }
+     * for every vote.
+     * v0.4.107 (T8): feed line -- unconditional, and reuses the
+     * rate_delivered computed above (identical formula on identical
+     * reads; the old block re-read tp fields and recomputed). */
+    bpf_printk("srate cookie=%llu alg=%u srate=%llu",
+               cookie, s, rate_delivered);
 
     m = &remote_host->metrics[s];
 
@@ -1264,9 +1166,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
             loss_term = (loss_bp * LOSS_SCALE) / LOSS_CAP_BP;
             metric += loss_term;
         }
-        if (bpftune_debug)
-                bpf_printk("met cookie=%llu rport=%u alg=%d segs=%llu val=%llu rtt=%llu rate=%llu loss=%llu smrtt=%llu bmrtt=%llu avgrtt=%llu",
-                   bpf_get_socket_cookie(ops), bpf_ntohl(ops->remote_port),
+        /* v0.4.107: feed line -- unconditional. */
+        bpf_printk("met cookie=%llu rport=%u alg=%d segs=%llu val=%llu rtt=%llu rate=%llu loss=%llu smrtt=%llu bmrtt=%llu avgrtt=%llu",
+                   cookie, bpf_ntohl(ops->remote_port),
                    s, (__u64)tp->segs_out + tp->segs_in, metric, rtt_term, rate_term,
                    loss_term, min_rtt, remote_host->min_rtt, avg_rtt);
         /* 0.4.39 diagnostic: window state at vote time.  When
@@ -1276,10 +1178,12 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
          * the algorithm: delivery_rate reflects the app, not the
          * path.  The met line above is at the 12-argument printk
          * limit, so this lives on its own line and joins by cookie.
-         * No metric logic change; diagnostic only. */
+         * No metric logic change; diagnostic only.
+         * v0.4.107: high-volume per-vote diagnostic -- now gated
+         * behind bpftune_debug (default quiet). */
         if (bpftune_debug)
                 bpf_printk("cwnd cookie=%llu snd_cwnd=%llu pkts_out=%llu",
-                   bpf_get_socket_cookie(ops),
+                   cookie,
                    (__u64)tp->snd_cwnd, (__u64)tp->packets_out);
         if (heal_rtt && bpftune_debug)
             bpf_printk("heal_rtt smrtt=%llu newref=%llu",
@@ -1619,14 +1523,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     statep->hist_1 = 0;
                     statep->hist_2 = 0;
                     statep->bad_checkpoints = 0;
-                    if (bpftune_debug)
+                    /* v0.4.107: feed line -- unconditional. */
                     bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=1 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), from_i, to_i,
+                               cookie, from_i, to_i,
                                bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     if (bpftune_debug)
                     bpf_printk("swapctx cookie=%llu d=1 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
-                               bpf_get_socket_cookie(ops),
+                               cookie,
                                (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
                                (__u64)tp->packets_out, (__u64)tp->snd_wnd,
                                (__u32)(s == remote_host->best_i),
@@ -1648,9 +1552,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if ((statep->best_seen_metric != 0 ||
                          statep->best_seen_srate != 0) && tgt8 != s)
                         fret = set_cong(ops, remote_host, tgt8);
-                    if (bpftune_debug)
+                    /* v0.4.107: action record -- unconditional (rare). */
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                               cookie, s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
@@ -1697,14 +1601,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         statep->hist_1 = 0;
                         statep->hist_2 = 0;
                         statep->bad_checkpoints = 0;
-                        if (bpftune_debug)
+                        /* v0.4.107: feed line -- unconditional. */
                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=2 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
-                                   bpf_get_socket_cookie(ops), from_i, to_i,
+                                   cookie, from_i, to_i,
                                    (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                         if (bpftune_debug)
                         bpf_printk("swapctx cookie=%llu d=2 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
-                                   bpf_get_socket_cookie(ops),
+                                   cookie,
                                    (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
                                    (__u64)tp->packets_out, (__u64)tp->snd_wnd,
                                    (__u32)(s == remote_host->best_i),
@@ -1726,9 +1630,9 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if ((statep->best_seen_metric != 0 ||
                          statep->best_seen_srate != 0) && tgt8 != s)
                         fret = set_cong(ops, remote_host, tgt8);
-                    if (bpftune_debug)
+                    /* v0.4.107: action record -- unconditional (rare). */
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                               cookie, s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     statep->frozen = 1;
                     statep->last_swap_at = now;
@@ -1775,14 +1679,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                         statep->hist_1 = 0;
                         statep->hist_2 = 0;
                         statep->bad_checkpoints = 0;
-                        if (bpftune_debug)
+                        /* v0.4.107: feed line -- unconditional. */
                         bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=3 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
-                                   bpf_get_socket_cookie(ops), from_i, to_i,
+                                   cookie, from_i, to_i,
                                    (__u64)0, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                    (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                         if (bpftune_debug)
                         bpf_printk("swapctx cookie=%llu d=3 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
-                                   bpf_get_socket_cookie(ops),
+                                   cookie,
                                    (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
                                    (__u64)tp->packets_out, (__u64)tp->snd_wnd,
                                    (__u32)(s == remote_host->best_i),
@@ -1806,13 +1710,13 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                     if ((statep->best_seen_metric != 0 ||
                          statep->best_seen_srate != 0) && tgt8 != s)
                         fret = set_cong(ops, remote_host, tgt8);
-                    if (bpftune_debug)
+                    /* v0.4.107: action record -- unconditional (rare). */
                     bpf_printk("freeze cookie=%llu from=%u to=%u bsrate=%llu ret=%d dest=%u dest6=%u dest6b=%u",
-                               bpf_get_socket_cookie(ops), s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
+                               cookie, s, tgt8, statep->best_seen_srate, fret, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                     if (bpftune_debug)
                     bpf_printk("swapctx cookie=%llu d=f cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
-                               bpf_get_socket_cookie(ops),
+                               cookie,
                                (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
                                (__u64)tp->packets_out, (__u64)tp->snd_wnd,
                                (__u32)(s == remote_host->best_i),
@@ -1887,14 +1791,14 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                                 statep->hist_1 = 0;
                                 statep->hist_2 = 0;
                                 statep->bad_checkpoints = 0;
-                                if (bpftune_debug)
+                                /* v0.4.107: feed line -- unconditional. */
                                 bpf_printk("swap cookie=%llu from=%u to=%u bc=%llu ac=%llu d=0 mt=%u rb=%u dest=%u dest6=%u dest6b=%u",
-                                           bpf_get_socket_cookie(ops), from_i, to_i,
+                                           cookie, from_i, to_i,
                                            bc_fire, ac, (__u32)mt_alt_i, (__u32)swap_tgt, is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
                                 if (bpftune_debug)
                                 bpf_printk("swapctx cookie=%llu d=0 cwnd=%llu ssthresh=%llu pkts=%llu wnd_out=%llu on_ldr=%u swaps=%llu app_lim=%u util=%llu",
-                                           bpf_get_socket_cookie(ops),
+                                           cookie,
                                            (__u64)tp->snd_cwnd, (__u64)tp->snd_ssthresh,
                                            (__u64)tp->packets_out, (__u64)tp->snd_wnd,
                                            (__u32)(s == remote_host->best_i),
@@ -2025,4 +1929,3 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
     __sync_fetch_and_add(&remote_host->seq, 1);
     return 1;
 }
-
