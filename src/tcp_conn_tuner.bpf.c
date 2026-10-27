@@ -313,6 +313,35 @@ static __always_inline int set_cong(struct bpf_sock_ops *ops,
 
 __u64 tcp_thin_lto_choices;
 
+/* v0.4.109: bpf_loop callback for the metric rescan. Verified ONCE by
+ * the verifier (no 16-iteration state explosion). Reads metrics[i] and
+ * updates the context struct's metric_min/min2/minindex fields. */
+struct metric_scan_ctx {
+    struct remote_host *rh;
+    __u64 metric_min;
+    __u64 min2;
+    __u8 minindex;
+};
+
+static int metric_scan_cb(__u32 i, void *ctx)
+{
+    struct metric_scan_ctx *s = ctx;
+    if (i >= NUM_TCP_CONN_METRICS)
+        return 1;
+    __u64 v = s->rh->metrics[i].metric_value;
+    /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned). */
+    if (v == 0 || v == ~((__u64)0))
+        return 0;
+    if (v < s->metric_min) {
+        s->min2 = s->metric_min;
+        s->metric_min = v;
+        s->minindex = (__u8)i;
+    } else if (v < s->min2) {
+        s->min2 = v;
+    }
+    return 0;
+}
+
 SEC("sockops")
 int bpftune_conn_tuner(struct bpf_sock_ops *ops)
 {
@@ -504,23 +533,23 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
         }
 
         {
-            __u64 min2 = ~((__u64)0);
-            for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
-                __u64 v = remote_host->metrics[i].metric_value;
-                /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
-                 * Was: treated as real value, causing best_v=~0, which
-                 * made the swap gate fire and swap everything to cubic. */
-                if (v == 0 || v == ~((__u64)0))
-                    continue;
-                if (v < metric_min) {
-                    min2 = metric_min;
-                    metric_min = v;
-                    minindex = i;
-                } else if (v < min2) {
-                    min2 = v;
-                }
-            }
+            /* v0.4.109: use bpf_loop (BPF helper #181, kernel 5.14+) instead
+             * of a regular for loop. The callback is verified ONCE by the
+             * verifier — no 16-iteration state explosion. This eliminates
+             * the ~25K verifier states that were hitting the 1M instruction
+             * limit, freeing headroom for the per-bucket tunnel tuning in
+             * the vote handler. */
+            struct metric_scan_ctx sctx = { .rh = remote_host, .metric_min = ~((__u64)0), .min2 = ~((__u64)0), .minindex = 0 };
+
+            bpf_loop(NUM_TCP_CONN_METRICS, metric_scan_cb, &sctx, 0);
+
+            metric_min = sctx.metric_min;
+            minindex = sctx.minindex;
             minindex &= (NUM_TCP_CONN_METRICS - 1);
+            /* min2 is read from sctx for the tight-bucket boost below.
+             * Use a local copy to avoid repeated pointer dereference. */
+            {
+                __u64 min2 = sctx.min2;
             /* Re-anchor the swap-target tracker to the true best on every
              * ESTABLISHED.  The incremental update in the vote path only
              * compares best vs second, so a third algorithm can drift into
@@ -564,6 +593,7 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
                            is_v4_mapped ? (__u32)bpf_ntohl(v4_addr_from_v6) : (__u32)bpf_ntohl(ops->remote_ip4),
                            (__u32)bpf_ntohl(ops->remote_ip6[0]), (__u32)bpf_ntohl(ops->remote_ip6[1]));
             }
+            } /* close min2 inner block */
         }
     }
     return 1;

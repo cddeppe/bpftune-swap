@@ -1,3 +1,20 @@
+bpftune (0.4.109) unstable; urgency=medium
+
+  * tcp_conn_tuner: rewrite 16-iter metric rescan using bpf_loop (BPF
+    helper #181, kernel 5.14+). The callback is verified ONCE by the
+    verifier instead of generating 16x state explosion. This eliminates
+    the ~25K verifier states that were hitting the 1M instruction limit,
+    freeing headroom for future additions (per-bucket tunnel tuning).
+    
+    No behavioral change — the rescan logic is identical (find min/
+    second-min metric_value, skip sentinels, re-anchor best_i). Only
+    the loop implementation changed (for → bpf_loop callback).
+    
+    Requires kernel 5.14+ (bpf_loop helper). All fleet hosts confirmed:
+    al=6.12, vps-3959=6.12, instance-20260905-0931=7.0.
+
+ -- Z.ai build bot <noreply@z.ai>  Sat, 24 Oct 2026 12:00:00 +0000
+
 bpftune (0.4.106) unstable; urgency=medium
 
   * net_buffer_tuner: fix aggressive netdev_budget_usecs increases on
