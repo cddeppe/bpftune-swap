@@ -266,6 +266,19 @@ print(best[1] + ' ' + best[2])
     fi
 fi
 
+# v0.9.117: restart cloudflared if it's running, so the BPF ESTABLISHED
+# handler fires on the new tunnel connection after bpftune restart.
+# Without this, the tunnel socket has no sk_storage → vote handler returns
+# early → no proofs/swaps on the tunnel until cloudflared reconnects.
+if [ "$DO_TUNER" = 1 ]; then
+    if systemctl is-active cloudflared >/dev/null 2>&1; then
+        step "1b. Restart cloudflared (trigger BPF ESTABLISHED on tunnel)"
+        systemctl restart cloudflared
+        sleep 2
+        ok "cloudflared restarted (BPF ESTABLISHED will fire on new tunnel socket)"
+    fi
+fi
+
 # ---------- Step 2: dashboard (Go collector) ----------
 if [ "$DO_DASHBOARD" = 1 ]; then
     step "2. Update dashboard (Go collector + frontend)"
