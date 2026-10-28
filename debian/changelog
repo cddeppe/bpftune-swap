@@ -1,3 +1,24 @@
+bpftune (0.4.110) unstable; urgency=medium
+
+  * tcp_conn_tuner: fix Cloudflare tunnel not being tuned after initial
+    connection. Root cause: the util_ok check (pkts_out * 100 < snd_cwnd *
+    METRIC_MIN_UTIL_PCT) blocks swaps when the socket has zero packets in
+    flight. The tunnel is HTTP/2 multiplexed — data bursts during chunk
+    downloads, then idle between chunks. When the vote fires during an
+    idle gap, pkts_out=0 → util_ok=false → swap blocked. The tunnel
+    stays on whatever alg was set at ESTABLISHMENT forever.
+    
+    Fix: skip the util_ok check for Cloudflare edge connections
+    (2606:4700::/32). The rate data from the last burst is still valid
+    — the socket's rate_delivered reflects the actual transfer rate,
+    even if pkts_out is momentarily 0. All other connections: unchanged.
+    
+    Built on top of main branch (has loopback filter + tail-call split +
+    net_buffer_tuner comment fix — all the fixes that were missing from
+    v0.4.109 which caused CPU burn).
+
+ -- Z.ai build bot <noreply@z.ai>  Wed, 28 Oct 2026 00:30:00 +0000
+
 bpftune (0.4.107) unstable; urgency=medium
 
   * tcp_conn_tuner: split bpftune_conn_tuner into prep + tail programs

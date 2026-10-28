@@ -57,6 +57,17 @@ BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
 BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
             struct in6_addr, 1024, 0);
 
+/* v0.4.110: tunnel bucket key — populated by userspace auto-detection.
+ * The daemon scans /proc/net/tcp6 for cloudflared's connections to
+ * Cloudflare edge, computes the bucket key (with prefix6 masking),
+ * and stores it here. The vote handler checks this map to identify
+ * tunnel connections and skip the util_ok gate for them (tunnel
+ * traffic is bursty — pkts_out=0 between chunks would block swaps).
+ * No IP addresses are hardcoded in BPF — the key comes from
+ * userspace observation of the actual cloudflared socket. */
+BPF_MAP_DEF(tunnel_bucket_map, BPF_MAP_TYPE_ARRAY, __u32,
+            struct in6_addr, 1, 0);
+
 /* 0.4.107fix-program-split: PROG_ARRAY for the tail-call split of
  * bpftune_conn_tuner.  Index 0 holds the fd of bpftune_conn_tuner_tail,
  * populated by the userspace loader after the skeleton is loaded.
@@ -525,6 +536,34 @@ int bpftune_conn_tuner(struct bpf_sock_ops *ops)
  * prep-phase outputs from ops because tail calls do not preserve
  * stack or registers.  This program is NOT attached to a cgroup —
  * it is reached only via the PROG_ARRAY tail call. */
+
+/* v0.4.110: bpf_loop callback for the metric rescan in the tail program.
+ * Verified ONCE by the verifier — no 16-iteration state explosion. */
+struct metric_scan_ctx {
+    struct remote_host *rh;
+    __u64 metric_min;
+    __u64 min2;
+    __u8 minindex;
+};
+
+static int metric_scan_cb(__u32 i, void *ctx)
+{
+    struct metric_scan_ctx *s = ctx;
+    if (i >= NUM_TCP_CONN_METRICS)
+        return 1;
+    __u64 v = s->rh->metrics[i].metric_value;
+    if (v == 0 || v == ~((__u64)0))
+        return 0;
+    if (v < s->metric_min) {
+        s->min2 = s->metric_min;
+        s->metric_min = v;
+        s->minindex = (__u8)i;
+    } else if (v < s->min2) {
+        s->min2 = v;
+    }
+    return 0;
+}
+
 SEC("sockops")
 int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
 {
@@ -605,23 +644,21 @@ int bpftune_conn_tuner_tail(struct bpf_sock_ops *ops)
         }
 
         {
-            __u64 min2 = ~((__u64)0);
-            #pragma unroll
-            for (i = 0; i < NUM_TCP_CONN_METRICS; i++) {
-                __u64 v = remote_host->metrics[i].metric_value;
-                /* v0.4.99: skip sentinel values (0=unset, ~0=poisoned).
-                 * Was: treated as real value, causing best_v=~0, which
-                 * made the swap gate fire and swap everything to cubic. */
-                if (v == 0 || v == ~((__u64)0))
-                    continue;
-                if (v < metric_min) {
-                    min2 = metric_min;
-                    metric_min = v;
-                    minindex = i;
-                } else if (v < min2) {
-                    min2 = v;
-                }
-            }
+            __u64 min2;
+            /* v0.4.110: use bpf_loop instead of #pragma unroll for loop.
+             * The callback is verified ONCE — no 16-iteration state
+             * explosion. Frees verifier headroom for the tunnel_bucket_map
+             * lookup added in the vote handler. */
+            struct metric_scan_ctx sctx = {
+                .rh = remote_host,
+                .metric_min = ~((__u64)0),
+                .min2 = ~((__u64)0),
+                .minindex = 0
+            };
+            bpf_loop(NUM_TCP_CONN_METRICS, metric_scan_cb, &sctx, 0);
+            metric_min = sctx.metric_min;
+            min2 = sctx.min2;
+            minindex = sctx.minindex;
             minindex &= (NUM_TCP_CONN_METRICS - 1);
             /* Re-anchor the swap-target tracker to the true best on every
              * ESTABLISHED.  The incremental update in the vote path only
@@ -1416,7 +1453,30 @@ int bpftune_conn_tuner_vote(struct bpf_sock_ops *ops)
                 rate_ok = false;
 
             bool util_ok = true;
-            if (tp->snd_cwnd > 0 &&
+            /* v0.4.110: skip the util_ok check for Cloudflare edge connections.
+             * The tunnel is HTTP/2 multiplexed — data bursts during chunk
+             * downloads, then idle between chunks. When the vote fires
+             * during an idle gap, pkts_out=0 → util_ok=false → swap blocked.
+             * This prevents the tunnel from ever being swapped after the
+             * initial connection. Skip the check for the tunnel bucket
+             * (identified via tunnel_bucket_map, populated by userspace
+             * auto-detection of cloudflared connections) so the swap
+             * engine can act on the rate data from the last burst even
+             * when the socket is momentarily idle. No IPs hardcoded. */
+            bool is_tunnel_bucket = false;
+            {
+                __u32 tk = 0;
+                struct in6_addr *tunnel_key;
+                tunnel_key = bpf_map_lookup_elem(&tunnel_bucket_map, &tk);
+                if (tunnel_key) {
+                    if (key->s6_addr32[0] == tunnel_key->s6_addr32[0] &&
+                        key->s6_addr32[1] == tunnel_key->s6_addr32[1] &&
+                        key->s6_addr32[2] == tunnel_key->s6_addr32[2] &&
+                        key->s6_addr32[3] == tunnel_key->s6_addr32[3])
+                        is_tunnel_bucket = true;
+                }
+            }
+            if (!is_tunnel_bucket && tp->snd_cwnd > 0 &&
                 (__u64)tp->packets_out * 100 < (__u64)tp->snd_cwnd * METRIC_MIN_UTIL_PCT)
                 util_ok = false;
 

@@ -491,6 +491,61 @@ int init(struct bpftuner *tuner)
         }
     }
 
+    /* v0.4.110: auto-detect the cloudflare tunnel bucket key.
+     * Scan /proc/net/tcp6 for ESTABLISHED connections to port 7844
+     * (cloudflared's HTTP/2 port to Cloudflare edge). When found,
+     * compute the bucket key (with prefix6 masking) and populate
+     * tunnel_bucket_map[0]. No IPs hardcoded — runtime detection. */
+    {
+        FILE *f = fopen("/proc/net/tcp6", "r");
+        if (f) {
+            char line[256];
+            fgets(line, sizeof(line), f); /* skip header */
+            while (fgets(line, sizeof(line), f)) {
+                char rem_addr[33], rem_port[5];
+                unsigned int state;
+                if (sscanf(line, "%*d: %*[^:]:%*[^ ] %32[0-9a-fA-F]:%4[0-9a-fA-F] %x",
+                           rem_addr, rem_port, &state) == 3) {
+                    if (state == 1 && strtol(rem_port, NULL, 16) == 7844) {
+                        __u32 addr[4];
+                        if (sscanf(rem_addr, "%08x%08x%08x%08x",
+                                   &addr[0], &addr[1], &addr[2], &addr[3]) == 4) {
+                            struct in6_addr tkey;
+                            tkey.s6_addr32[0] = addr[0];
+                            tkey.s6_addr32[1] = addr[1];
+                            tkey.s6_addr32[2] = addr[2];
+                            tkey.s6_addr32[3] = addr[3];
+                            /* Apply prefix6 (same as BPF bucket_key_apply_prefix) */
+                            __u32 pk = 2, pfx = 32, pfx_val = 0;
+                            struct bpf_map *tcm = bpftuner_bpf_map_get(tcp_conn, tuner, tuner_config_map);
+                            if (tcm && bpf_map_lookup_elem(bpf_map__fd(tcm), &pk, &pfx_val) == 0)
+                                pfx = pfx_val;
+                            if (pfx < 1) pfx = 1;
+                            if (pfx > 128) pfx = 128;
+                            if (pfx <= 32) {
+                                __u32 mask = (0xffffffffu << (32 - pfx));
+                                tkey.s6_addr32[0] &= mask;
+                                tkey.s6_addr32[1] = tkey.s6_addr32[2] = tkey.s6_addr32[3] = 0;
+                            }
+                            __u32 zero = 0;
+                            struct bpf_map *tbm = bpftuner_bpf_map_get(tcp_conn, tuner, tunnel_bucket_map);
+                            if (tbm) {
+                                bpf_map_update_elem(bpf_map__fd(tbm), &zero, &tkey, BPF_ANY);
+                                bpftune_log(BPFTUNE_LOG_LEVEL,
+                                    "tunnel_bucket: detected cloudflared tunnel "
+                                    "bucket key %08x%08x%08x%08x (port=7844)\n",
+                                    tkey.s6_addr32[0], tkey.s6_addr32[1],
+                                    tkey.s6_addr32[2], tkey.s6_addr32[3]);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+
         /* 0.4.79: verify both progs actually landed on the root cgroup.
          * Observed on fast systemctl restart: the attaches return 0 but
          * the tree ends up empty, then a second restart fixes it.  The
