@@ -302,6 +302,9 @@ print(candidates[0][1])
     # Copy frontend files to BOTH binDir (for Go binary) and histDir (for HTTP serving)
     # The Go collector serves index.html from histDir (/var/lib/bpftune/history/),
     # and dashboard.js/css from binDir (/opt/bpftune-dashboard/bin/)
+    # FIX: ensure $SERVED exists BEFORE the cp commands (was missing, caused 404
+    # on fresh installs because cp failed silently when the dir didn't exist).
+    mkdir -p "$SERVED/data"
     cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$DASH_BIN"/ 2>/dev/null || true
     cp /root/bpftune/dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
     cp /root/bpftune/dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
@@ -309,9 +312,9 @@ print(candidates[0][1])
     cp "$DASH_BIN"/index.html "$SERVED"/ 2>/dev/null || true
     cp "$DASH_BIN"/dashboard.js "$DASH_BIN"/dashboard.css "$SERVED"/ 2>/dev/null || true
     cp "$DASH_BIN"/chart.umd.min.js "$DASH_BIN"/chartjs-adapter-date-fns.bundle.min.js "$SERVED"/ 2>/dev/null || true
-    chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js 2>/dev/null || true
+    chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js "$SERVED"/*.css "$SERVED"/*.js 2>/dev/null || true
     chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
-    ok "frontend files deployed to $DASH_BIN"
+    ok "frontend files deployed to $DASH_BIN (and $SERVED)"
 
     # --- 3d. Handle nginx port 8080 conflict (if present) ---
     if [ "$HAVE_NGINX" = 1 ]; then
