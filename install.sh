@@ -199,6 +199,13 @@ print(candidates[0][1])
                 fi
                 ok "auto-fixed deps, .deb installed"
             fi
+            # Write bpftune state defaults BEFORE starting bpftune:
+            #   explore_pct = 100  (max exploration — cold-start data collection)
+            #   bpf_debug   = 1    (verbose trace output for diagnostics)
+            mkdir -p /var/lib/bpftune
+            echo 100 > /var/lib/bpftune/explore_pct
+            echo 1   > /var/lib/bpftune/bpftune_debug
+            ok "bpftune state defaults written: explore_pct=100, bpf_debug=1"
             systemctl restart bpftune
             ok "bpftune $(dpkg-query -W -f='${Version}' bpftune) installed and started"
         fi
