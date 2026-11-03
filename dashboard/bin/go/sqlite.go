@@ -41,22 +41,25 @@ package main
 // short-circuits the whole serialization path when nothing changed.
 // When a write IS needed, the original v0.9.104 hash is computed and
 // stored in lastWriteHash with identical semantics and values.
+//
+// v0.9.118: fixed the compile error in snapshotPreHash that prevented
+// building the branch from a clean checkout (see the note at the fix).
 
 import (
-        "bufio"
-        "database/sql"
-        "encoding/json"
-        "fmt"
-        "hash/fnv"
-        "os"
-        "path/filepath"
-        "runtime/debug"
-        "strconv"
-        "strings"
-        "sync"
-        "time"
+	"bufio"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-        _ "modernc.org/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -120,7 +123,7 @@ func initSQLite() {
 		//                              and trips VPS OOM-killer heuristics)
 		//   cache_size=-512          — 512KB page cache (was -8000 = 8MB)
 		//   temp_store=MEMORY        — no temp files on disk
-		//   soft_heap_limit=20971520 — 20MB hard ceiling on SQLite\'s
+		//   soft_heap_limit=20971520 — 20MB hard ceiling on SQLite's
 		//                              internal allocator (modernc.org/sqlite
 		//                              passes this through to its malloc wrapper)
 		dsn := dbPath +
@@ -149,7 +152,7 @@ func initSQLite() {
 		db.Exec("PRAGMA soft_heap_limit=20971520") // 20MB
 		db.Exec("PRAGMA wal_autocheckpoint=200")   // ~800KB
 
-		// v0.9.104: cap Go heap pressure so SQLite allocations don\'t
+		// v0.9.104: cap Go heap pressure so SQLite allocations don't
 		// trigger stop-the-world GC. Defensive in case main.go ordering
 		// changes; main.go already sets GOMEMLIMIT=200MiB + GOGC=50.
 		debug.SetGCPercent(50)
@@ -377,9 +380,13 @@ func snapshotPreHash(mv, re, ss, bs, ns []interface{}, bestI int, bestAlg string
 		buf = append(buf, '|')
 	}
 	// Same scalar fold as the v0.9.104 JSON hash.
-	buf = fmt.Fprintf(h, "%s|%d|%s|%d|%g|%g|%g", buf, bestI, bestAlg, inst,
+	// v0.9.118: fixed the compile error that made the branch unbuildable
+	// from a clean checkout: the old line was
+	//   buf = fmt.Fprintf(h, "%s|...", buf, ...)
+	// which assigned fmt.Fprintf's (int, error) to a single []byte var.
+	// Semantics unchanged: %s folds buf's array bytes into the hash.
+	fmt.Fprintf(h, "%s|%d|%s|%d|%g|%g|%g", buf, bestI, bestAlg, inst,
 		minRtt, refMbps, rateBestV)
-	_ = buf
 	return h.Sum64()
 }
 
