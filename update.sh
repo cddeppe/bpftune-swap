@@ -367,14 +367,37 @@ print(candidates[0][1])
     fi
 
     # --- 2c. Fallback: build from source if Go is installed ---
+    # v0.9.117 fix: build the source that MATCHES the release we tried to
+    # download. Was: whatever the $BRANCH checkout happened to be, which
+    # after a failed download can be stale (the git checkout above tracks
+    # a BRANCH, not a release). Now we fetch + check out the resolved
+    # release tag before building, so the fallback always builds the
+    # exact source behind the release. Falls back to the branch checkout
+    # when no tag resolved. The version string now derives from the tag
+    # (was hardcoded 0.9.104).
     if [ "$BINARY_UPDATED" = "0" ] && [ -d /root/bpftune/.git ] && command -v go >/dev/null 2>&1; then
         printf "  building Go binary from source...\n"
         systemctl stop bpftune-collector-go 2>/dev/null || true
         sleep 2
-        cd /root/bpftune/dashboard/bin/go
-        CGO_ENABLED=0 go build -ldflags "-X main.dashVersionStr=0.9.104" -o "$GO_BIN" .
+        cd /root/bpftune
+        BUILD_REF=""
+        if [ -n "$DASH_TAG" ]; then
+            if git fetch --depth 1 origin "refs/tags/$DASH_TAG:refs/tags/$DASH_TAG" >/dev/null 2>&1; then
+                BUILD_REF="$DASH_TAG"
+            fi
+        fi
+        if [ -n "$BUILD_REF" ]; then
+            git checkout -q "$BUILD_REF" 2>/dev/null || true
+            ok "source pinned to release tag $BUILD_REF"
+        fi
+        DASH_VER="${DASH_TAG#v}"
+        if [ -z "$DASH_VER" ]; then
+            DASH_VER=$(git rev-parse --short HEAD 2>/dev/null || echo source)
+        fi
+        cd dashboard/bin/go
+        CGO_ENABLED=0 go build -ldflags "-X main.dashVersionStr=$DASH_VER" -o "$GO_BIN" .
         chmod +x "$GO_BIN"
-        ok "Go binary rebuilt from source"
+        ok "Go binary rebuilt from source (version $DASH_VER)"
         BINARY_UPDATED=1
         cd /root/bpftune
     fi
