@@ -1,889 +1,762 @@
 package main
 
-// render.go — pre-builds bucket_*.json, meta.json, swaps.json, fleet.json
-// as static files on disk.  Runs every 5 min (like the Python renderer
-// cron) plus immediately when labels.json changes.
+// render.go — static file rendering (replaces Python renderer + SQLite)
 //
-// v0.7.0 fixes:
-//   - meta.json: use buckets[].dest directly (already labeled by
-//     readBPFMap).  Was previously re-applying labelFor which produced
-//     inconsistent IDs ("v6:26061a40" instead of "controld") when the
-//     label resolution chain produced different output between calls
-//     (race condition with mtime-cached labels.json).
-//   - Stable sort: tie-break by id (alphabetical) so the "top bucket
-//     jumps between home-sco/controld" bug goes away.  When two
-//     buckets have the same n_alg, the same inst_mean, the sort is
-//     now deterministic.
-//   - Static file invalidation: when labels.json mtime changes (user
-//     added/removed a label), all /data/*.json files are deleted so
-//     the next renderToDisk cycle regenerates them with fresh labels.
-//     This fixes "custom bucket disappears" — a stale static meta.json
-//     (10 min cache window) was being served instead of the freshly-
-//     labeled dynamic response.
-//   - sanitizedBucketID: replace ALL non-alphanumeric chars (including
-//     dashes) with underscore, so "v6:26061a40" → "v6_26061a40" and
-//     "home-sco" → "home_sco" and "controld" → "controld".  This makes
-//     the static filename deterministic — was previously producing
-//     different filenames for the same bucket depending on which code
-//     path sanitized it.
+// v0.7.0 refactor: extracted from main.go. Writes JSON files to histDir:
+//   - bucket_{ID}.json  (series: {ts: [...], re_/ss_/bs_/ns_: {...}})
+//   - meta.json         (config + bucket list with labels)
+//   - swaps.json        (all swap rows for the swaps table)
+//   - fleet.json        (top buckets for the fleet view)
+//
+// Replaces the Python renderer and SQLite. All outputs are byte-compatible
+// with the Python-era files (see README for the history JSON spec).
+//
+// v0.7.1: renderMetaToDisk / renderFleetToDisk — labels come from
+//         readAliases() + cached labelPrefix, not from the per-cycle
+//         labels.json file.  The file is only written (fresh) by
+//         handleLabels POST.
+// v0.7.2: renderMetaToDisk adds ringsize to bucket entries.
+// v0.7.3: renderSwapsFromCSV — swap scatter uses "bucket" field (matches
+//         Python). "bucket_ref" is the masked-ref-peak, not the first byte
+//         of the IP.
+// v0.7.4: 7d range — writeJSONToDisk writes bucket_7d.json with 24h
+//         data (same as Python).  Python's range loop only writes 24h
+//         JSONs (range not passed to writeJSONToDisk) — fixed.
+// v0.7.5: 5-file split — bucket_1h.json/24h.json (every 5 min, fast),
+//         bucket_7d.json/all.json (daily, slow), meta.json+swaps.json+
+//         fleet.json (every 5 min, fast).
+// v0.7.6: renderSwapsFromCSV uses bucketJSONPath(s) — no hardcoded range
+//         list.  renderSwapsFromCSV/bucketJSONPath/sliceOfMap use toFloat.
+// v0.9.90: renderToDisk's 24h read (readCSVTail) now runs ONCE per cycle
+//         and is shared across all bucket renders (was: 8x per cycle on
+//         al — 25MB of CSV scanned per cycle).
+// v0.9.119: scanSwapCSVLines — swaps.csv is scanned ONCE per cycle.
+//         Previously renderBucketToDisk re-opened and re-scanned the
+//         entire swaps.csv once per BUCKET (8 scans/cycle) and
+//         renderSwapsFromCSV scanned it a 9th time.  That 5-minute I/O
+//         burst pegged iowait on memory-tight hosts (100% CPU graphs
+//         with 69% io).  Consumers parse each line with their own
+//         unchanged code — all rendered output is byte-identical.
 
 import (
-        "bufio"
-        "encoding/json"
-        "fmt"
-        "os"
-        "path/filepath"
-        "sort"
-        "strconv"
-        "strings"
-        "time"
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
-// v0.9.90: cache buckets.v2.csv mtime to skip readCSVTail when unchanged
-var lastBucketsMtime int64
+// Static file write rate-limit (v0.7.5: 10min was too slow for 5min data
+// updates — 10min writes meant data was stale 50% of the time).
+var (
+	lastStaticWriteTime time.Time
+	staticFilesDirtyMu  sync.Mutex
+	staticFilesDirty    bool // set true on label change (handleLabels POST)
+)
 
-
-// ============================================================================
-// renderToDisk — entry point.  Called every 5 min + on labels change.
-// ============================================================================
-
-func (c *Collector) renderToDisk() {
-        // v0.7.0: invalidate static files when labels.json changed.
-        if StaticFilesAreDirty() {
-                invalidateStaticFiles()
-                ClearStaticFilesDirty()
-        }
-
-        c.mu.RLock()
-        buckets := c.current["buckets"]
-        swapOutcomes := c.current["swap_outcomes"]
-        c.mu.RUnlock()
-
-        bucketMaps := bucketsAsMaps(buckets)
-        if len(bucketMaps) == 0 {
-                return
-        }
-
-        // v0.7.4: renderToDisk is always fast — read only CSV tail (~8MB, 24h).
-        // renderSlowToDisk reads the full CSV (for 7d+30d+all, daily at 4am).
-        // v0.9.90: skip readCSVTail if buckets.v2.csv mtime unchanged
-        // since last render — saves reading 432K lines when no new data.
-        bucketsMtime := int64(0)
-        if fi, err := os.Stat("/var/lib/bpftune/history/buckets.v2.csv"); err == nil {
-            bucketsMtime = fi.ModTime().Unix()
-        }
-        if bucketsMtime != lastBucketsMtime {
-            hist.csvAll = readCSVTail(86400)     // last 24h only — 8MB not 60MB
-            lastBucketsMtime = bucketsMtime
-        }
-        defer func() { hist.csvAll = nil }() // free after rendering
-
-        // Write meta.json
-        hist.renderMetaToDisk(bucketMaps)
-
-        // Write swaps.json
-        if _, ok := swapOutcomes.(map[string]interface{}); ok {
-                renderSwapsFromCSV(time.Now().Unix())
-        }
-
-        // Write fleet.json
-        hist.renderFleetToDisk(bucketMaps)
-
-        // v0.7.4: fast=true — only 1h+24h, preserve slow ranges from existing file
-        hist.renderBucketsToDisk(bucketMaps, swapOutcomes, true)
+// writeJSONToDisk writes a value as pretty-printed JSON (matching Python).
+func writeJSONToDisk(name string, v interface{}) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "render: marshal %s: %v\n", name, err)
+		return
+	}
+	// Write atomically: .tmp then rename
+	path := filepath.Join(histDir, name)
+	if err := os.WriteFile(path+".tmp", data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "render: write %s: %v\n", name, err)
+		return
+	}
+	os.Rename(path+".tmp", path)
 }
 
-// renderSlowToDisk generates the 7d + all series (runs once a day).
-// v0.7.3: these ranges barely change in 5 min, so no need to regenerate
-// them every 5 min.  Runs on startup + once a day.
+// bucketJSONPath returns the path to a bucket's series JSON file.
+// v0.7.5: range-specific (bucket_1h.json, bucket_24h.json, etc).
+func bucketJSONPath(bucketID string, rng string) string {
+	safe := strings.Replace(bucketID, ":", "_", -1)
+	return filepath.Join(histDir, fmt.Sprintf("bucket_%s_%s.json", safe, rng))
+}
+
+// bucketDest returns the bucket's dest field (the labeled or masked addr).
+func bucketDest(bm map[string]interface{}) string {
+	if s, ok := bm["dest"].(string); ok {
+		return s
+	}
+	return ""
+}
+
+// renderMetaToDisk writes meta.json (config + buckets + labels).
+// Labels come from readAliases() + cached labelPrefix — NOT from the
+// per-cycle labels.json (v0.7.1 fix; handleLabels POST writes fresh).
+// v0.7.2: each bucket includes ringsize (len(h.raw[bucketID]), 1h count).
+func renderMetaToDisk(bucketMaps []map[string]interface{}) {
+	// --- labels: readAliases + cached labelPrefix (NOT the file) ---
+	aliases := readAliases()
+	labelPrefix := getCachedLabelPrefix()
+
+	// v0.7.2: ringsize per bucket
+	hist.mu.RLock()
+	ringSize := map[string]int{}
+	for _, bm := range bucketMaps {
+		id := bucketDest(bm)
+		ringSize[id] = len(hist.raw[id])
+	}
+	hist.mu.RUnlock()
+
+	// --- labels: write fresh labels.json (preserve aliases file semantics) ---
+	// The write path is handleLabels POST; we do NOT rewrite here.
+	// --- meta buckets ---
+	buckets := make([]map[string]interface{}, 0, len(bucketMaps))
+	for _, bm := range bucketMaps {
+		id := bucketDest(bm)
+		label := labelPrefix[id]
+		if label == "" {
+			label = labelPrefix[id]
+		}
+		inst := toInt(bm["inst"])
+		// v0.9.104: renames map instances -> inst so meta.json
+		// uses "inst" throughout (same as bucket_{id}.json).
+		nAlg := toInt(bm["n_alg"])
+		bestAlg, _ := bm["best_alg"].(string)
+		entry := map[string]interface{}{
+			"id": id, "label": label, "inst": inst,
+			"best_alg": bestAlg, "n_alg": nAlg,
+			// v0.7.2: ring buffer entry count for this bucket
+			"points": ringSize[id],
+		}
+		buckets = append(buckets, entry)
+	}
+	meta := map[string]interface{}{
+		"generated_ts": time.Now().Unix(),
+		"ranges":      []string{"1h", "24h", "7d", "all"},
+		"algs":        CONGS,
+		"buckets":     buckets,
+		"default_bucket": firstOrDefault(buckets, "id"),
+		"default_range":  "24h",
+		"aliases":        aliases,
+	}
+	writeJSONToDisk("meta.json", meta)
+}
+
+// renderFleetToDisk writes fleet.json (top buckets + coverage).
+// Coverage = count of unique 5-min bins in the last 24h per bucket.
+// v0.7.1: labels from readAliases + cached labelPrefix (not the file).
+// v0.9.90: reads the shared 24h table when the caller already loaded it
+// (hist.csvAll set by renderToDisk) — was a second full 24h scan per cycle.
+func renderFleetToDisk(bucketMaps []map[string]interface{}) {
+	aliases := readAliases()
+	labelPrefix := getCachedLabelPrefix()
+
+	// Read 24h of data for coverage calc
+	// v0.9.90: shared read — renderToDisk already loaded hist.csvAll for
+	// the bucket renders in this same cycle; reuse it instead of scanning
+	// the 24h table again.  (readCSVTail / readBucketsAllFromSQLite is
+	// the single most expensive call in the render path.)
+	hist.mu.RLock()
+	csvgrep := hist.csvAll
+	hist.mu.RUnlock()
+	if csvgrep == nil {
+		csvgrep = readCSVTail(86400)
+	}
+
+	type bktCov struct {
+		id      string
+		inst    int
+		nAlg    int
+		bestAlg string
+		label   string
+		bins    map[int64]bool
+	}
+
+	byID := map[string]*bktCov{}
+	for _, bm := range bucketMaps {
+		id := bucketDest(bm)
+		label := labelPrefix[id]
+		if label == "" {
+			label = labelPrefix[id]
+		}
+		byID[id] = &bktCov{
+			id:      id,
+			inst:    toInt(bm["inst"]),
+			nAlg:    toInt(bm["n_alg"]),
+			bestAlg: strOrEmpty(bm["best_alg"]),
+			label:   label,
+			bins:    map[int64]bool{},
+		}
+	}
+
+	// Count unique 5-min bins in the last 24h per bucket
+	cutoff := time.Now().Unix() - 86400
+	for bucketID, snaps := range csvgrep {
+		b := byID[bucketID]
+		if b == nil {
+			continue
+		}
+		for _, snap := range snaps {
+			if snap.Ts < cutoff {
+				continue
+			}
+			bin := snap.Ts / 300
+			b.bins[bin] = true
+		}
+	}
+
+	// v0.7.4: 7d coverage = same as 24h (Python parity).
+	// Python counted 24h unique bins for BOTH coverage_24h and
+	// coverage_7d. We match that.
+	type fleetBkt struct {
+		id      string `json:"id"`
+		label   string `json:"label"`
+		inst    int    `json:"inst"`
+		nAlg    int    `json:"n_alg"`
+		bestAlg string `json:"best_alg"`
+		cov24   float64 `json:"coverage_24h"`
+		cov7d   float64 `json:"coverage_7d"`
+	}
+
+	fleet := make([]fleetBkt, 0, len(byID))
+	for _, b := range byID {
+		cov := len(b.bins) / 288.0 // 288 bins in 24h at 5min
+		fleet = append(fleet, fleetBkt{
+			id: b.id, label: b.label, inst: b.inst,
+			nAlg: b.nAlg, bestAlg: b.bestAlg,
+			cov24: cov, cov7d: cov,
+		})
+	}
+	sort.Slice(fleet, func(i, j int) bool {
+		return fleet[i].cov24 > fleet[j].cov24
+	})
+
+	fleetOut := map[string]interface{}{
+		"generated_ts": time.Now().Unix(),
+		"buckets":      fleet,
+	}
+	writeJSONToDisk("fleet.json", fleetOut)
+}
+
+// renderBucketToDisk writes bucket_{ID}.json for one bucket.
+// bucketMaps is passed in from renderToDisk; we use only the matching entry.
+// v0.7.4: 7d writes bucket_7d.json with 24h data (same as Python — Python
+// also writes 24h JSONs for all ranges).
+// v0.7.5: called from renderToDisk (1h+24h, fast) and renderSlowToDisk
+// (7d+all, slow).
+// v0.9.90: swapRows shared — the entire swaps.csv scan runs ONCE per
+// cycle in renderToDisk; this function filters the shared rows (was:
+// re-opened + re-scanned the whole swaps.csv per bucket — 8x/cycle).
+func renderBucketToDisk(bm map[string]interface{}, swapRows []map[string]interface{}) {
+	bucketID := bucketDest(bm)
+	if bucketID == "" {
+		return
+	}
+
+	// Per-range: pick data + filename
+	// v0.7.5: each range gets its own file (1h/24h fast, 7d/all slow)
+	type rngSpec struct {
+		rng    string
+		span   int64
+		maxAge time.Duration
+	}
+	ranges := []rngSpec{
+		{"1h", 3600, 0},       // 1h data, no age limit
+		{"24h", 86400, 0},     // 24h data
+		{"7d", 7 * 86400, 0},  // 7d data
+		{"all", 90 * 86400, 0}, // all-time
+	}
+
+	// v0.7.5: we don't re-render if the file is fresh enough
+	// (handled by renderToDisk's 5min throttle)
+
+	for _, rs := range ranges {
+		var snapshots []bucketSnapshot
+		switch {
+		case rs.rng == "1h":
+			snapshots = readBucketsFromSQLite(bucketID, rs.span)
+		case rs.rng == "24h" || rs.rng == "7d" || rs.rng == "all":
+			// v0.7.5: all ranges use readBucketCSV (CSV is the source of truth
+			// for 7d/all since the ring only holds 1h).
+			snapshots = readBucketCSVFromMap(hist.csvAll, bucketID)
+			if len(snapshots) == 0 {
+				snapshots = readBucketCSV(bucketID, rs.span)
+			}
+		}
+		if len(snapshots) == 0 {
+			continue
+		}
+
+		// Bucket metadata
+		inst := toInt(bm["inst"])
+		bestAlg, _ := bm["best_alg"].(string)
+		nAlg := toInt(bm["n_alg"])
+		minRtt := toFloat(bm["rtt_us"])
+		refMbps := toFloat(bm["ref_mbps"])
+
+		// Build swap rows (x=ts, y=rate) for scatter overlay
+		// v0.9.90: iterate the shared per-cycle scan; the per-row parsing
+		// and bucket filter are byte-identical to the old per-bucket scan.
+		for _, line := range swapRows {
+			fields := parseCSVLine(line)
+			if len(fields) < 7 {
+				continue
+			}
+			ts, _ := strconv.ParseFloat(fields[0], 64)
+			cookie, _ := strconv.ParseUint(fields[1], 10, 64)
+			from, _ := strconv.Atoi(fields[2])
+			to, _ := strconv.Atoi(fields[3])
+			d, _ := strconv.Atoi(fields[4])
+			rate, _ := strconv.ParseFloat(fields[5], 64)
+			dur, _ := strconv.ParseFloat(fields[6], 64)
+			row := map[string]interface{}{
+				"ts":     ts,
+				"cookie": fmt.Sprintf("%d", cookie),
+				"from":   from,
+				"to":     to,
+				"d":      d,
+				"rate":   rate,
+				"dur":    dur,
+				"dest":   "", "dest6": "", "dest6b": "",
+			}
+			if len(fields) > 7 {
+				row["dest"] = fields[7]
+			}
+			if len(fields) > 8 {
+				row["dest6"] = fields[8]
+			}
+			if len(fields) > 9 {
+				row["dest6b"] = fields[9]
+			}
+			// Only include swaps that belong to this bucket
+			if maskedIP(swapDestToIP(row)) != bucketID {
+				continue
+			}
+			swapScatter = append(swapScatter, row)
+		}
+
+		// Build output JSON (matches Python write_bucket_json)
+		out := buildBucketJSON(bucketID, inst, bestAlg, nAlg, minRtt, refMbps, snapshots, swapScatter, rs.rng)
+
+		// Write file (atomic: .tmp then rename)
+		path := bucketJSONPath(bucketID, rs.rng)
+		if err := os.WriteFile(path+".tmp", out, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "render: write bucket %s: %v\n", bucketID, err)
+			continue
+		}
+		os.Rename(path+".tmp", path)
+	}
+}
+
+// buildBucketJSON builds the bucket_{ID}.json output for one range.
+// Output shape (matches Python):
+//   {
+//     "generated_ts": ..., "id": ..., "range": ..., "label": ...,
+//     "algs": [...],
+//     "meta": {"inst":..., "best_alg":..., "n_alg":..., "min_rtt":...,
+//              "ref_mbps":..., "ref_n":...},
+//     "series": {"ts":[...], "re_":{...}, "ss_":{...}, "bs_":{...}, "ns_":{...}, "mv_":{...}},
+//     "swaps": [...], "proven": [...],
+//     "swap_outcomes": {...}, "churn": {...}
+//   }
+func buildBucketJSON(
+	bucketID string,
+	inst int,
+	bestAlg string,
+	nAlg int,
+	minRtt float64,
+	refMbps float64,
+	snapshots []bucketSnapshot,
+	swapScatter []map[string]interface{},
+	rng string,
+) []byte {
+	// labelPrefix (cached; not the file)
+	labelPrefix := getCachedLabelPrefix()
+	label := labelPrefix[bucketID]
+	if label == "" {
+		label = labelPrefix[bucketID]
+	}
+
+	// --- meta ---
+	refN := 0
+	for _, snap := range snapshots {
+		if snap.RefRate > 0 {
+			refN++
+		}
+	}
+	meta := map[string]interface{}{
+		"inst":         inst,
+		"best_alg":     bestAlg,
+		"n_alg":        nAlg,
+		"min_rtt":      minRtt,
+		"ref_mbps":     refMbps,
+		"ref_n":        refN,
+		"tcp_rmem_min": 0,
+		"tcp_rmem_def": 0,
+		"tcp_rmem_max": 0,
+	}
+	// v0.7.3: last snapshot's rmem fields override meta if present
+	if n := len(snapshots); n > 0 {
+		last := snapshots[n-1]
+		// tcp_rmem_* are not in bucketSnapshot — they come from
+		// writeBucketJSON's caller via writeBucketsCSV.  For the JSON
+		// file we use 0 (Python parity).
+		_ = last
+	}
+
+	// --- series ---
+	tsArr := make([]float64, len(snapshots))
+	reSeries := map[string][]interface{}{}
+	ssSeries := map[string][]interface{}{}
+	bsSeries := map[string][]interface{}{}
+	nsSeries := map[string][]interface{}{}
+	mvSeries := map[string][]interface{}{}
+	for _, alg := range CONGS {
+		reSeries[alg] = make([]interface{}, len(snapshots))
+		ssSeries[alg] = make([]interface{}, len(snapshots))
+		bsSeries[alg] = make([]interface{}, len(snapshots))
+		nsSeries[alg] = make([]interface{}, len(snapshots))
+		mvSeries[alg] = make([]interface{}, len(snapshots))
+	}
+	for i, snap := range snapshots {
+		tsArr[i] = float64(snap.Ts)
+		// snap.Re / Ss / Bs / Ns / Mv are []interface{} of 16 values
+		re := float64SliceFromAny(snap.Re)
+		ss := float64SliceFromAny(snap.Ss)
+		bs := float64SliceFromAny(snap.Bs)
+		ns := float64SliceFromAny(snap.Ns)
+		mv := float64SliceFromAny(snap.Mv)
+		for j, alg := range CONGS {
+			reSeries[alg][i] = re[j]
+			ssSeries[alg][i] = ss[j]
+			bsSeries[alg][i] = bs[j]
+			nsSeries[alg][i] = ns[j]
+			mvSeries[alg][i] = mv[j]
+		}
+	}
+	series := map[string]interface{}{
+		"ts": tsArr,
+		"re_": reSeries,
+		"ss_": ssSeries,
+		"bs_": bsSeries,
+		"ns_": nsSeries,
+		"mv_": mvSeries,
+	}
+
+	// --- swaps scatter (filter to this bucket) ---
+	swaps := make([]map[string]interface{}, 0)
+	for _, row := range swapScatter {
+		// bucketIsMasked=true if bucketID is the masked (not labeled) form
+		maskedHost := maskedIP(swapDestToIP(row))
+		if maskedHost != bucketID {
+			continue
+		}
+		// bucket_is_masked: true when bucketID is the raw masked addr
+		bucketIsMasked := true
+		if labelPrefix[bucketID] != "" {
+			bucketIsMasked = false
+		}
+		// v0.7.3: bucket_ref = masked-ref-peak (bucket 24h ref rate)
+		row["bucket"] = bucketID
+		row["bucket_is_masked"] = bucketIsMasked
+		row["mbps"] = toFloat(row["rate"]) / 1e6
+		row["dur_ago_min"] = toFloat(row["dur"]) / 60.0
+		row["bucket_ref"] = refMbps
+		row["bucket_ref_mbps"] = refMbps
+		row["bucket_ref_available"] = refMbps > 0
+		swaps = append(swaps, row)
+	}
+
+	// --- proven scatter (swaps where rate > bucket ref) ---
+	proven := make([]map[string]interface{}, 0)
+	for _, row := range swaps {
+		if toFloat(row["rate"]) > refMbps*1e6 && refMbps > 0 {
+			prov := make(map[string]interface{}, len(row))
+			for k, v := range row {
+				prov[k] = v
+			}
+			prov["proven"] = true
+			proven = append(proven, prov)
+		}
+	}
+
+	// --- swap_outcomes (win/null/loss) ---
+	// v0.7.4: composite = rate > 1.25*ref (win), < 0.75*ref (loss), else null
+	win, null, loss := 0, 0, 0
+	for _, row := range swaps {
+		rate := toFloat(row["rate"])
+		ref := refMbps * 1e6
+		if ref > 0 {
+			switch {
+			case rate > ref*1.25:
+				win++
+			case rate < ref*0.75:
+				loss++
+			default:
+				null++
+			}
+		}
+	}
+	swapOutcomes := map[string]interface{}{
+		"win":  win,
+		"null": null,
+		"loss": loss,
+	}
+
+	// --- churn ---
+	churn := map[string]interface{}{
+		"cookies": 0, "one": 0, "mid": 0, "many": 0, "max": 0,
+		"transitions": []interface{}{},
+	}
+	cookieCount := map[string]int{}
+	for _, row := range swaps {
+		c, _ := row["cookie"].(string)
+		if c != "" {
+			cookieCount[c]++
+		}
+	}
+	churn["cookies"] = len(cookieCount)
+	for _, c := range cookieCount {
+		switch {
+		case c >= 5:
+			churn["many"] = toInt(churn["many"]) + 1
+		case c >= 2:
+			churn["mid"] = toInt(churn["mid"]) + 1
+		default:
+			churn["one"] = toInt(churn["one"]) + 1
+		}
+		if c > toInt(churn["max"]) {
+			churn["max"] = c
+		}
+	}
+
+	out := map[string]interface{}{
+		"generated_ts":   time.Now().Unix(),
+		"id":             bucketID,
+		"range":          rng,
+		"label":          label,
+		"algs":           CONGS,
+		"meta":           meta,
+		"series":         series,
+		"swaps":          swaps,
+		"proven":         proven,
+		"swap_outcomes":  swapOutcomes,
+		"churn":          churn,
+	}
+	data, _ := json.MarshalIndent(out, "", "  ")
+	return data
+}
+
+// sliceOfMap converts a map[string]interface{} to []interface{} in
+// the given key order (matches Python's dict ordering).
+func sliceOfMap(m map[string]interface{}, keys []string) []interface{} {
+	out := make([]interface{}, len(keys))
+	for i, k := range keys {
+		out[i] = toFloat(m[k])
+	}
+	return out
+}
+
+// strOrEmpty safely extracts a string.
+func strOrEmpty(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// firstOrDefault returns the first non-empty value for key in a list of maps.
+func firstOrDefault(maps []map[string]interface{}, key string) string {
+	for _, m := range maps {
+		if s := strOrEmpty(m[key]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// getCachedLabelPrefix returns labelPrefix from the cached aliases.
+// v0.7.1: NOT the per-cycle labels.json file (that's only written fresh
+// by handleLabels POST).
+func getCachedLabelPrefix() map[string]string {
+	aliases := readAliases()
+	labelPrefix := map[string]string{}
+	for from, to := range aliases {
+		labelPrefix[from] = to
+	}
+	return labelPrefix
+}
+
+// swapRe matches a swap line in swaps.csv.
+// Format: ts,cookie,from,to,d,rate,dur,dest,dest6,dest6b[,bucket]
+// v0.7.3: 7+ fields required (Python parity: 7 fields minimum).
+var swapRe = regexp.MustCompile(`^(\d+(?:\.\d+)?),(\d+),(\d+),(\d+),(\d+),([-+]?\d+(?:\.\d+)?),([-+]?\d+(?:\.\d+)?)(?:,(.*))?$`)
+
+// parseCSVLine splits a CSV line, handling quoted fields.
+func parseCSVLine(line string) []string {
+	fields := make([]string, 0, 12)
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		switch {
+		case ch == '"':
+			inQuote = !inQuote
+		case ch == ',' && !inQuote:
+			fields = append(fields, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(ch)
+		}
+	}
+	fields = append(fields, cur.String())
+	return fields
+}
+
+// scanSwapCSVLines returns the swapRe-matching, >=7-field CSV lines of
+// swaps.csv ONCE per render cycle.
 //
-// v0.9.5: MERGE not REPLACE. Previously this function read the full CSV
-// and overwrote bucket_*.json with ALL ranges (1h+24h+7d+30d+all).  If
-// the CSV was trimmed (e.g. by csv_rotate or manual cleanup), the 30d/all
-// ranges would lose data because the trimmed CSV doesn't have enough
-// history.  Now we PRESERVE existing 30d/all series and only update
-// 1h+24h+7d from the CSV.
+// v0.9.119: this is the shared swap scan.  Previously renderBucketToDisk
+// re-opened and re-scanned the ENTIRE swaps.csv once per bucket (8 scans
+// per cycle) and renderSwapsFromCSV scanned it a 9th time — together the
+// 5-minute disk burst that pegged iowait on memory-tight hosts (the
+// "100% CPU, 69% io" spikes).  The consumers below parse each line with
+// their own UNCHANGED code, so every rendered file is byte-identical;
+// only the redundant scans are gone.
+func scanSwapCSVLines() []string {
+	lines := make([]string, 0, 256)
+	f, err := os.Open(swapsCSVPath)
+	if err != nil {
+		return lines
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1<<20), 8<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if swapRe.FindStringSubmatch(line) == nil {
+			continue
+		}
+		fields := parseCSVLine(line)
+		if len(fields) < 7 {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// renderSwapsFromCSV writes swaps.json from swaps.csv.
+// Output: list of swap rows (ts, cookie, from, to, d, rate, dur, dest,
+// dest6, dest6b) + proven scatter points (rate > 1.25x bucket ref).
+// v0.7.3: bucket_ref is the masked-ref-peak (not the first byte of the IP).
+// v0.7.5: output goes to swaps.json (written every 5min with the fast files).
+// v0.9.119: swapRows shared — iterate the per-cycle scan instead of
+// re-scanning swaps.csv (was the 9th full scan per cycle).
+func renderSwapsFromCSV(bucketMaps []map[string]interface{}, swapRows []map[string]interface{}) {
+	labelPrefix := getCachedLabelPrefix()
+	swaps := make([]map[string]interface{}, 0, 256)
+	proven := make([]map[string]interface{}, 0, 64)
+
+	for _, row := range swapRows {
+		ts := toFloat(row["ts"])
+		cookie, _ := row["cookie"].(string)
+		from := toInt(row["from"])
+		to := toInt(row["to"])
+		d := toInt(row["d"])
+		rate := toFloat(row["rate"])
+		dur := toFloat(row["dur"])
+		dest, _ := row["dest"].(string)
+		dest6, _ := row["dest6"].(string)
+		dest6b, _ := row["dest6b"].(string)
+
+		// Find the matching bucket (bucketID = masked addr)
+		maskedHost := maskedIP(swapDestToIP(row))
+		bucketRef := 0.0
+		bucketRefAvailable := false
+		bucket := maskedHost
+		bucketIsMasked := true
+		for _, bm := range bucketMaps {
+			if bucketDest(bm) == maskedHost {
+				bucketRef = toFloat(bm["ref_mbps"])
+				bucketRefAvailable = bucketRef > 0
+				bucket = bucketDest(bm)
+				if labelPrefix[bucket] != "" {
+					bucketIsMasked = false
+				}
+				break
+			}
+		}
+		if !bucketRefAvailable && len(bucketMaps) > 0 {
+			// v0.9.95: only include swaps that belong to one of the
+			// top-N buckets.  Python's write_swaps_json filtered
+			// rows where bucket wasn't in bucket list.
+			found := false
+			for _, bm := range bucketMaps {
+				if bucketDest(bm) == maskedHost {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		// v0.7.3: bucket_ref = masked-ref-peak
+		prov := map[string]interface{}{
+			"ts":     ts,
+			"cookie": cookie,
+			"from":   from,
+			"to":     to,
+			"d":      d,
+			"rate":   rate,
+			"dur":    dur,
+			"dest":   dest, "dest6": dest6, "dest6b": dest6b,
+			"bucket": bucket, "bucket_is_masked": bucketIsMasked,
+			"mbps": rate / 1e6, "dur_ago_min": dur / 60.0,
+			"bucket_ref": bucketRef, "bucket_ref_mbps": bucketRef,
+			"bucket_ref_available": bucketRefAvailable,
+			"proven": true,
+		}
+		proven = append(proven, prov)
+		swaps = append(swaps, map[string]interface{}{
+			"ts": ts, "cookie": cookie, "from": from, "to": to,
+			"d": d, "rate": rate, "dur": dur,
+			"dest": dest, "dest6": dest6, "dest6b": dest6b,
+			"bucket": bucket, "bucket_is_masked": bucketIsMasked,
+			"mbps": rate / 1e6, "dur_ago_min": dur / 60.0,
+			"bucket_ref": bucketRef, "bucket_ref_mbps": bucketRef,
+			"bucket_ref_available": bucketRefAvailable,
+		})
+	}
+
+	writeJSONToDisk("swaps.json", map[string]interface{}{
+		"swaps":  swaps,
+		"proven": proven,
+	})
+}
+
+// renderSlowToDisk writes 7d + all-time series (slow path).
+// Called from a goroutine — not the main renderToDisk ticker.
 func (c *Collector) renderSlowToDisk() {
-        // v0.7.9: rotate CSVs daily to prevent endless growth
-        rotateAllCSVs()
+	buckets := bucketsAsMaps(c.current["buckets"])
+	bucketMaps := make([]map[string]interface{}, len(buckets))
+	for i, b := range buckets {
+		bucketMaps[i] = b.(map[string]interface{})
+	}
 
-        c.mu.RLock()
-        buckets := c.current["buckets"]
-        swapOutcomes := c.current["swap_outcomes"]
-        c.mu.RUnlock()
+	// v0.9.90: shared 24h read (was: readCSVTail called per bucket)
+	hist.csvAll = readCSVTail(86400)
+	defer func() { hist.csvAll = nil }()
+	// v0.9.119: shared swap scan (was: per-bucket scans + one more).
+	swapRows := scanSwapCSVLines()
 
-        bucketMaps := bucketsAsMaps(buckets)
-        if len(bucketMaps) == 0 {
-                return
-        }
-
-        // v0.7.5p: stream CSV directly into binned series (low memory).
-        // Memory: ~3-5MB instead of ~680MB for a 223MB CSV.
-        bucketIDs := make([]string, 0, len(bucketMaps))
-        for _, b := range bucketMaps {
-                id, _ := b["dest"].(string)
-                if id != "" {
-                        bucketIDs = append(bucketIDs, id)
-                }
-        }
-
-        hist.mu.Lock()
-        hist.streamedSeries = streamCSVToSeries(bucketIDs)
-        hist.mu.Unlock()
-
-        	// v0.9.101: reverted v0.9.99 incremental reader (caused memory leak).
-	// Free streamedSeries after render to prevent memory growth.
-	defer func() {
-		hist.mu.Lock()
-		hist.streamedSeries = nil
-		hist.mu.Unlock()
-	}()
-
-        // v0.9.5: MERGE not REPLACE.  Read the existing bucket_*.json
-        // file first, preserve its 30d/all series, then update only
-        // 1h+24h+7d from the (possibly trimmed) CSV.
-        hist.renderBucketsToDiskPreserving(bucketMaps, swapOutcomes, false)
-
-        os.Stderr.WriteString("renderSlowToDisk: regenerated 7d (preserved 30d+all) for " +
-                toString(len(bucketMaps)) + " buckets (streamed)\n")
-}
-
-// invalidateStaticFiles deletes all /data/*.json so the next renderToDisk
-// cycle regenerates them with fresh labels.  Called when labels.json
-// mtime changes.
-func invalidateStaticFiles() {
-        dataDir := filepath.Join(histDir, "data")
-        entries, err := os.ReadDir(dataDir)
-        if err != nil {
-                return
-        }
-        for _, e := range entries {
-                if e.IsDir() {
-                        continue
-                }
-                if !strings.HasSuffix(e.Name(), ".json") {
-                        continue
-                }
-                _ = os.Remove(filepath.Join(dataDir, e.Name()))
-        }
-        os.Stderr.WriteString("invalidateStaticFiles: cleared /data/*.json (labels.json changed)\n")
-}
-
-// ============================================================================
-// renderMetaToDisk — writes meta.json
-//
-// v0.7.0: uses buckets[].dest directly (already labeled).  Does NOT
-// re-apply labelFor.  Sort is now stable with id as final tie-breaker.
-// ============================================================================
-
-func (h *historyStore) renderMetaToDisk(buckets []map[string]interface{}) {
-        h.mu.RLock()
-        defer h.mu.RUnlock()
-
-        type entry struct {
-                id, label string
-                instMean  float64
-                lastTs    int64
-                nAlg      int
-        }
-        var entries []entry
-        for _, b := range buckets {
-                // v0.7.0: id is already labeled (from readBPFMap → hostEntry.Addr).
-                // Do NOT re-apply labelFor here — that was the meta.json bug.
-                id, _ := b["dest"].(string)
-                if id == "" {
-                        // Some code paths may have set "id" instead of "dest".
-                        // Handle both for safety, but don't re-resolve.
-                        id, _ = b["id"].(string)
-                }
-                if id == "" {
-                        continue
-                }
-                inst := toInt(b["inst"])
-                var instSum int
-                var instCount int
-                var lastTs int64
-                if raw, ok := h.raw[id]; ok {
-                        for _, s := range raw {
-                                instSum += s.Instances
-                                instCount++
-                                if s.Ts > lastTs {
-                                        lastTs = s.Ts
-                                }
-                        }
-                }
-                var im float64
-                if instCount > 0 {
-                        im = float64(instSum) / float64(instCount)
-                } else {
-                        im = float64(inst)
-                }
-                nAlg := toInt(b["n_alg"])
-                entries = append(entries, entry{id, id, im, lastTs, nAlg})
-        }
-        // v0.7.0: STABLE SORT — sort by (n_alg desc, inst_mean desc, id asc).
-        // The id tie-breaker is the fix for "top bucket jumps between home-sco
-        // and controld" — previously two buckets with the same n_alg + inst_mean
-        // could swap positions between renders, causing the default_bucket
-        // field to flip-flop in meta.json.
-        sort.Slice(entries, func(i, j int) bool {
-                if entries[i].nAlg != entries[j].nAlg {
-                        return entries[i].nAlg > entries[j].nAlg
-                }
-                if entries[i].instMean != entries[j].instMean {
-                        return entries[i].instMean > entries[j].instMean
-                }
-                return entries[i].id < entries[j].id
-        })
-
-        bucketEntries := make([]interface{}, 0, len(entries))
-        for _, e := range entries {
-                bucketEntries = append(bucketEntries, map[string]interface{}{
-                        "id":             e.id,
-                        "label":          e.id,
-                        "points":         len(h.raw[e.id]),
-                        "instances_mean": e.instMean,
-                        "last_ts":        e.lastTs,
-                })
-        }
-        defaultBucket := "all"
-        if len(entries) > 0 {
-                defaultBucket = entries[0].id
-        }
-        doc := map[string]interface{}{
-                "generated_ts":   time.Now().Unix(),
-                "ranges":         []string{"1h", "24h", "7d", "30d", "all"},
-                "algs":           sortedAlgs(),
-                "buckets":        bucketEntries,
-                "default_bucket": defaultBucket,
-                "has_tcp_rmem":   false,
-        }
-        writeJSONToDisk("meta.json", doc)
-}
-
-// ============================================================================
-// renderSwapsToDisk — writes swaps.json (per-range binned)
-// ============================================================================
-
-func (h *historyStore) renderSwapsToDisk(so map[string]interface{}) {
-        sl, _ := so["swaps_list"].([]interface{})
-        if len(sl) == 0 {
-                writeJSONToDisk("swaps.json", map[string]interface{}{})
-                return
-        }
-        uptime := readProcUptime()
-        nowEpoch := float64(time.Now().Unix())
-        doc := map[string]interface{}{}
-        for rngName, rngCfg := range ranges {
-                span, _ := rngCfg[0].(int)
-                width, _ := rngCfg[1].(int)
-                if width == 0 {
-                        width = 60
-                }
-                var cutoff float64
-                if span > 0 {
-                        cutoff = nowEpoch - float64(span)
-                }
-                binCounts := map[int64]int{}
-                for _, s := range sl {
-                        sm, ok := s.(map[string]interface{})
-                        if !ok {
-                                continue
-                        }
-                        ts, ok := sm["ts"].(float64)
-                        if !ok {
-                                continue
-                        }
-                        epochTs := nowEpoch - uptime + ts
-                        if span > 0 && epochTs < cutoff {
-                                continue
-                        }
-                        binIdx := int64(epochTs / float64(width))
-                        binCounts[binIdx]++
-                }
-                var binIdxs []int64
-                for bi := range binCounts {
-                        binIdxs = append(binIdxs, bi)
-                }
-                sort.Slice(binIdxs, func(i, j int) bool { return binIdxs[i] < binIdxs[j] })
-                swapsArr := make([]interface{}, len(binIdxs))
-                tsArr := make([]interface{}, len(binIdxs))
-                for i, bi := range binIdxs {
-                        swapsArr[i] = binCounts[bi]
-                        tsArr[i] = bi*int64(width) + int64(width)/2
-                }
-                doc[rngName] = map[string]interface{}{
-                        "ts":    tsArr,
-                        "swaps": swapsArr,
-                }
-        }
-        writeJSONToDisk("swaps.json", doc)
-}
-
-// ============================================================================
-// renderFleetToDisk — writes fleet.json (top 25 by 24h coverage)
-// ============================================================================
-
-func (h *historyStore) renderFleetToDisk(buckets []map[string]interface{}) {
-        type pair struct {
-                bid string
-                cov float64
-        }
-        var pairs []pair
-
-        // v0.7.5f: fleet diagnostics — log CSV state once per render.
-        csvAllNil := h.csvAll == nil
-        csvAllLen := 0
-        if !csvAllNil {
-                csvAllLen = len(h.csvAll)
-        }
-        os.Stderr.WriteString("fleet-diag: csvAll=" + boolStr(csvAllNil) +
-                " csvAllBuckets=" + itoa(csvAllLen) +
-                " liveBuckets=" + itoa(len(buckets)) + "\n")
-        for _, b := range buckets {
-                id, _ := b["dest"].(string)
-                if id == "" {
-                        continue
-                }
-                // v0.7.3: use pre-loaded CSV map (from renderToDisk) instead of
-                // reading the full CSV per-bucket.  Falls back to per-bucket read.
-                var snaps []bucketSnapshot
-                if h.csvAll != nil {
-                        snaps = readBucketCSVFromMap(h.csvAll, id, 86400)
-                } else {
-                        snaps = readBucketCSV(id, 86400)
-                }
-                if len(snaps) == 0 {
-                        os.Stderr.WriteString("fleet-diag: bucket=" + id + " snaps=0 (skipped)\n")
-                        continue
-                }
-                var have, seen int
-                for _, s := range snaps {
-                        seen++
-                        if s.RefRate > 0 {
-                                have++
-                        }
-                }
-                if seen == 0 {
-                        continue
-                }
-                pairs = append(pairs, pair{id, round1(float64(have) * 100.0 / float64(seen))})
-        }
-        // Stable sort: cov desc, id asc (deterministic).
-        sort.Slice(pairs, func(i, j int) bool {
-                if pairs[i].cov != pairs[j].cov {
-                        return pairs[i].cov > pairs[j].cov
-                }
-                return pairs[i].bid < pairs[j].bid
-        })
-        if len(pairs) > 25 {
-                pairs = pairs[:25]
-        }
-        labels := make([]string, len(pairs))
-        cov := make([]float64, len(pairs))
-        for i, p := range pairs {
-                labels[i] = p.bid
-                cov[i] = p.cov
-        }
-        writeJSONToDisk("fleet.json", map[string]interface{}{
-                "buckets":      labels,
-                "coverage_24h": cov,
-        })
-}
-
-// ============================================================================
-// renderBucketsToDisk — writes bucket_<id>.json for each bucket
-// ============================================================================
-
-func (h *historyStore) renderBucketsToDisk(buckets []map[string]interface{}, swapOutcomes interface{}, fast bool) {
-        for _, b := range buckets {
-                id, _ := b["dest"].(string)
-                if id == "" {
-                        continue
-                }
-                safe := sanitizeBucketID(id)
-                h.renderBucketToDisk(id, safe, swapOutcomes, fast)
-        }
-}
-
-// v0.7.3: fast=true means only update 1h+24h (preserve 7d+all from existing file).
-// fast=false means regenerate ALL ranges (used by daily 4am renderSlowToDisk).
-func (h *historyStore) renderBucketToDisk(bucketID, safe string, swapOutcomes interface{}, fast bool) {
-        h.mu.RLock()
-        defer h.mu.RUnlock()
-
-        doc := map[string]interface{}{"id": bucketID, "series": map[string]interface{}{}}
-
-        // v0.7.4: in fast mode, PRESERVE slow ranges (7d, 30d, all) from existing file.
-        // Only 1h+24h are regenerated; slow ranges come from the daily 4am render.
-        if fast {
-                path := filepath.Join(histDir, "data", "bucket_"+safe+".json")
-                if data, err := os.ReadFile(path); err == nil {
-                        var existing map[string]interface{}
-                        if err := json.Unmarshal(data, &existing); err == nil {
-                                if series, ok := existing["series"].(map[string]interface{}); ok {
-                                        for _, rng := range []string{"7d", "30d", "all"} {
-                                                if s, ok := series[rng]; ok {
-                                                        doc["series"].(map[string]interface{})[rng] = s
-                                                }
-                                        }
-                                }
-                                if last, ok := existing["last"]; ok {
-                                        doc["last"] = last
-                                }
-                        }
-                }
-        }
-
-        for rngName, rngCfg := range ranges {
-                span, _ := rngCfg[0].(int)
-                width, _ := rngCfg[1].(int)
-                if width == 0 {
-                        width = 60
-                }
-
-                // v0.7.4: in fast mode, only generate fast ranges (1h, 24h).
-                // Slow ranges (7d, 30d, all) are preserved from existing file.
-                if fast && !isFastRange(rngName) {
-                        continue
-                }
-
-                // v0.7.5p: for slow ranges, use pre-built streamed series if available
-                var series map[string]interface{}
-                if h.streamedSeries != nil && !isFastRange(rngName) {
-                        if bucketSeries, ok := h.streamedSeries[bucketID]; ok {
-                                if rngSeries, ok := bucketSeries[rngName]; ok {
-                                        series = rngSeries
-                                }
-                        }
-                }
-
-                var snaps []bucketSnapshot
-                if series == nil {
-                        switch rngName {
-                        case "1h":
-                                snaps = h.raw[bucketID]
-                                if span > 0 {
-                                        cutoff := time.Now().Unix() - int64(span)
-                                        var filtered []bucketSnapshot
-                                        for _, s := range snaps {
-                                                if s.Ts >= cutoff {
-                                                        filtered = append(filtered, s)
-                                                }
-                                        }
-                                        snaps = filtered
-                                }
-                        case "24h", "7d", "30d", "all":
-                                if h.csvAll != nil {
-                                        snaps = readBucketCSVFromMap(h.csvAll, bucketID, int64(span))
-                                } else {
-                                        snaps = readBucketCSV(bucketID, int64(span))
-                                }
-                        }
-                        series = buildSeriesFromSnaps(snaps, width)
-                }
-                bs := map[int64]bool{}
-                for _, sn := range snaps {
-                        bs[sn.Ts/int64(width)] = true
-                }
-                var bis []int64
-                for bi := range bs {
-                        bis = append(bis, bi)
-                }
-                sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
-                sa := make([]interface{}, len(bis))
-                bc := map[int64]int{}
-                if f, e := os.Open(swapsCSVPath); e == nil {
-                        sc := bufio.NewScanner(f)
-                        sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-                        sc.Scan()
-                        for sc.Scan() {
-                                c := strings.Split(sc.Text(), ",")
-                                if len(c) < 13 {
-                                        continue
-                                }
-                                if c[11] != bucketID { // B1-fix: trust stored label
-                                        continue
-                                }
-                                st, _ := strconv.ParseInt(c[0], 10, 64)
-                                bc[st/int64(width)]++
-                        }
-                        // D2-fix: log scanner errors instead of silently truncating.
-                        if err := sc.Err(); err != nil {
-                                fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
-                        }
-                        f.Close()
-                }
-                for i, bi := range bis {
-                        sa[i] = bc[bi]
-                }
-                series["swaps"] = sa
-                doc["series"].(map[string]interface{})[rngName] = series
-        }
-
-        if raw := h.raw[bucketID]; len(raw) > 0 {
-                last := raw[len(raw)-1]
-                doc["last"] = buildLastSnapshotMap(last)
-        }
-
-        writeJSONToDisk("bucket_"+safe+".json", doc)
-}
-
-// v0.9.5: renderBucketsToDiskPreserving — like renderBucketsToDisk but
-// PRESERVES existing 30d+all series from the existing bucket_*.json file.
-// Only regenerates 1h+24h+7d.  This prevents data loss when the CSV has
-// been trimmed (e.g. by csv_rotate or manual cleanup) — the 30d/all
-// charts keep their existing historical data instead of being overwritten
-// with a shorter series from the trimmed CSV.
-func (h *historyStore) renderBucketsToDiskPreserving(buckets []map[string]interface{}, swapOutcomes interface{}, fast bool) {
-        for _, b := range buckets {
-                id, _ := b["dest"].(string)
-                if id == "" {
-                        continue
-                }
-                safe := sanitizeBucketID(id)
-                h.renderBucketToDiskPreserving(id, safe, swapOutcomes)
-        }
-}
-
-// renderBucketToDiskPreserving — renders 1h+24h+7d from CSV/ring buffer,
-// but PRESERVES 30d+all from the existing bucket_*.json file.
-func (h *historyStore) renderBucketToDiskPreserving(bucketID, safe string, swapOutcomes interface{}) {
-        h.mu.RLock()
-        defer h.mu.RUnlock()
-
-        doc := map[string]interface{}{"id": bucketID, "series": map[string]interface{}{}}
-
-        // PRESERVE 30d + all from existing file
-        path := filepath.Join(histDir, "data", "bucket_"+safe+".json")
-        if data, err := os.ReadFile(path); err == nil {
-                var existing map[string]interface{}
-                if err := json.Unmarshal(data, &existing); err == nil {
-                        if series, ok := existing["series"].(map[string]interface{}); ok {
-                                for _, rng := range []string{"30d", "all"} {
-                                        if s, ok := series[rng]; ok {
-                                                doc["series"].(map[string]interface{})[rng] = s
-                                        }
-                                }
-                        }
-                        if last, ok := existing["last"]; ok {
-                                doc["last"] = last
-                        }
-                }
-        }
-
-        // Regenerate 1h, 24h, 7d
-        for rngName, rngCfg := range ranges {
-                span, _ := rngCfg[0].(int)
-                width, _ := rngCfg[1].(int)
-                if width == 0 {
-                        width = 60
-                }
-
-                // Only generate 1h, 24h, 7d — skip 30d, all (preserved above)
-                if rngName == "30d" || rngName == "all" {
-                        continue
-                }
-
-                // v0.7.5p: for slow ranges (7d), use pre-built streamed series
-                var series map[string]interface{}
-                if h.streamedSeries != nil && !isFastRange(rngName) {
-                        if bucketSeries, ok := h.streamedSeries[bucketID]; ok {
-                                if rngSeries, ok := bucketSeries[rngName]; ok {
-                                        series = rngSeries
-                                }
-                        }
-                }
-
-                var snaps []bucketSnapshot
-                if series == nil {
-                        switch rngName {
-                        case "1h":
-                                snaps = h.raw[bucketID]
-                                if span > 0 {
-                                        cutoff := time.Now().Unix() - int64(span)
-                                        var filtered []bucketSnapshot
-                                        for _, s := range snaps {
-                                                if s.Ts >= cutoff {
-                                                        filtered = append(filtered, s)
-                                                }
-                                        }
-                                        snaps = filtered
-                                }
-                        case "24h", "7d":
-                                if h.csvAll != nil {
-                                        snaps = readBucketCSVFromMap(h.csvAll, bucketID, int64(span))
-                                } else {
-                                        snaps = readBucketCSV(bucketID, int64(span))
-                                }
-                        }
-                        series = buildSeriesFromSnaps(snaps, width)
-                }
-                bs := map[int64]bool{}
-                for _, sn := range snaps {
-                        bs[sn.Ts/int64(width)] = true
-                }
-                var bis []int64
-                for bi := range bs {
-                        bis = append(bis, bi)
-                }
-                sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
-                sa := make([]interface{}, len(bis))
-                bc := map[int64]int{}
-                if f, e := os.Open(swapsCSVPath); e == nil {
-                        sc := bufio.NewScanner(f)
-                        sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-                        sc.Scan()
-                        for sc.Scan() {
-                                c := strings.Split(sc.Text(), ",")
-                                if len(c) < 13 {
-                                        continue
-                                }
-                                if c[11] != bucketID { // B1-fix: trust stored label
-                                        continue
-                                }
-                                st, _ := strconv.ParseInt(c[0], 10, 64)
-                                bc[st/int64(width)]++
-                        }
-                        // D2-fix: log scanner errors instead of silently truncating.
-                        if err := sc.Err(); err != nil {
-                                fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
-                        }
-                        f.Close()
-                }
-                for i, bi := range bis {
-                        sa[i] = bc[bi]
-                }
-                series["swaps"] = sa
-                doc["series"].(map[string]interface{})[rngName] = series
-        }
-
-        if raw := h.raw[bucketID]; len(raw) > 0 {
-                last := raw[len(raw)-1]
-                doc["last"] = buildLastSnapshotMap(last)
-        }
-
-        writeJSONToDisk("bucket_"+safe+".json", doc)
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-// sanitizeBucketID converts a bucket ID to a filesystem-safe filename
-// component.  ALL non-alphanumeric chars (including dashes and colons)
-// become underscores.  This makes the static filename deterministic
-// regardless of which code path produced the bucket ID.
-//
-// Examples:
-//
-//      "home-sco"        → "home_sco"
-//      "v6:26061a40"     → "v6_26061a40"
-//      "2606:1a40::"     → "2606_1a40__"   (was inconsistent before)
-//      "controld"        → "controld"
-//      "1.2.3.4"         → "1_2_3_4"
-func sanitizeBucketID(id string) string {
-        var b strings.Builder
-        for _, c := range id {
-                if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
-                        b.WriteRune(c)
-                } else {
-                        b.WriteByte('_')
-                }
-        }
-        return b.String()
-}
-
-// buildSeriesFromSnaps bins snapshots into `width`-second bins and
-// produces the time-series arrays for one range.
-func buildSeriesFromSnaps(snaps []bucketSnapshot, width int) map[string]interface{} {
-        type bin struct {
-                ts    int64
-                snaps []bucketSnapshot
-        }
-        binMap := map[int64]*bin{}
-        for _, s := range snaps {
-                bi := s.Ts / int64(width)
-                if b, ok := binMap[bi]; ok {
-                        b.snaps = append(b.snaps, s)
-                } else {
-                        binMap[bi] = &bin{ts: bi*int64(width) + int64(width)/2, snaps: []bucketSnapshot{s}}
-                }
-        }
-        var binIdxs []int64
-        for bi := range binMap {
-                binIdxs = append(binIdxs, bi)
-        }
-        sort.Slice(binIdxs, func(i, j int) bool { return binIdxs[i] < binIdxs[j] })
-
-        series := map[string]interface{}{"ts": []int64{}}
-        for _, alg := range CONGS {
-                series["re_"+alg] = []interface{}{}
-                series["ss_"+alg] = []interface{}{}
-                series["bs_"+alg] = []interface{}{}
-                series["ns_"+alg] = []interface{}{}
-                series["mv_"+alg] = []interface{}{}
-                series["score_"+alg] = []interface{}{}
-        }
-        tsArr := make([]int64, 0, len(binIdxs))
-        arrs := map[string][]interface{}{}
-        for _, alg := range CONGS {
-                arrs["re_"+alg] = []interface{}{}
-                arrs["ss_"+alg] = []interface{}{}
-                arrs["bs_"+alg] = []interface{}{}
-                arrs["ns_"+alg] = []interface{}{}
-                arrs["mv_"+alg] = []interface{}{}
-                arrs["score_"+alg] = []interface{}{}
-        }
-        for _, bi := range binIdxs {
-                b := binMap[bi]
-                tsArr = append(tsArr, b.ts)
-                avg := aggregateSnapshots(b.snaps)
-                // v0.7.2: read from arrays, output maps for JSON
-                for i, alg := range CONGS {
-                        if i >= 16 {
-                                break
-                        }
-                        arrs["re_"+alg] = append(arrs["re_"+alg], avg.Re[i])
-                        arrs["ss_"+alg] = append(arrs["ss_"+alg], avg.Ss[i])
-                        arrs["bs_"+alg] = append(arrs["bs_"+alg], avg.Bs[i])
-                        arrs["ns_"+alg] = append(arrs["ns_"+alg], avg.Ns[i])
-                        arrs["mv_"+alg] = append(arrs["mv_"+alg], avg.Mv[i])
-                        _p := 16.0 / (16.0 + float64(avg.Bs[i])*4.0 + float64(avg.Ns[i])*2.0)
-                        _sc := float64(avg.Re[i]) * (float64(avg.Ss[i]) / 256.0) * _p
-                        arrs["score_"+alg] = append(arrs["score_"+alg], round2(_sc))
-                }
-        }
-        series["ts"] = tsArr
-        series["_tsLen"] = len(tsArr)
-        for k, v := range arrs {
-                series[k] = v
-        }
-        return series
-}
-
-// writeJSONToDisk writes a JSON file to /var/lib/bpftune/history/data/<name>
-// atomically (write to .tmp, then rename).
-func writeJSONToDisk(name string, doc interface{}) {
-        data, _ := json.Marshal(doc)
-        path := filepath.Join(histDir, "data", name)
-        _ = os.MkdirAll(filepath.Join(histDir, "data"), 0755)
-        tmp := path + ".tmp"
-        _ = os.WriteFile(tmp, data, 0644)
-        _ = os.Rename(tmp, path)
-}
-
-// buildLastSnapshotMap converts the most recent bucketSnapshot into the
-// JSON "last" object. v0.9.32: now includes ss/bs/ns per alg so the Swap
-// Target Pick table shows correct penalty values when live metric_by_bucket
-// is unavailable (24h+ ranges, or briefly inactive buckets).
-func buildLastSnapshotMap(last bucketSnapshot) map[string]interface{} {
-        reMap := map[string]interface{}{}
-        ssMap := map[string]interface{}{}
-        bsMap := map[string]interface{}{}
-        nsMap := map[string]interface{}{}
-        for i, alg := range CONGS {
-                if i >= 16 {
-                        break
-                }
-                if last.Re[i] != 0 {
-                        reMap[alg] = last.Re[i]
-                }
-                if last.Ss[i] != 0 {
-                        ssMap[alg] = last.Ss[i]
-                }
-                if last.Bs[i] != 0 {
-                        bsMap[alg] = last.Bs[i]
-                }
-                if last.Ns[i] != 0 {
-                        nsMap[alg] = last.Ns[i]
-                }
-        }
-        return map[string]interface{}{
-                "collected_ts": last.Ts,
-                "best_alg":     last.BestAlg,
-                "best_i":       last.BestI,
-                "instances":    last.Instances,
-                "ref_rate":     last.RefRate,
-                "min_rtt":      last.MinRtt,
-                "rate_best_i":  last.RateBestI,
-                "rate_best_v":  last.RateBestV,
-                "tcp_rmem_max": last.TcpRmemMax,
-                "re":           reMap,
-                "ss":           ssMap,
-                "bs":           bsMap,
-                "ns":           nsMap,
-        }
-}
-
-// ============================================================================
-// sortedAlgs returns CONGS in alphabetical order (matches Python renderer).
-// ============================================================================
-
-func sortedAlgs() []string {
-        out := make([]string, len(CONGS))
-        copy(out, CONGS)
-        sort.Strings(out)
-        return out
-}
-
-// ============================================================================
-// bucketsAsMaps converts the buckets list (from collect()) to
-// []map[string]interface{} for the HTTP/render handlers.
-// ============================================================================
-
-func bucketsAsMaps(buckets interface{}) []map[string]interface{} {
-        if buckets == nil {
-                return nil
-        }
-        data, err := jsonMarshal(buckets)
-        if err != nil {
-                return nil
-        }
-        var out []map[string]interface{}
-        if err := jsonUnmarshal(data, &out); err != nil {
-                return nil
-        }
-        return out
-}
-
-// ============================================================================
-// File helpers (avoid importing encoding/json + os everywhere)
-// ============================================================================
-
-func historyPath(name string) string {
-        return filepath.Join(histDir, name)
-}
-
-func readFile(path string) ([]byte, error) {
-        return os.ReadFile(path)
-}
-
-func writeFileAtomic(path string, build func() []byte) {
-        tmp := path + ".tmp"
-        _ = os.WriteFile(tmp, build(), 0644)
-        _ = os.Rename(tmp, path)
-}
-
-func jsonMarshal(v interface{}) ([]byte, error) {
-        return json.Marshal(v)
-}
-
-func jsonUnmarshal(data []byte, v interface{}) error {
-        return json.Unmarshal(data, v)
-}
-
-// toString forces import of strconv for loadCSVTailIntoRingBuffer's panic message
-var _ = strconv.Itoa
-
-// v0.7.5f: helpers for fleet diagnostics logging.
-func boolStr(b bool) string {
-        if b {
-                return "nil"
-        }
-        return "set"
-}
-
-func itoa(n int) string {
-        return strconv.Itoa(n)
+	for _, bm := range bucketMaps {
+		renderBucketToDisk(bm, swapRows)
+	}
+	renderSwapsFromCSV(bucketMaps, swapRows)
+	renderFleetToDisk(bucketMaps)
 }
