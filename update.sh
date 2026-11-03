@@ -348,14 +348,40 @@ print(candidates[0][1])
     if [ -n "$BIN_URL" ]; then
         printf "  downloading binary from %s\n" "$BIN_URL"
         if curl -fsSL "$BIN_URL" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
-            # Stop service BEFORE copying - avoids "Text file busy" on Linux
-            # when the running binary has an open file handle.
-            systemctl stop bpftune-collector-go 2>/dev/null || true
-            sleep 2
-            cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
-            chmod +x "$GO_BIN"
-            ok "Go binary updated from GitHub Releases (tag $DASH_TAG)"
-            BINARY_UPDATED=1
+            # Verify downloaded file is a valid ELF binary (not an HTML error
+            # page, redirect, or empty file that curl saved with HTTP 200)
+            DL_SIZE=$(stat -c %s /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null || echo 0)
+            DL_TYPE=$(file /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null | head -1)
+            if [ "$DL_SIZE" -lt 1000000 ] || ! echo "$DL_TYPE" | grep -q "ELF"; then
+                warn "downloaded file is invalid (size=${DL_SIZE}, type=${DL_TYPE})"
+                warn "  expected ELF binary >1MB — likely a CDN cache miss or HTML error page"
+                warn "  will try source build or keep existing binary"
+            else
+                # Stop service BEFORE copying - avoids "Text file busy" on Linux
+                # when the running binary has an open file handle.
+                systemctl stop bpftune-collector-go 2>/dev/null || true
+                sleep 2
+                # Save old MD5 for post-install verification
+                OLD_MD5=$(md5sum "$GO_BIN" 2>/dev/null | awk '{print $1}')
+                # Copy and verify
+                if cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN" && chmod +x "$GO_BIN"; then
+                    NEW_MD5=$(md5sum "$GO_BIN" 2>/dev/null | awk '{print $1}')
+                    DL_MD5=$(md5sum /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null | awk '{print $1}')
+                    if [ "$NEW_MD5" = "$DL_MD5" ]; then
+                        ok "Go binary updated from GitHub Releases (tag $DASH_TAG)"
+                        ok "  verified: MD5=$NEW_MD5 size=${DL_SIZE} ELF confirmed"
+                        BINARY_UPDATED=1
+                    else
+                        warn "post-copy verification FAILED: MD5 mismatch"
+                        warn "  downloaded: $DL_MD5  installed: $NEW_MD5"
+                        warn "  the cp may have been interrupted or the file is locked"
+                        BINARY_UPDATED=0
+                    fi
+                else
+                    warn "cp failed — binary not replaced"
+                    BINARY_UPDATED=0
+                fi
+            fi
         else
             warn "download failed for $BIN_URL - will try source build or skip"
         fi
@@ -395,10 +421,21 @@ print(candidates[0][1])
             DASH_VER=$(git rev-parse --short HEAD 2>/dev/null || echo source)
         fi
         cd dashboard/bin/go
-        CGO_ENABLED=0 go build -ldflags "-X main.dashVersionStr=$DASH_VER" -o "$GO_BIN" .
-        chmod +x "$GO_BIN"
-        ok "Go binary rebuilt from source (version $DASH_VER)"
-        BINARY_UPDATED=1
+        if CGO_ENABLED=0 go build -ldflags "-X main.dashVersionStr=$DASH_VER" -o "$GO_BIN" . && chmod +x "$GO_BIN"; then
+            BUILD_SIZE=$(stat -c %s "$GO_BIN" 2>/dev/null || echo 0)
+            BUILD_MD5=$(md5sum "$GO_BIN" 2>/dev/null | awk '{print $1}')
+            if [ "$BUILD_SIZE" -gt 1000000 ]; then
+                ok "Go binary rebuilt from source (version $DASH_VER)"
+                ok "  verified: MD5=$BUILD_MD5 size=${BUILD_SIZE}"
+                BINARY_UPDATED=1
+            else
+                warn "source build produced invalid binary (size=${BUILD_SIZE})"
+                BINARY_UPDATED=0
+            fi
+        else
+            warn "go build failed — keeping existing binary"
+            BINARY_UPDATED=0
+        fi
         cd /root/bpftune
     fi
 
