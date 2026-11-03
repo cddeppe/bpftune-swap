@@ -17,6 +17,11 @@ package main
 // into the raw ring buffer so 1h/24h charts work immediately.
 
 import (
+	"bufio"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -68,6 +73,86 @@ type historyStore struct {
 	// Set by renderSlowToDisk via streamCSVToSeries(), then freed.
 	// renderBucketToDisk uses this instead of readBucketCSVFromMap.
 	streamedSeries map[string]map[string]map[string]interface{}
+	// v0.9.124: shared swaps.csv entries — read ONCE per render cycle,
+	// used by all per-bucket render calls. Eliminates 8-16 redundant
+	// full-file scans of swaps.csv per render.
+	swapCSVEntries []swapBinEntry
+}
+
+// swapBinEntry is one row from swaps.csv, pre-parsed for binning.
+// Only the fields needed by renderBucketToDisk's swap-count binning.
+type swapBinEntry struct {
+	bucketID string
+	ts       int64
+}
+
+// scanSwapCSVEntries reads swaps.csv ONCE and returns all (bucketID, ts) pairs.
+// This replaces the per-bucket per-range file scans in renderBucketToDisk etc.
+func scanSwapCSVEntries() []swapBinEntry {
+	f, err := os.Open(swapsCSVPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 8<<20) // 8MB cap — matches original
+	sc.Scan()                             // skip header
+	var entries []swapBinEntry
+	for sc.Scan() {
+		c := strings.Split(sc.Text(), ",")
+		if len(c) < 13 {
+			continue
+		}
+		st, _ := strconv.ParseInt(c[0], 10, 64)
+		entries = append(entries, swapBinEntry{bucketID: c[11], ts: st})
+	}
+	if err := sc.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "scanSwapCSVEntries: scanner error: %v\n", err)
+	}
+	return entries
+}
+
+// binSwapCounts filters shared entries by bucketID and bins by width.
+// Returns map[binIdx]count — same output as the original per-bucket scan.
+func binSwapCounts(entries []swapBinEntry, bucketID string, width int64) map[int64]int {
+	bc := map[int64]int{}
+	for _, e := range entries {
+		if e.bucketID != bucketID {
+			continue
+		}
+		bc[e.ts/width]++
+	}
+	return bc
+}
+
+// v0.9.124: cached swaps.csv entries for HTTP dynamic handler.
+// 5-minute TTL with mtime check — same pattern as readBucketCSV.
+var (
+	swapCSVEntriesCache   []swapBinEntry
+	swapCSVEntriesCacheMu sync.Mutex
+	swapCSVEntriesMtime   int64
+	swapCSVEntriesAt      time.Time
+)
+
+func getSwapCSVEntriesCached() []swapBinEntry {
+	swapCSVEntriesCacheMu.Lock()
+	defer swapCSVEntriesCacheMu.Unlock()
+	// 5-minute TTL
+	if time.Since(swapCSVEntriesAt) < 5*time.Minute && len(swapCSVEntriesCache) > 0 {
+		return swapCSVEntriesCache
+	}
+	// Check mtime — skip re-scan if file unchanged
+	if fi, err := os.Stat(swapsCSVPath); err == nil {
+		mt := fi.ModTime().Unix()
+		if mt == swapCSVEntriesMtime && len(swapCSVEntriesCache) > 0 {
+			swapCSVEntriesAt = time.Now()
+			return swapCSVEntriesCache
+		}
+		swapCSVEntriesMtime = mt
+	}
+	swapCSVEntriesCache = scanSwapCSVEntries()
+	swapCSVEntriesAt = time.Now()
+	return swapCSVEntriesCache
 }
 
 // ringCap is the ring buffer size.  Default 120 = 1h at 30s intervals.

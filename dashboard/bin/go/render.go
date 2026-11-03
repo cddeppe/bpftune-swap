@@ -28,9 +28,7 @@ package main
 //     path sanitized it.
 
 import (
-	"bufio"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -77,6 +75,11 @@ func (c *Collector) renderToDisk() {
 	}
 	defer func() { hist.csvAll = nil }() // free after rendering
 
+	// v0.9.124: scan swaps.csv ONCE for all buckets — replaces 8-16
+	// per-bucket full-file scans in renderBucketToDisk.
+	hist.swapCSVEntries = scanSwapCSVEntries()
+	defer func() { hist.swapCSVEntries = nil }()
+
 	// Write meta.json
 	hist.renderMetaToDisk(bucketMaps)
 
@@ -113,8 +116,12 @@ func (c *Collector) renderSlowToDisk() {
 	defer func() {
 		hist.mu.Lock()
 		hist.csvAll = nil
+		hist.swapCSVEntries = nil
 		hist.mu.Unlock()
 	}()
+
+	// v0.9.124: scan swaps.csv once for all buckets
+	hist.swapCSVEntries = scanSwapCSVEntries()
 
 	rotateAllCSVs()
 
@@ -503,27 +510,12 @@ func (h *historyStore) renderBucketToDisk(bucketID, safe string, swapOutcomes in
 		}
 		sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
 		sa := make([]interface{}, len(bis))
-		bc := map[int64]int{}
-		if f, e := os.Open(swapsCSVPath); e == nil {
-			sc := bufio.NewScanner(f)
-			sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-			sc.Scan()
-			for sc.Scan() {
-				c := strings.Split(sc.Text(), ",")
-				if len(c) < 13 {
-					continue
-				}
-				if c[11] != bucketID { // B1-fix: trust stored label
-					continue
-				}
-				st, _ := strconv.ParseInt(c[0], 10, 64)
-				bc[st/int64(width)]++
-			}
-			// D2-fix: log scanner errors instead of silently truncating.
-			if err := sc.Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
-			}
-			f.Close()
+		// v0.9.124: use shared swaps.csv entries instead of per-bucket file scan
+		var bc map[int64]int
+		if len(h.swapCSVEntries) > 0 {
+			bc = binSwapCounts(h.swapCSVEntries, bucketID, int64(width))
+		} else {
+			bc = map[int64]int{}
 		}
 		for i, bi := range bis {
 			sa[i] = bc[bi]
@@ -640,27 +632,12 @@ func (h *historyStore) renderBucketToDiskPreserving(bucketID, safe string, swapO
 		}
 		sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
 		sa := make([]interface{}, len(bis))
-		bc := map[int64]int{}
-		if f, e := os.Open(swapsCSVPath); e == nil {
-			sc := bufio.NewScanner(f)
-			sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-			sc.Scan()
-			for sc.Scan() {
-				c := strings.Split(sc.Text(), ",")
-				if len(c) < 13 {
-					continue
-				}
-				if c[11] != bucketID { // B1-fix: trust stored label
-					continue
-				}
-				st, _ := strconv.ParseInt(c[0], 10, 64)
-				bc[st/int64(width)]++
-			}
-			// D2-fix: log scanner errors instead of silently truncating.
-			if err := sc.Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
-			}
-			f.Close()
+		// v0.9.124: use shared swaps.csv entries instead of per-bucket file scan
+		var bc map[int64]int
+		if len(h.swapCSVEntries) > 0 {
+			bc = binSwapCounts(h.swapCSVEntries, bucketID, int64(width))
+		} else {
+			bc = map[int64]int{}
 		}
 		for i, bi := range bis {
 			sa[i] = bc[bi]
