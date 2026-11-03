@@ -40,6 +40,7 @@ import (
 const (
 	rateHistBins        = 32
 	numTCPConnMetrics   = 16
+	offMetricSwapScore  = 40 // __u16, 2 bytes, little-endian
 	offMetricBadStreak  = 42
 	offMetricNullStreak = 43
 	sizeofTCPConnMetric = 48
@@ -603,9 +604,7 @@ func streaksFromHistory(outcomes []string) (bad, null uint8) {
 // into the metric slot for algIdx.  ONLY touches these 2 bytes —
 // swap_score, rate_ema, sockets_*, prefix fields, rate_hist are
 // preserved from the lookup.  Mirrors Python _patch_streaks.
-func patchStreaks(buf []byte, algIdx int, bad, null uint8) {
-	// D3 fix: bounds-check algIdx to prevent out-of-bounds write panic.
-	// A malformed log line with to=99 would crash the entire collector.
+func patchStreaks(buf []byte, algIdx int, bad, null uint8, swapScore uint16) {
 	if algIdx < 0 || algIdx >= numTCPConnMetrics {
 		return
 	}
@@ -613,10 +612,39 @@ func patchStreaks(buf []byte, algIdx int, bad, null uint8) {
 	if base+offMetricNullStreak+1 > len(buf) {
 		return
 	}
+	// v0.9.127: patch swap_score (offset 40-41) based on ring outcomes.
+	// Formula: 256 + wins*50 - losses*30 + nulls*10 (clamped 0-65535)
+	// This is NOT rate-based (the old 0.4.86 formula used rate_ema which
+	// unfairly penalized low-rate algs). This formula is outcome-based:
+	// wins boost, losses penalize, nulls give small credit for evaluation.
+	buf[base+offMetricSwapScore] = byte(swapScore & 0xff)
+	buf[base+offMetricSwapScore+1] = byte((swapScore >> 8) & 0xff)
 	buf[base+offMetricBadStreak] = bad
 	buf[base+offMetricNullStreak] = null
-	// Explicitly DO NOT touch swap_score (offset 40) or rate_ema (38).
-	// Kernel (0.4.84+) owns swap_score — see Python 0.4.86 comment.
+}
+
+// computeSwapScore derives a swap_score from ring outcomes.
+// 256 = no history (sentinel). Wins add 50, losses subtract 30, nulls add 10.
+func computeSwapScore(ring []string) uint16 {
+	wins, losses, nulls := 0, 0, 0
+	for _, o := range ring {
+		switch o {
+		case "win":
+			wins++
+		case "loss":
+			losses++
+		case "null":
+			nulls++
+		}
+	}
+	score := 256 + wins*50 - losses*30 + nulls*10
+	if score < 0 {
+		score = 0
+	}
+	if score > 65535 {
+		score = 65535
+	}
+	return uint16(score)
 }
 
 // ============================================================================
@@ -681,7 +709,7 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		}
 	}
 
-	const wbGracePeriodSec = 120.0
+	const wbGracePeriodSec = 300.0
 	cutoff := maxTs - wbGracePeriodSec
 	if c.wbLastProcessedTs > cutoff {
 		cutoff = c.wbLastProcessedTs
@@ -725,6 +753,15 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 			continue
 		}
 		o3 := outcomeSustained(srate, sw.Cookie, sw.Ts)
+		if o3 == "" {
+			// v0.9.127: fallback to immediate outcome when sustained
+			// isn't available yet (takes up to 5 min to arrive).
+			// Without this, swaps with only immediate outcomes never
+			// get ingested into the ring buffer, and the leaderboard's
+			// bad/null streaks stay at 0 while the recent swaps panel
+			// shows outcomes — the two panels disagree.
+			o3 = outcomeComposite(met, sw.Cookie, sw.Ts)
+		}
 		if o3 == "" {
 			continue
 		}
@@ -779,7 +816,8 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 				continue
 			}
 			bad, null := streaksFromHistory(ring)
-			patchStreaks(buf, algIdx, bad, null)
+			swapScore := computeSwapScore(ring)
+			patchStreaks(buf, algIdx, bad, null, swapScore)
 			patches++
 		}
 		if patches == 0 {
@@ -800,6 +838,8 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 			if base+offMetricNullStreak+1 > len(freshBuf) || base+offMetricNullStreak+1 > len(buf) {
 				continue
 			}
+			freshBuf[base+offMetricSwapScore] = buf[base+offMetricSwapScore]
+			freshBuf[base+offMetricSwapScore+1] = buf[base+offMetricSwapScore+1]
 			freshBuf[base+offMetricBadStreak] = buf[base+offMetricBadStreak]
 			freshBuf[base+offMetricNullStreak] = buf[base+offMetricNullStreak]
 		}
