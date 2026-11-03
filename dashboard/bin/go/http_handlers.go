@@ -12,13 +12,8 @@ package main
 //     so dynamic + static responses produce the same filenames.
 
 import (
-	"bufio"
-	"fmt"
 	"net/http"
-	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -73,28 +68,9 @@ func (h *historyStore) handleBucketJSON(w http.ResponseWriter, r *http.Request, 
 		}
 		sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
 		sa := make([]interface{}, len(bis))
-		bc := map[int64]int{}
-		if f, e := os.Open(swapsCSVPath); e == nil {
-			sc := bufio.NewScanner(f)
-			sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-			sc.Scan()
-			for sc.Scan() {
-				c := strings.Split(sc.Text(), ",")
-				if len(c) < 13 {
-					continue
-				}
-				if c[11] != bucketID { // B1-fix: trust stored label
-					continue
-				}
-				st, _ := strconv.ParseInt(c[0], 10, 64)
-				bc[st/int64(width)]++
-			}
-			// D2-fix: log scanner errors instead of silently truncating.
-			if err := sc.Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "handleBucketJSON: swaps.csv scan error: %v\n", err)
-			}
-			f.Close()
-		}
+		// v0.9.124: use cached shared swaps.csv entries instead of per-request file scan
+		entries := getSwapCSVEntriesCached()
+		bc := binSwapCounts(entries, bucketID, int64(width))
 		for i, bi := range bis {
 			sa[i] = bc[bi]
 		}

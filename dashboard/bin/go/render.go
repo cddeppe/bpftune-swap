@@ -28,15 +28,13 @@ package main
 //     path sanitized it.
 
 import (
-        "bufio"
-        "encoding/json"
-        "fmt"
-        "os"
-        "path/filepath"
-        "sort"
-        "strconv"
-        "strings"
-        "time"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // v0.9.90: cache buckets.v2.csv mtime to skip readCSVTail when unchanged
@@ -78,8 +76,13 @@ func (c *Collector) renderToDisk() {
         }
         defer func() { hist.csvAll = nil }() // free after rendering
 
-        // Write meta.json
-        hist.renderMetaToDisk(bucketMaps)
+	// v0.9.124: scan swaps.csv ONCE for all buckets — replaces 8-16
+	// per-bucket full-file scans in renderBucketToDisk.
+	hist.swapCSVEntries = scanSwapCSVEntries()
+	defer func() { hist.swapCSVEntries = nil }()
+
+	// Write meta.json
+	hist.renderMetaToDisk(bucketMaps)
 
         // Write swaps.json
         if _, ok := swapOutcomes.(map[string]interface{}); ok {
@@ -104,13 +107,29 @@ func (c *Collector) renderToDisk() {
 // history.  Now we PRESERVE existing 30d/all series and only update
 // 1h+24h+7d from the CSV.
 func (c *Collector) renderSlowToDisk() {
-        // v0.7.9: rotate CSVs daily to prevent endless growth
-        rotateAllCSVs()
+	// v0.7.9: rotate CSVs daily to prevent endless growth
+	// v0.9.107: cache full CSV read to avoid per-bucket re-read
+	{
+		hist.mu.Lock()
+		hist.csvAll = readCSVTail(86400)
+		hist.mu.Unlock()
+	}
+	defer func() {
+		hist.mu.Lock()
+		hist.csvAll = nil
+		hist.swapCSVEntries = nil
+		hist.mu.Unlock()
+	}()
 
-        c.mu.RLock()
-        buckets := c.current["buckets"]
-        swapOutcomes := c.current["swap_outcomes"]
-        c.mu.RUnlock()
+	// v0.9.124: scan swaps.csv once for all buckets
+	hist.swapCSVEntries = scanSwapCSVEntries()
+
+	rotateAllCSVs()
+
+	c.mu.RLock()
+	buckets := c.current["buckets"]
+	swapOutcomes := c.current["swap_outcomes"]
+	c.mu.RUnlock()
 
         bucketMaps := bucketsAsMaps(buckets)
         if len(bucketMaps) == 0 {
@@ -458,68 +477,53 @@ func (h *historyStore) renderBucketToDisk(bucketID, safe string, swapOutcomes in
                         }
                 }
 
-                var snaps []bucketSnapshot
-                if series == nil {
-                        switch rngName {
-                        case "1h":
-                                snaps = h.raw[bucketID]
-                                if span > 0 {
-                                        cutoff := time.Now().Unix() - int64(span)
-                                        var filtered []bucketSnapshot
-                                        for _, s := range snaps {
-                                                if s.Ts >= cutoff {
-                                                        filtered = append(filtered, s)
-                                                }
-                                        }
-                                        snaps = filtered
-                                }
-                        case "24h", "7d", "30d", "all":
-                                if h.csvAll != nil {
-                                        snaps = readBucketCSVFromMap(h.csvAll, bucketID, int64(span))
-                                } else {
-                                        snaps = readBucketCSV(bucketID, int64(span))
-                                }
-                        }
-                        series = buildSeriesFromSnaps(snaps, width)
-                }
-                bs := map[int64]bool{}
-                for _, sn := range snaps {
-                        bs[sn.Ts/int64(width)] = true
-                }
-                var bis []int64
-                for bi := range bs {
-                        bis = append(bis, bi)
-                }
-                sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
-                sa := make([]interface{}, len(bis))
-                bc := map[int64]int{}
-                if f, e := os.Open(swapsCSVPath); e == nil {
-                        sc := bufio.NewScanner(f)
-                        sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-                        sc.Scan()
-                        for sc.Scan() {
-                                c := strings.Split(sc.Text(), ",")
-                                if len(c) < 13 {
-                                        continue
-                                }
-                                if c[11] != bucketID { // B1-fix: trust stored label
-                                        continue
-                                }
-                                st, _ := strconv.ParseInt(c[0], 10, 64)
-                                bc[st/int64(width)]++
-                        }
-                        // D2-fix: log scanner errors instead of silently truncating.
-                        if err := sc.Err(); err != nil {
-                                fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
-                        }
-                        f.Close()
-                }
-                for i, bi := range bis {
-                        sa[i] = bc[bi]
-                }
-                series["swaps"] = sa
-                doc["series"].(map[string]interface{})[rngName] = series
-        }
+		var snaps []bucketSnapshot
+		if series == nil {
+			switch rngName {
+			case "1h":
+				snaps = h.raw[bucketID]
+				if span > 0 {
+					cutoff := time.Now().Unix() - int64(span)
+					var filtered []bucketSnapshot
+					for _, s := range snaps {
+						if s.Ts >= cutoff {
+							filtered = append(filtered, s)
+						}
+					}
+					snaps = filtered
+				}
+			case "24h", "7d", "30d", "all":
+				if h.csvAll != nil {
+					snaps = readBucketCSVFromMap(h.csvAll, bucketID, int64(span))
+				} else {
+					snaps = readBucketCSV(bucketID, int64(span))
+				}
+			}
+			series = buildSeriesFromSnaps(snaps, width)
+		}
+		bs := map[int64]bool{}
+		for _, sn := range snaps {
+			bs[sn.Ts/int64(width)] = true
+		}
+		var bis []int64
+		for bi := range bs {
+			bis = append(bis, bi)
+		}
+		sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
+		sa := make([]interface{}, len(bis))
+		// v0.9.124: use shared swaps.csv entries instead of per-bucket file scan
+		var bc map[int64]int
+		if len(h.swapCSVEntries) > 0 {
+			bc = binSwapCounts(h.swapCSVEntries, bucketID, int64(width))
+		} else {
+			bc = map[int64]int{}
+		}
+		for i, bi := range bis {
+			sa[i] = bc[bi]
+		}
+		series["swaps"] = sa
+		doc["series"].(map[string]interface{})[rngName] = series
+	}
 
         if raw := h.raw[bucketID]; len(raw) > 0 {
                 last := raw[len(raw)-1]
@@ -595,68 +599,53 @@ func (h *historyStore) renderBucketToDiskPreserving(bucketID, safe string, swapO
                         }
                 }
 
-                var snaps []bucketSnapshot
-                if series == nil {
-                        switch rngName {
-                        case "1h":
-                                snaps = h.raw[bucketID]
-                                if span > 0 {
-                                        cutoff := time.Now().Unix() - int64(span)
-                                        var filtered []bucketSnapshot
-                                        for _, s := range snaps {
-                                                if s.Ts >= cutoff {
-                                                        filtered = append(filtered, s)
-                                                }
-                                        }
-                                        snaps = filtered
-                                }
-                        case "24h", "7d":
-                                if h.csvAll != nil {
-                                        snaps = readBucketCSVFromMap(h.csvAll, bucketID, int64(span))
-                                } else {
-                                        snaps = readBucketCSV(bucketID, int64(span))
-                                }
-                        }
-                        series = buildSeriesFromSnaps(snaps, width)
-                }
-                bs := map[int64]bool{}
-                for _, sn := range snaps {
-                        bs[sn.Ts/int64(width)] = true
-                }
-                var bis []int64
-                for bi := range bs {
-                        bis = append(bis, bi)
-                }
-                sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
-                sa := make([]interface{}, len(bis))
-                bc := map[int64]int{}
-                if f, e := os.Open(swapsCSVPath); e == nil {
-                        sc := bufio.NewScanner(f)
-                        sc.Buffer(make([]byte, 1<<20), 8<<20) // D2-fix: 8MB cap
-                        sc.Scan()
-                        for sc.Scan() {
-                                c := strings.Split(sc.Text(), ",")
-                                if len(c) < 13 {
-                                        continue
-                                }
-                                if c[11] != bucketID { // B1-fix: trust stored label
-                                        continue
-                                }
-                                st, _ := strconv.ParseInt(c[0], 10, 64)
-                                bc[st/int64(width)]++
-                        }
-                        // D2-fix: log scanner errors instead of silently truncating.
-                        if err := sc.Err(); err != nil {
-                                fmt.Fprintf(os.Stderr, "render.go: swaps.csv scan error: %v\n", err)
-                        }
-                        f.Close()
-                }
-                for i, bi := range bis {
-                        sa[i] = bc[bi]
-                }
-                series["swaps"] = sa
-                doc["series"].(map[string]interface{})[rngName] = series
-        }
+		var snaps []bucketSnapshot
+		if series == nil {
+			switch rngName {
+			case "1h":
+				snaps = h.raw[bucketID]
+				if span > 0 {
+					cutoff := time.Now().Unix() - int64(span)
+					var filtered []bucketSnapshot
+					for _, s := range snaps {
+						if s.Ts >= cutoff {
+							filtered = append(filtered, s)
+						}
+					}
+					snaps = filtered
+				}
+			case "24h", "7d":
+				if h.csvAll != nil {
+					snaps = readBucketCSVFromMap(h.csvAll, bucketID, int64(span))
+				} else {
+					snaps = readBucketCSV(bucketID, int64(span))
+				}
+			}
+			series = buildSeriesFromSnaps(snaps, width)
+		}
+		bs := map[int64]bool{}
+		for _, sn := range snaps {
+			bs[sn.Ts/int64(width)] = true
+		}
+		var bis []int64
+		for bi := range bs {
+			bis = append(bis, bi)
+		}
+		sort.Slice(bis, func(i, j int) bool { return bis[i] < bis[j] })
+		sa := make([]interface{}, len(bis))
+		// v0.9.124: use shared swaps.csv entries instead of per-bucket file scan
+		var bc map[int64]int
+		if len(h.swapCSVEntries) > 0 {
+			bc = binSwapCounts(h.swapCSVEntries, bucketID, int64(width))
+		} else {
+			bc = map[int64]int{}
+		}
+		for i, bi := range bis {
+			sa[i] = bc[bi]
+		}
+		series["swaps"] = sa
+		doc["series"].(map[string]interface{})[rngName] = series
+	}
 
         if raw := h.raw[bucketID]; len(raw) > 0 {
                 last := raw[len(raw)-1]
