@@ -295,9 +295,9 @@ print(candidates[0][1])
         cd /root/bpftune
     else
         fail "Could not get Go binary. Options:
-   (a) Create a GitHub release with bpftune-collector-go-{amd64,arm64} assets
+   (a) Create a GitHub release with bpftune-dashboard-{amd64,arm64} assets
    (b) Install Go: apt-get install -y golang-go && re-run install.sh
-   (c) Pre-build on another host and copy to $BACKUP_DIR/bpftune-collector-go-$ARCH"
+   (c) Pre-build on another host and copy to $BACKUP_DIR/bpftune-dashboard-$ARCH"
     fi
 
     # --- 3c. Deploy frontend files ---
