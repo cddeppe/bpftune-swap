@@ -96,6 +96,10 @@ func (c *Collector) collect() {
         // v0.7.6: streak writeback — async to avoid blocking the 30s cycle.
         if cycleCount % 2 == 0 {
                 go c.writebackStreaks(allSwaps, allMets, allSrates)
+                // v0.9.118: backfill rate_ema from proof events for short-lived
+                // sockets (e.g. cloudflared/Cloudflare) where srate never fires.
+                // Only writes when rate_ema is currently 0 — safe alongside BPF.
+                go c.writebackRateEmaFromProofs(pl.parsedProofs, cdest)
         }
         doc["recent_swaps"] = topSwaps
         doc["recent_proofs"] = topProofs
