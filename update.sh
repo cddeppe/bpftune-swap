@@ -541,6 +541,66 @@ if [ "$DO_DASHBOARD" = 1 ]; then
     fi
 fi
 
+# ---------- Step 5: system policy (idle disk scheduling + swap policy) ----------
+# v0.9.119: the 5-minute render work caused periodic 100%-CPU / high-iowait
+# spikes on memory-tight hosts. Two GENERIC system policies remove the
+# amplifiers. Nothing here is specific to any one collector or binary:
+#
+#   1. IOSchedulingClass=idle for every bpftune* unit (pattern match, not
+#      a hardcoded service): background work (chart renders, log capture,
+#      state saves) must never compete with the real workloads for the
+#      disk. The scheduler runs them only when the disk is otherwise
+#      free.  Note: applies at service START, so changed units are
+#      restarted once here (idempotent — only when the drop-in is new).
+#
+#   2. vm.swappiness=10 (system-wide, via /etc/sysctl.d): when page-cache
+#      churn happens, drop COLD CACHE instead of swapping HOT application
+#      pages. This is eviction policy, not memory capacity.
+#
+# Idempotent: re-running is a no-op when already configured.
+step "5. System policy (idle disk scheduling + swap policy)"
+
+# 5a. swappiness — system-wide, not tied to any unit.
+SYSCTL_FILE=/etc/sysctl.d/99-bpftune-swap.conf
+if [ ! -f "$SYSCTL_FILE" ] || ! grep -q '^vm.swappiness=10' "$SYSCTL_FILE" 2>/dev/null; then
+    printf 'vm.swappiness=10\n' > "$SYSCTL_FILE"
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+    ok "vm.swappiness=10 applied ($SYSCTL_FILE)"
+else
+    ok "vm.swappiness=10 already set"
+fi
+
+# 5b. IOSchedulingClass=idle drop-in for EVERY bpftune unit (generic).
+# Pattern match — no specific collector is hardcoded; future bpftune*
+# units are covered automatically.
+UNITS=$(systemctl list-unit-files --plain --no-legend 'bpftune*.service' 2>/dev/null \
+    | awk '{print $1}' | grep -v '@' | sort -u)
+if [ -z "$UNITS" ]; then
+    UNITS=$(ls /etc/systemd/system/*.service /lib/systemd/system/*.service /usr/lib/systemd/system/*.service 2>/dev/null \
+        | xargs -n1 basename 2>/dev/null | grep '^bpftune' | sort -u)
+fi
+for u in $UNITS; do
+    DROPIN_DIR="/etc/systemd/system/$u.d"
+    DROPIN="$DROPIN_DIR/zz-idle-io.conf"
+    mkdir -p "$DROPIN_DIR"
+    if [ -f "$DROPIN" ] && grep -q 'IOSchedulingClass=idle' "$DROPIN" 2>/dev/null; then
+        ok "$u already idle-scheduled"
+        continue
+    fi
+    cat > "$DROPIN" <<'EOF'
+[Service]
+IOSchedulingClass=idle
+EOF
+    ok "IOSchedulingClass=idle -> $u"
+    # Restart if active so the policy takes effect now (IOSchedulingClass
+    # is applied at service start). Only runs when the drop-in is new.
+    if systemctl is-active "$u" >/dev/null 2>&1; then
+        systemctl daemon-reload
+        systemctl restart "$u" 2>/dev/null || true
+        ok "restarted $u (policy active)"
+    fi
+done
+
 # ---------- Summary ----------
 step "Update Complete"
 printf "  bpftune:   %s\n" "$(dpkg-query -W -f='${Version}' bpftune 2>/dev/null || echo 'not installed')"
