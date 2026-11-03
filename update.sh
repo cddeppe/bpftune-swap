@@ -460,7 +460,24 @@ print(candidates[0][1])
         chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
         ok "frontend files synced"
     else
+<<<<<<< Updated upstream
         warn "no frontend files to sync (no /root/bpftune/dashboard/bin)"
+=======
+        warn "no local checkout - downloading frontend files from GitHub"
+        for ff in index.html dashboard.js dashboard.css chart.umd.min.js chartjs-adapter-date-fns.bundle.min.js labels-api.py; do
+            curl -fsSL -o "$DASH_BIN/$ff" \
+                "https://raw.githubusercontent.com/${REPO}/${DASH_TAG}/dashboard/bin/$ff" 2>/dev/null || true
+        done
+        cp "$DASH_BIN"/index.html "$SERVED"/ 2>/dev/null || true
+        cp "$DASH_BIN"/dashboard.js "$SERVED"/ 2>/dev/null || true
+        cp "$DASH_BIN"/dashboard.css "$SERVED"/ 2>/dev/null || true
+        cp "$DASH_BIN"/chart.umd.min.js "$SERVED"/ 2>/dev/null || true
+        cp "$DASH_BIN"/chartjs-adapter-date-fns.bundle.min.js "$SERVED"/ 2>/dev/null || true
+        chmod 644 "$SERVED"/*.css "$SERVED"/*.js 2>/dev/null || true
+        chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js 2>/dev/null || true
+        chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
+        ok "frontend files downloaded from GitHub"
+>>>>>>> Stashed changes
     fi
 
     # --- 2e. Restart Go collector ---
