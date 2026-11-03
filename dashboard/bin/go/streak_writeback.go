@@ -505,7 +505,7 @@ func getMapFD(mapID int) (int, error) {
 	if cachedMapFD > 0 {
 		return cachedMapFD, nil
 	}
-	fd, err := bpfMapGetFDByID(uint32(mapID))
+	fd, _, err := bpfMapGetFDByIDVerified(uint32(mapID), "remote_host_map")
 	if err != nil {
 		return -1, err
 	}

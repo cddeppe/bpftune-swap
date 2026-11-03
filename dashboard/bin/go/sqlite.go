@@ -377,9 +377,9 @@ func snapshotPreHash(mv, re, ss, bs, ns []interface{}, bestI int, bestAlg string
 		buf = append(buf, '|')
 	}
 	// Same scalar fold as the v0.9.104 JSON hash.
-	buf = fmt.Fprintf(h, "%s|%d|%s|%d|%g|%g|%g", buf, bestI, bestAlg, inst,
+	h.Write(buf)
+	fmt.Fprintf(h, "|%d|%s|%d|%g|%g|%g", bestI, bestAlg, inst,
 		minRtt, refMbps, rateBestV)
-	_ = buf
 	return h.Sum64()
 }
 
