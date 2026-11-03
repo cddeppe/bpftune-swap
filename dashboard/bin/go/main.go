@@ -62,11 +62,16 @@ type Collector struct {
 	keyHashes  map[string]string      // per-key md5 for SSE delta
 	sseClients map[chan []byte]bool
 	startedAt  time.Time // for uptime_min field
-	// v0.9.119: incremental writeback — each swap processed exactly once.
-	// wbStreakRings maintains the last writebackWindow (8) sustained
-	// outcomes per (host, alg) pair. New swaps push to the ring; old
-	// swaps are never reprocessed.
-	wbStreakRings     map[[2]int][]string // key: [hostHash, algIdx] → last 8 outcomes
+	// v0.9.120: incremental writeback with grace period.
+	// wbStreakRings: last writebackWindow (8) sustained outcomes per (host, alg).
+	// wbLastProcessedTs: high-water mark minus grace period. Swaps younger
+	//   than the grace period (120s) are re-examined each cycle to pick up
+	//   outcomes that arrive late (socket still open when swap was logged).
+	//   After 120s, swaps are final — either they got an outcome or never will.
+	// wbIngestedMaxTs: per (host, alg), the max ts already ingested into the
+	//   ring. Prevents duplicate pushes when re-examining within the grace period.
+	wbStreakRings     map[[2]int][]string
+	wbIngestedMaxTs   map[[2]int]float64
 	wbLastProcessedTs float64
 }
 

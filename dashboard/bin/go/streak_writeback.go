@@ -674,18 +674,19 @@ type wbRow struct {
 // bad_streak/null_streak in remote_host_map based on the sustained
 // outcomes of the last 8 swaps per (host, alg) pair.
 //
-// v0.9.119: INCREMENTAL — each swap is processed EXACTLY ONCE.  A ring
-// buffer (wbStreakRings) maintains the last writebackWindow (8) sustained
-// outcomes per (host, alg).  Each cycle, only NEW swaps (ts > wbLastProcessedTs)
-// are ingested into the rings; old swaps are never reprocessed.  BPF map
-// writes happen only for hosts with affected (host, alg) pairs.
+// v0.9.120: INCREMENTAL WITH GRACE PERIOD — each swap is ingested into
+// an in-memory ring buffer exactly once.  The high-water mark
+// (wbLastProcessedTs) lags behind maxTs by wbGracePeriodSec (120s), so
+// recent swaps are re-examined each cycle to pick up sustained outcomes
+// that arrive late (socket still open when swap was logged).  After 120s,
+// swaps are final.  wbIngestedMaxTs prevents duplicate pushes during
+// re-examination.
 //
-// On cold start (wbLastProcessedTs == 0), all existing swaps are ingested
-// once to build the ring buffers — this is the only full-scan pass.
 // Returns (hostsPatched, slotsPatched) for logging.
 func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, srate map[int64][]srateEntry) (int, int) {
 	if c.wbStreakRings == nil {
 		c.wbStreakRings = make(map[[2]int][]string)
+		c.wbIngestedMaxTs = make(map[[2]int]float64)
 	}
 
 	// Find max ts in the current swap set
@@ -696,16 +697,23 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		}
 	}
 
-	// Filter to NEW swaps only (ts > last processed ts).
-	// On first run (wbLastProcessedTs == 0), process ALL swaps (cold start).
-	var newSwaps []swapRow
+	// Grace period: re-examine swaps from the last 120 seconds to pick up
+	// outcomes that arrive late. Swaps older than 120s are final.
+	const wbGracePeriodSec = 120.0
+	cutoff := maxTs - wbGracePeriodSec
+	if c.wbLastProcessedTs > cutoff {
+		cutoff = c.wbLastProcessedTs // don't go backwards
+	}
+
+	// Filter to swaps newer than the cutoff (new + within grace period)
+	var pendingSwaps []swapRow
 	for _, sw := range swaps {
-		if sw.Ts > c.wbLastProcessedTs {
-			newSwaps = append(newSwaps, sw)
+		if sw.Ts > cutoff {
+			pendingSwaps = append(pendingSwaps, sw)
 		}
 	}
 
-	if len(newSwaps) == 0 {
+	if len(pendingSwaps) == 0 {
 		return 0, 0
 	}
 
@@ -722,13 +730,13 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	}
 	detectMask(mapID)
 
-	// Ingest new swaps into the ring buffers.
-	// Only swaps with sustained outcomes affect streaks.
-	// affectedHosts: host string → set of alg indices that have new swaps
+	// Ingest pending swaps into the ring buffers.
+	// Dedup via wbIngestedMaxTs: skip swaps already ingested for this (host, alg).
 	affectedHosts := map[string]map[int]bool{}
 	ingested := 0
+	reExamined := 0
 	skippedNoDest := 0
-	for _, sw := range newSwaps {
+	for _, sw := range pendingSwaps {
 		rawDest := swapDestToIP(sw)
 		if rawDest == "" {
 			skippedNoDest++
@@ -740,18 +748,26 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		}
 		o3 := outcomeSustained(srate, sw.Cookie, sw.Ts)
 		if o3 == "" {
-			continue // only sustained outcomes affect streaks
+			continue // no sustained outcome yet — will be re-examined next cycle if within grace period
 		}
 
-		// Use host hash for the ring key (string→int via FNV-1a)
 		hh := stringHash(h)
 		ringKey := [2]int{hh, sw.To}
+
+		// Dedup: skip if already ingested (ts <= max ingested for this host+alg)
+		if sw.Ts <= c.wbIngestedMaxTs[ringKey] {
+			reExamined++
+			continue
+		}
+
+		// Push to ring buffer
 		ring := c.wbStreakRings[ringKey]
 		ring = append(ring, o3)
 		if len(ring) > writebackWindow {
 			ring = ring[len(ring)-writebackWindow:]
 		}
 		c.wbStreakRings[ringKey] = ring
+		c.wbIngestedMaxTs[ringKey] = sw.Ts
 
 		if affectedHosts[h] == nil {
 			affectedHosts[h] = make(map[int]bool)
@@ -760,21 +776,23 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		ingested++
 	}
 
-	// Update the high-water mark — all swaps up to maxTs are now ingested
-	c.wbLastProcessedTs = maxTs
+	// Advance the high-water mark (lagging by grace period)
+	if maxTs > wbGracePeriodSec {
+		c.wbLastProcessedTs = maxTs - wbGracePeriodSec
+	}
 
 	if skippedNoDest > 0 {
-		fmt.Fprintf(os.Stderr, "[writeback] %d new swaps skipped (no remote_host)\n", skippedNoDest)
+		fmt.Fprintf(os.Stderr, "[writeback] %d swaps skipped (no remote_host)\n", skippedNoDest)
 	}
 
 	if len(affectedHosts) == 0 {
-		// New swaps arrived but none had sustained outcomes — nothing to patch
-		fmt.Fprintf(os.Stderr, "[writeback] ingested %d new swaps (no sustained outcomes yet)\n", ingested)
+		if ingested > 0 || reExamined > 0 {
+			fmt.Fprintf(os.Stderr, "[writeback] ingested %d, re-examined %d (no BPF writes needed)\n", ingested, reExamined)
+		}
 		return 0, 0
 	}
 
-	// For each affected host: BPF map lookup, patch streaks for affected
-	// algos only, seq-check, write back.
+	// For each affected host: BPF map lookup, patch streaks, seq-check, write
 	totalHosts, totalSlots := 0, 0
 	for host, algSet := range affectedHosts {
 		keyArgs := keyArgsFor(host)
@@ -805,7 +823,6 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		}
 
 		// Seq check: re-lookup to avoid clobbering kernel-side updates
-		// that happened between T0 (our lookup) and T1 (now).
 		freshBuf, err := mapLookupBytes(mapID, keyArgs)
 		if err != nil || len(freshBuf) != sizeofRemoteHost {
 			fmt.Fprintf(os.Stderr, "[writeback] WARN: %s re-lookup failed; skip\n", host)
@@ -818,7 +835,6 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 				host, origSeq, freshSeq)
 			continue
 		}
-		// Copy our streak patches into the fresh buffer
 		for algIdx := range algSet {
 			base := offMetricsArray + (algIdx * sizeofTCPConnMetric)
 			if base+offMetricNullStreak+1 > len(freshBuf) || base+offMetricNullStreak+1 > len(buf) {
@@ -837,8 +853,8 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	}
 
 	if totalHosts > 0 {
-		fmt.Fprintf(os.Stderr, "[writeback] done: %d hosts, %d slots (ingested %d new, %d rings active)\n",
-			totalHosts, totalSlots, ingested, len(c.wbStreakRings))
+		fmt.Fprintf(os.Stderr, "[writeback] done: %d hosts, %d slots (ingested %d new, re-examined %d, %d rings)\n",
+			totalHosts, totalSlots, ingested, reExamined, len(c.wbStreakRings))
 	}
 	return totalHosts, totalSlots
 }
