@@ -56,6 +56,11 @@ type Collector struct {
 	startedAt    time.Time    // for uptime_min field
 	cachedJSON   []byte       // v0.9.107
 	cachedJSONMu sync.RWMutex // v0.9.107
+	// v0.9.125: incremental writeback — each swap processed exactly once
+	// with a 120s grace period for late outcomes.
+	wbStreakRings     map[[2]int][]string
+	wbIngestedMaxTs   map[[2]int]float64
+	wbLastProcessedTs float64
 }
 
 func NewCollector() *Collector {

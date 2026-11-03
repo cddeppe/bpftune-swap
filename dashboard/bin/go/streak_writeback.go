@@ -21,10 +21,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -665,16 +665,38 @@ type wbRow struct {
 	sustained string // sustained (preferred)
 }
 
-// writebackStreaks is the per-cycle entry point.  Called from collect()
-// every 30s.  Takes the parsed swaps + met + srate data and patches
-// bad_streak/null_streak in remote_host_map based on the sustained
-// outcomes of the last 8 swaps per (host, alg) pair.
-//
-// Returns (hostsPatched, slotsPatched) for logging.
-// Mirrors Python writeback_streaks(swaps).
+// writebackStreaks — v0.9.125: INCREMENTAL with 120s grace period.
+// Each swap is ingested into an in-memory ring buffer exactly once.
+// Only hosts with new sustained-outcome swaps get BPF map writes.
 func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, srate map[int64][]srateEntry) (int, int) {
-	// TryLock: if a previous writeback is still running (rare — should
-	// complete in <1s), skip this cycle rather than queuing up.
+	if c.wbStreakRings == nil {
+		c.wbStreakRings = make(map[[2]int][]string)
+		c.wbIngestedMaxTs = make(map[[2]int]float64)
+	}
+
+	var maxTs float64
+	for _, sw := range swaps {
+		if sw.Ts > maxTs {
+			maxTs = sw.Ts
+		}
+	}
+
+	const wbGracePeriodSec = 120.0
+	cutoff := maxTs - wbGracePeriodSec
+	if c.wbLastProcessedTs > cutoff {
+		cutoff = c.wbLastProcessedTs
+	}
+
+	var pending []swapRow
+	for _, sw := range swaps {
+		if sw.Ts > cutoff {
+			pending = append(pending, sw)
+		}
+	}
+	if len(pending) == 0 {
+		return 0, 0
+	}
+
 	if !writebackMu.TryLock() {
 		fmt.Fprintf(os.Stderr, "[writeback] skipped (previous cycle still running)\n")
 		return 0, 0
@@ -688,12 +710,11 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	}
 	detectMask(mapID)
 
-	// Pre-compute masked host + both outcomes for each swap.
-	// Filter to swaps that have at least one outcome (immediate OR sustained).
-	// Mirrors Python: new_swaps = [s for s in swaps if s.get('outcome_sustained') or s.get('outcome')]
-	var rows []wbRow
+	affectedHosts := map[string]map[int]bool{}
+	ingested := 0
+	reExamined := 0
 	skippedNoDest := 0
-	for _, sw := range swaps {
+	for _, sw := range pending {
 		rawDest := swapDestToIP(sw)
 		if rawDest == "" {
 			skippedNoDest++
@@ -703,121 +724,77 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		if h == "" {
 			continue
 		}
-		o := outcomeComposite(met, sw.Cookie, sw.Ts)
 		o3 := outcomeSustained(srate, sw.Cookie, sw.Ts)
-		if o == "" && o3 == "" {
+		if o3 == "" {
 			continue
 		}
-		rows = append(rows, wbRow{
-			ts:        sw.Ts,
-			toAlg:     sw.To,
-			host:      h,
-			outcome:   o,
-			sustained: o3,
-		})
+		hh := stringHash(h)
+		ringKey := [2]int{hh, sw.To}
+		if sw.Ts <= c.wbIngestedMaxTs[ringKey] {
+			reExamined++
+			continue
+		}
+		ring := c.wbStreakRings[ringKey]
+		ring = append(ring, o3)
+		if len(ring) > writebackWindow {
+			ring = ring[len(ring)-writebackWindow:]
+		}
+		c.wbStreakRings[ringKey] = ring
+		c.wbIngestedMaxTs[ringKey] = sw.Ts
+		if affectedHosts[h] == nil {
+			affectedHosts[h] = make(map[int]bool)
+		}
+		affectedHosts[h][sw.To] = true
+		ingested++
+	}
+
+	if maxTs > wbGracePeriodSec {
+		c.wbLastProcessedTs = maxTs - wbGracePeriodSec
 	}
 	if skippedNoDest > 0 {
 		fmt.Fprintf(os.Stderr, "[writeback] %d swaps skipped (no remote_host)\n", skippedNoDest)
 	}
-	if len(rows) == 0 {
+	if len(affectedHosts) == 0 {
+		if ingested > 0 || reExamined > 0 {
+			fmt.Fprintf(os.Stderr, "[writeback] ingested %d, re-examined %d (no BPF writes)\n", ingested, reExamined)
+		}
 		return 0, 0
 	}
 
-	// Group by host (masked remote_host).
-	byHost := map[string][]wbRow{}
-	for _, r := range rows {
-		byHost[r.host] = append(byHost[r.host], r)
-	}
-
 	totalHosts, totalSlots := 0, 0
-	for host, hostRows := range byHost {
+	for host, algSet := range affectedHosts {
 		keyArgs := keyArgsFor(host)
 		if keyArgs == nil {
 			continue
 		}
-
-		// Lookup current value (1 BPF map lookup per host).
 		buf, err := mapLookupBytes(mapID, keyArgs)
-		if err != nil {
+		if err != nil || buf == nil || len(buf) != sizeofRemoteHost {
 			continue
 		}
-		if buf == nil || len(buf) != sizeofRemoteHost {
-			fmt.Fprintf(os.Stderr, "[writeback] WARN: %s buf %d!=%d; skip\n", host, len(buf), sizeofRemoteHost)
-			continue
-		}
-
-		// Find unique algs in this host's swaps.
-		algSet := map[int]bool{}
-		for _, r := range hostRows {
-			algSet[r.toAlg] = true
-		}
-
+		hh := stringHash(host)
 		patches := 0
 		for algIdx := range algSet {
-			// Take last writebackWindow swaps with sustained outcome for (host, alg).
-			// Mirrors Python:
-			//   recent = sorted([s for s in swaps
-			//                    if masked_ip(s.remote_host)==host
-			//                    and s.to_alg==alg_idx
-			//                    and s.outcome_sustained], by ts)[-8:]
-			var recent []wbRow
-			for _, r := range hostRows {
-				if r.toAlg != algIdx {
-					continue
-				}
-				if r.sustained == "" {
-					continue
-				}
-				recent = append(recent, r)
-			}
-			if len(recent) == 0 {
+			ring := c.wbStreakRings[[2]int{hh, algIdx}]
+			if len(ring) == 0 {
 				continue
 			}
-
-			// Sort by ts ascending (oldest first).
-			sort.Slice(recent, func(i, j int) bool { return recent[i].ts < recent[j].ts })
-
-			// Take last writebackWindow (most recent 8).
-			if len(recent) > writebackWindow {
-				recent = recent[len(recent)-writebackWindow:]
-			}
-
-			// Compute streaks from the outcomes.
-			outcomes := make([]string, len(recent))
-			for i, r := range recent {
-				outcomes[i] = r.sustained
-			}
-			bad, null := streaksFromHistory(outcomes)
-
-			// Patch the 2 bytes for this alg slot.
+			bad, null := streaksFromHistory(ring)
 			patchStreaks(buf, algIdx, bad, null)
 			patches++
 		}
-
 		if patches == 0 {
 			continue
 		}
-
-		// C1-fix: re-lookup the buffer immediately before writeback and
-		// compare the seq field. The kernel increments seq on every update
-		// to the remote_host entry. If seq changed between the original
-		// lookup (T0) and now (T1), the kernel has updated metric_count /
-		// rate_ema / swap_score / etc. in the meantime, and writing back
-		// our stale buf would clobber those updates.
 		freshBuf, err := mapLookupBytes(mapID, keyArgs)
 		if err != nil || len(freshBuf) != sizeofRemoteHost {
-			fmt.Fprintf(os.Stderr, "[writeback] WARN: %s re-lookup failed; skip\n", host)
 			continue
 		}
 		origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
 		freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
 		if origSeq != freshSeq {
-			fmt.Fprintf(os.Stderr, "[writeback] %s seq changed (%d → %d); kernel updated mid-cycle, skip\n",
-				host, origSeq, freshSeq)
+			fmt.Fprintf(os.Stderr, "[writeback] %s seq changed; skip\n", host)
 			continue
 		}
-		// Copy our 2-byte streak patches into the fresh buffer so we don't
-		// lose any other kernel-side updates that happened between T0 and T1.
 		for algIdx := range algSet {
 			base := offMetricsArray + (algIdx * sizeofTCPConnMetric)
 			if base+offMetricNullStreak+1 > len(freshBuf) || base+offMetricNullStreak+1 > len(buf) {
@@ -827,18 +804,21 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 			freshBuf[base+offMetricNullStreak] = buf[base+offMetricNullStreak]
 		}
 		buf = freshBuf
-
-		// Write back the modified buffer (1 BPF map update per host).
 		if mapUpdateBytes(mapID, keyArgs, buf) {
 			totalHosts++
 			totalSlots += patches
 			fmt.Fprintf(os.Stderr, "[writeback] %s: patched %d alg slots\n", host, patches)
 		}
 	}
-
 	if totalHosts > 0 {
-		fmt.Fprintf(os.Stderr, "[writeback] done: %d hosts, %d algorithm slots corrected (processed %d swaps)\n",
-			totalHosts, totalSlots, len(rows))
+		fmt.Fprintf(os.Stderr, "[writeback] done: %d hosts, %d slots (ingested %d new, re-examined %d, %d rings)\n",
+			totalHosts, totalSlots, ingested, reExamined, len(c.wbStreakRings))
 	}
 	return totalHosts, totalSlots
+}
+
+func stringHash(s string) int {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return int(h.Sum32())
 }
