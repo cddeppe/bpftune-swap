@@ -57,43 +57,54 @@ type hostEntry struct {
 // and skip the bpftool call when the map entry count hasn't changed
 // (checked via a lightweight bpftool map show). This saves forking
 // bpftool + parsing large JSON on every cycle when the map is stable.
+//
+// v0.9.126: the count-match cache was ALSO gating the raw-syscall path,
+// where the dump costs nothing to re-read. BPF map VALUES (swap_score,
+// rate_ema, streaks) change every vote WITHOUT changing the entry COUNT,
+// so a stable host returned the first cached snapshot forever — the
+// leaderboard froze. Now the syscall path ALWAYS merges fresh; this
+// cache is consulted only by the bpftool fallback, and only for 60s.
 var (
 	bpfMapCache     []hostEntry
 	bpfMapCacheErr  error
 	bpfMapCacheSize int
+	bpfMapCacheAt   time.Time // v0.9.126: when the cache was populated
 )
+
+// bpfMapCacheFresh reports whether the cached merge may be served
+// without re-reading.  v0.9.126: 60-second TTL — the cache can never
+// serve stale data indefinitely.
+func bpfMapCacheFresh() bool {
+	return bpfMapCache != nil && time.Since(bpfMapCacheAt) < 60*time.Second
+}
 
 func readBPFMap() ([]hostEntry, error) {
 	// v0.9.86: try raw BPF syscalls first (no fork), fall back to bpftool.
 	// The syscall path uses BPF_MAP_GET_NEXT_KEY + BPF_MAP_LOOKUP_ELEM to
 	// iterate the map and parse raw bytes. Identical output to bpftool dump.
 	if raw, err := readBPFMapSyscall(); err == nil && len(raw) >= 0 {
-		// Check cache: if entry count matches, return cache.
-		if collectorMode.CacheBPFMap && bpfMapCache != nil && len(raw) == bpfMapCacheSize {
-			return bpfMapCache, bpfMapCacheErr
-		}
+		// v0.9.126: ALWAYS merge fresh on the syscall path.
+		// The syscall dump costs nothing (no fork, no JSON parse);
+		// only the merge runs. The old count-match cache returned
+		// stale VALUES (swap_score, rate_ema change per vote without
+		// changing the entry count), freezing the leaderboard.
 		bpfMapCacheSize = len(raw)
-		return mergeBPFMapEntries(raw)
+		merged, mergeErr := mergeBPFMapEntries(raw)
+		if collectorMode.CacheBPFMap {
+			bpfMapCache = merged
+			bpfMapCacheErr = mergeErr
+			bpfMapCacheAt = time.Now()
+		}
+		return merged, mergeErr
 	}
 
 	// Fallback: bpftool fork path (used when syscalls fail — e.g.,
 	// kernel < 4.4 without BPF_MAP_GET_FD_BY_ID, or map FD is stale).
 	// v0.9.33: check if the map size changed since last call.
-	if collectorMode.CacheBPFMap && bpfMapCache != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "bpftool", "--json", "map", "show", "name", "remote_host_map")
-		output, err := cmd.Output()
-		if err == nil {
-			var mapInfo []map[string]interface{}
-			if json.Unmarshal(output, &mapInfo) == nil && len(mapInfo) > 0 {
-				sz := toInt(mapInfo[0]["entries"])
-				if sz == bpfMapCacheSize {
-					return bpfMapCache, bpfMapCacheErr
-				}
-				bpfMapCacheSize = sz
-			}
-		}
+	// v0.9.126: bpftool fallback cache — only consulted when syscalls
+	// fail. 60-second TTL prevents indefinite stale serving.
+	if collectorMode.CacheBPFMap && bpfMapCacheFresh() {
+		return bpfMapCache, bpfMapCacheErr
 	}
 
 	// v0.9.27: add 10s timeout to prevent collector hanging on bpftool
@@ -119,7 +130,13 @@ func readBPFMap() ([]hostEntry, error) {
 	if collectorMode.CacheBPFMap {
 		bpfMapCacheSize = len(raw)
 	}
-	return mergeBPFMapEntries(raw)
+	merged, mergeErr := mergeBPFMapEntries(raw)
+	if collectorMode.CacheBPFMap {
+		bpfMapCache = merged
+		bpfMapCacheErr = mergeErr
+		bpfMapCacheAt = time.Now()
+	}
+	return merged, mergeErr
 }
 
 // mergeBPFMapEntries takes raw bpftool-formatted entries (either from
