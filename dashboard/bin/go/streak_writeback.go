@@ -479,7 +479,7 @@ func mapLookupBytesSyscall(mapID int, keyArgs []string) ([]byte, error) {
 		return nil, err
 	}
 
-	// Convert keyArgs (hex strings like "0a", "0b") to bytes.
+	// Convert keyArgs (hex strings like "0a", "0b", "00") to bytes.
 	key, err := hexArgsToBytes(keyArgs)
 	if err != nil {
 		return nil, err
@@ -501,11 +501,15 @@ func mapLookupBytesSyscall(mapID int, keyArgs []string) ([]byte, error) {
 }
 
 // getMapFD resolves a BPF map ID to a file descriptor, with caching.
+// v0.9.118: compile fix — bpfMapGetFDByID was removed from bpf_syscall.go
+// in the v0.9.114 rewrite; use the verified FD opener instead (this is
+// the same fix the v0.9.117 build used; it is now committed to source so
+// the branch builds from a clean checkout).
 func getMapFD(mapID int) (int, error) {
 	if cachedMapFD > 0 {
 		return cachedMapFD, nil
 	}
-	fd, err := bpfMapGetFDByID(uint32(mapID))
+	fd, _, err := bpfMapGetFDByIDVerified(uint32(mapID), "")
 	if err != nil {
 		return -1, err
 	}
