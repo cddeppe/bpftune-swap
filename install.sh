@@ -278,7 +278,7 @@ print(candidates[0][1])
     if [ -n "$DASH_TAG" ]; then
         BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-dashboard-${ARCH}"
     fi
-    if [ -n "\${BIN_URL:-}" ] && curl -fsSL "\${BIN_URL:-}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
+    if [ -n "${BIN_URL:-}" ] && curl -fsSL "${BIN_URL:-}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
         cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
         chmod +x "$GO_BIN"
         ok "downloaded Go binary from GitHub Releases ($ARCH, tag $DASH_TAG)"
