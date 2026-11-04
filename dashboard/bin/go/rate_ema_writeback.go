@@ -63,6 +63,7 @@ import (
 //        bad_streak(1) at 42, null_streak(1) at 43.
 // Matches offMetricBadStreak=42, offMetricNullStreak=43 in streak_writeback.go.
 const offMetricRateEma = 38
+const offMetricSwapScore = 40
 
 // RATE_EMA_BYTES_PER_UNIT must match the BPF constant (100000 = 100 KB).
 // rate_ema is stored as rate_Bps / 100000, capped to __u16 (65535).
@@ -207,13 +208,26 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
 
                 // Lookup current BPF map value (one syscall per host).
                 buf, err := mapLookupBytes(mapID, keyArgs)
-                if err != nil {
-                        fmt.Fprintf(os.Stderr, "[rate_ema_wb] %s: map lookup failed: %v\n", host, err)
-                        continue
-                }
-                if buf == nil || len(buf) != sizeofRemoteHost {
-                        fmt.Fprintf(os.Stderr, "[rate_ema_wb] WARN: %s buf %d!=%d; skip\n", host, len(buf), sizeofRemoteHost)
-                        continue
+                if err != nil || buf == nil || len(buf) != sizeofRemoteHost {
+                        // v0.9.124: Entry doesn't exist for this masked IP.
+                        // This happens when proof events resolve to a different
+                        // /32 prefix than the BPF map entries (common for
+                        // Cloudflare — multiple edge IPs mask to different /32s).
+                        // CREATE the entry with rate_ema seeded from the proof
+                        // and swap_score=256 (neutral). The BPF program will
+                        // update the other fields normally when new sockets
+                        // establish to this IP.
+                        buf = make([]byte, sizeofRemoteHost)
+                        // Initialize all 16 alg slots with swap_score=256 (neutral).
+                        // Without this, the reanchor skips algs with swap_score=0
+                        // (tcp_conn_tuner.c line 995: "if (ss == 0) continue").
+                        for i := 0; i < numTCPConnMetrics; i++ {
+                                off := offMetricsArray + i*sizeofTCPConnMetric + offMetricSwapScore
+                                if off+2 <= len(buf) {
+                                        binary.LittleEndian.PutUint16(buf[off:off+2], 256)
+                                }
+                        }
+                        fmt.Fprintf(os.Stderr, "[rate_ema_wb] %s: created new BPF map entry (lookup failed: %v)\n", host, err)
                 }
 
                 // Apply the BPF EMA to each alg in this host's proof set.
