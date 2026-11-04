@@ -69,6 +69,10 @@ const offMetricRateEma = 38
 const rateEmaBytesPerUnit = int64(100000)
 const rateEmaMax = 65535
 
+// rateEmaShift matches the BPF RATE_EMA_SHIFT (tcp_conn_tuner.h:317).
+// EMA: new_ema = (old_ema * 15 + new_sample) >> 4  (1/16 weight on new sample).
+const rateEmaShift = 4
+
 // destStringsToIP converts raw decimal-u32 dest fields (v4/v6/v6b) to a
 // net.ParseIP-parseable string, mirroring swapDestToIP from streak_writeback.go.
 // Do NOT use destStr() — that returns display labels like "v6:%08x" for
@@ -194,9 +198,15 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                         continue
                 }
 
-                // Check each alg in this host's proof set.
-                // Only write rate_ema for algs where it's currently 0.
+                // Apply the BPF EMA to each alg in this host's proof set.
+                // Mirrors tcp_conn_tuner.bpf.c lines 1942-1958:
+                //   r100k = rate_delivered / RATE_EMA_BYTES_PER_UNIT;
+                //   if (rate_ema == 0) rate_ema = r100k;
+                //   else rate_ema = (rate_ema*15 + r100k) >> RATE_EMA_SHIFT;
+                // Each proof event nudges rate_ema toward the proof's observed
+                // rate, so the picker always sees current conditions.
                 patches := 0
+                patchedAlgs := make([]int, 0, len(algRates))
                 for alg, rate := range algRates {
                         if alg < 0 || alg >= numTCPConnMetrics {
                                 continue
@@ -205,40 +215,61 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                         if off+2 > len(buf) {
                                 continue
                         }
+
+                        r100k := rate / rateEmaBytesPerUnit
+                        if r100k <= 0 {
+                                continue
+                        }
+                        if r100k > rateEmaMax {
+                                r100k = rateEmaMax
+                        }
+
                         curEma := binary.LittleEndian.Uint16(buf[off : off+2])
-                        if curEma != 0 {
-                                // BPF srate path has populated this — leave it alone.
-                                continue
+                        var newEma uint16
+                        if curEma == 0 {
+                                newEma = uint16(r100k)
+                        } else {
+                                newEma = uint16((uint32(curEma)*15 + uint32(r100k)) >> rateEmaShift)
                         }
 
-                        // Convert proof rate (Bps) to rate_ema units (100KB/s), cap at 65535.
-                        newEma := rate / rateEmaBytesPerUnit
-                        if newEma > rateEmaMax {
-                                newEma = rateEmaMax
-                        }
-                        if newEma <= 0 {
-                                continue
-                        }
-
-                        binary.LittleEndian.PutUint16(buf[off:off+2], uint16(newEma))
+                        binary.LittleEndian.PutUint16(buf[off:off+2], newEma)
                         patches++
+                        patchedAlgs = append(patchedAlgs, alg)
                 }
 
                 if patches == 0 {
                         continue
                 }
 
-                // Write the modified buffer back to the BPF map.
+                // C1 race fix — mirrors writebackStreaks lines 801-829.
+                // Re-lookup immediately before writeback and compare seq.
+                // BPF bumps seq around every rate_ema/sockets_*/swap_score
+                // update. If seq changed, kernel updated mid-cycle — skip.
+                freshBuf, err := mapLookupBytes(mapID, keyArgs)
+                if err != nil || len(freshBuf) != sizeofRemoteHost {
+                        continue
+                }
+                origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
+                freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
+                if origSeq != freshSeq {
+                        continue
+                }
+                // Copy ONLY our 2-byte rate_ema patches into the fresh buffer.
+                for _, alg := range patchedAlgs {
+                        off := offMetricsArray + alg*sizeofTCPConnMetric + offMetricRateEma
+                        if off+2 > len(freshBuf) || off+2 > len(buf) {
+                                continue
+                        }
+                        freshBuf[off] = buf[off]
+                        freshBuf[off+1] = buf[off+1]
+                }
+                buf = freshBuf
+
                 if mapUpdateBytes(mapID, keyArgs, buf) {
                         totalHosts++
                         totalSlots += patches
-                        // Log which algs got patched (for debugging).
-                        algList := make([]int, 0, patches)
-                        for alg := range algRates {
-                                algList = append(algList, alg)
-                        }
-                        sort.Ints(algList)
-                        fmt.Fprintf(os.Stderr, "[rate_ema_wb] %s: patched %d alg slot(s) from proofs\n", host, patches)
+                        sort.Ints(patchedAlgs)
+                        fmt.Fprintf(os.Stderr, "[rate_ema_wb] %s: EMA-updated %d alg slot(s) from proofs\n", host, patches)
                 }
         }
 
