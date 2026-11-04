@@ -103,7 +103,7 @@ func (c *Collector) collect() {
                         // v0.9.118: backfill rate_ema from proof events for
                         // short-lived sockets (cloudflared/Cloudflare) where
                         // srate never fires. Only writes when rate_ema == 0.
-                        c.writebackRateEmaFromProofs(pl.parsedProofs, cdest)
+                        c.writebackRateEmaFromProofs(pl.parsedProofs, cdest, pl.CookieAlg)
                 }()
         }
         doc["recent_swaps"] = topSwaps

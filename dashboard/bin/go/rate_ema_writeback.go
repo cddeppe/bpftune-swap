@@ -115,7 +115,7 @@ func destStringsToIP(v4, v6, v6b string) string {
 // for any (dest, alg) entry that currently has rate_ema == 0.
 //
 // Returns (hostsPatched, slotsPatched) for logging.
-func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[string]cdestEntry) (int, int) {
+func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[string]cdestEntry, cookieAlg map[string]int) (int, int) {
         // TryLock: if streak writeback is still running, skip this cycle.
         if !writebackMu.TryLock() {
                 fmt.Fprintf(os.Stderr, "[rate_ema_wb] skipped (writeback mutex busy)\n")
@@ -138,6 +138,7 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
         }
         bestRateByPair := map[proofKey]int64{}
         skippedNoDest := 0
+        skippedNoMask := 0
         for _, pp := range proofs {
                 // Resolve raw dest IP directly from v4/v6/v6b decimal-u32 fields,
                 // mirroring swapDestToIP. Do NOT use destStr() — that returns display
@@ -154,9 +155,26 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                 }
                 host := maskedIP(rawDest)
                 if host == "" {
+                        skippedNoMask++
                         continue
                 }
-                k := proofKey{host: host, alg: pp.alg}
+                // v0.9.123: apply cookie→alg rewrite, same as GetProofRows
+                // (singlepass.go:568-572). parsedProof.alg is stored RAW;
+                // sockets swapped away from cubic (alg=0) still log alg=0 in
+                // the proof line. Without this rewrite, their proofs get
+                // attributed to cubic's slot — wrong metric index.
+                // v0.9.123: apply cookie→alg rewrite, same as GetProofRows
+                // (singlepass.go:568-572). parsedProof.alg is stored RAW;
+                // sockets swapped away from cubic (alg=0) still log alg=0 in
+                // the proof line. Without this rewrite, their proofs get
+                // attributed to cubic's slot — wrong metric index.
+                alg := pp.alg
+                if alg == 0 {
+                        if realAlg, ok := cookieAlg[pp.cookie]; ok && realAlg != 0 {
+                                alg = realAlg
+                        }
+                }
+                k := proofKey{host: host, alg: alg}
                 if pp.rate > bestRateByPair[k] {
                         bestRateByPair[k] = pp.rate
                 }
@@ -164,9 +182,9 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
         // v0.9.121: unconditional summary log every cycle (same pattern as
         // writebackStreaks). This makes the function's behavior observable
         // without needing separate diagnostics.
-        skippedNoMask := len(proofs) - skippedNoDest - len(bestRateByPair)
-        fmt.Fprintf(os.Stderr, "[rate_ema_wb] processed %d proofs: %d resolved, %d no-dest, %d no-mask, %d (host,alg) pairs\n",
-                len(proofs), len(bestRateByPair), skippedNoDest, skippedNoMask, len(bestRateByPair))
+        duplicates := len(proofs) - skippedNoDest - skippedNoMask - len(bestRateByPair)
+        fmt.Fprintf(os.Stderr, "[rate_ema_wb] processed %d proofs: %d resolved, %d no-dest, %d no-mask, %d dup, %d (host,alg) pairs\n",
+                len(proofs), len(bestRateByPair), skippedNoDest, skippedNoMask, duplicates, len(bestRateByPair))
         if len(bestRateByPair) == 0 {
                 return 0, 0
         }
