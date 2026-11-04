@@ -157,9 +157,12 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                         bestRateByPair[k] = pp.rate
                 }
         }
-        if skippedNoDest > 0 {
-                fmt.Fprintf(os.Stderr, "[rate_ema_wb] %d proofs skipped (no dest)\n", skippedNoDest)
-        }
+        // v0.9.121: unconditional summary log every cycle (same pattern as
+        // writebackStreaks). This makes the function's behavior observable
+        // without needing separate diagnostics.
+        skippedNoMask := len(proofs) - skippedNoDest - len(bestRateByPair)
+        fmt.Fprintf(os.Stderr, "[rate_ema_wb] processed %d proofs: %d resolved, %d no-dest, %d no-mask, %d (host,alg) pairs\n",
+                len(proofs), len(bestRateByPair), skippedNoDest, skippedNoMask, len(bestRateByPair))
         if len(bestRateByPair) == 0 {
                 return 0, 0
         }
@@ -183,6 +186,7 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                 // Lookup current BPF map value (one syscall per host).
                 buf, err := mapLookupBytes(mapID, keyArgs)
                 if err != nil {
+                        fmt.Fprintf(os.Stderr, "[rate_ema_wb] %s: map lookup failed: %v\n", host, err)
                         continue
                 }
                 if buf == nil || len(buf) != sizeofRemoteHost {
@@ -238,8 +242,7 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                 }
         }
 
-        if totalSlots > 0 {
-                fmt.Fprintf(os.Stderr, "[rate_ema_wb] wrote rate_ema for %d alg slot(s) across %d host(s)\n", totalSlots, totalHosts)
-        }
+        // v0.9.121: always log summary, even when 0 slots patched.
+        fmt.Fprintf(os.Stderr, "[rate_ema_wb] done: %d host(s), %d slot(s) patched (of %d candidates)\n", totalHosts, totalSlots, len(hostsByPair))
         return totalHosts, totalSlots
 }
