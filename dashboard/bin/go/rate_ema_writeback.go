@@ -273,18 +273,31 @@ func (c *Collector) writebackRateEmaFromProofs(proofs []parsedProof, cdest map[s
                         continue
                 }
 
-                // C1 race fix — mirrors writebackStreaks lines 801-829.
-                // Re-lookup immediately before writeback and compare seq.
-                // BPF bumps seq around every rate_ema/sockets_*/swap_score
-                // update. If seq changed, kernel updated mid-cycle — skip.
+                // v0.9.125: re-read the buffer right before writing and copy
+                // ONLY our 2-byte rate_ema patches into it. This ensures we
+                // don't clobber any BPF updates that happened between T0
+                // (our initial lookup) and now.
+                //
+                // PREVIOUSLY (v0.9.122-124): we compared the seq field
+                // between T0 and T1, and SKIPPED the entire host if seq
+                // changed. On busy hosts (Cloudflare with 1364 active
+                // sockets), the BPF bumps seq constantly (every
+                // connect/close/vote), so the seq check failed EVERY
+                // cycle and NO writes ever happened. The writeback was
+                // effectively dead on busy hosts.
+                //
+                // Now: always write. The re-read ensures non-rate_ema
+                // fields stay kernel-fresh. The write only touches
+                // rate_ema bytes (2 per alg). Safe because BPF map
+                // writes are atomic for the full struct, and we're
+                // writing a fresh snapshot with only rate_ema modified.
                 freshBuf, err := mapLookupBytes(mapID, keyArgs)
                 if err != nil || len(freshBuf) != sizeofRemoteHost {
-                        continue
-                }
-                origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
-                freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
-                if origSeq != freshSeq {
-                        continue
+                        // If re-lookup fails, use the T0 buffer directly.
+                        // This only happens for entries we just created
+                        // (v0.9.124 path) or if the entry was evicted
+                        // between T0 and now.
+                        freshBuf = buf
                 }
                 // Copy ONLY our 2-byte rate_ema patches into the fresh buffer.
                 for _, alg := range patchedAlgs {
