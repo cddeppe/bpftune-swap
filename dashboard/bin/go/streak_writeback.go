@@ -316,6 +316,105 @@ func maskedIP(s string) string {
 	return ip.String()
 }
 
+// ============================================================================
+// Alias canonicalization for writeback keys (bucket fix, on top of v0.9.116)
+// ============================================================================
+
+// aliasCanonicalHolder caches {from_ip → to_ip} parsed from
+// /etc/bpftune/aliases (mtime-cached, same 30s stat discipline as the
+// other holders in bucketing.go).
+//
+// NOTE: mtimeCache.get() calls markLabelsChanged() after each load. For
+// the aliases file this is benign: markLabelsChanged() only sets
+// staticFilesDirty when /var/lib/bpftune/aliases.labels.json's mtime has
+// actually changed, which is exactly when invalidation is wanted anyway.
+var aliasCanonicalHolder mtimeCache
+
+// loadAliasCanonicalMap parses /etc/bpftune/aliases lines of the form
+//
+//	FROM_IP = TO_IP [label]
+//
+// into {normalized FROM → normalized TO}. Keys are exact IPs — this
+// mirrors the running daemon's dest_alias_map (BPF_MAP_TYPE_HASH, exact
+// in6_addr keys, loaded from the same file at daemon start). Lines with
+// unparseable addresses are skipped. If the file is missing or empty,
+// returns an empty map (writeback then behaves exactly like v0.9.116).
+func loadAliasCanonicalMap() map[string]string {
+	return aliasCanonicalHolder.get(aliasesFile, func(data []byte) map[string]string {
+		out := map[string]string{}
+		for _, raw := range strings.Split(string(data), "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			from := strings.TrimSpace(parts[0])
+			fields := strings.Fields(strings.TrimSpace(parts[1]))
+			if len(fields) == 0 {
+				continue
+			}
+			to := fields[0]
+			fi := net.ParseIP(from)
+			if fi == nil {
+				continue
+			}
+			ti := net.ParseIP(to)
+			if ti == nil {
+				continue
+			}
+			out[fi.String()] = ti.String()
+		}
+		return out
+	})
+}
+
+// canonicalWritebackHost maps a raw destination IP to the SAME canonical
+// bucket key the running C daemon derives at key time:
+//
+//  1. exact alias lookup on the raw IP      → hit: use the alias target
+//  2. else mask (v4 /maskBitsV4, v6 /maskBitsV6)
+//  3. alias lookup on the MASKED key       → hit: use the alias target
+//  4. else the masked key
+//
+// Returns (host, foldKind) where foldKind is "raw" (step 1), "masked"
+// (step 3) or "" (no fold). The returned host string is KEY-READY: it
+// must be passed to keyArgsForExact, NOT to keyArgsFor (which would
+// re-mask an alias target and break /32 canonical keys).
+//
+// Before the bucket fix, writeback only did step 2 — so streak
+// corrections for operator-folded destinations (e.g. Cloudflare edges
+// folded via /etc/bpftune/aliases) were patched into a masked key that
+// the daemon never grouped under, and the corrections were lost.
+func canonicalWritebackHost(rawDest string) (string, string) {
+	ip := net.ParseIP(rawDest)
+	if ip == nil {
+		return "", ""
+	}
+	aliases := loadAliasCanonicalMap()
+	if len(aliases) > 0 {
+		if to, ok := aliases[ip.String()]; ok && to != "" {
+			if ti := net.ParseIP(to); ti != nil {
+				return ti.String(), "raw"
+			}
+		}
+	}
+	masked := maskedIP(rawDest)
+	if masked == "" {
+		return "", ""
+	}
+	if len(aliases) > 0 {
+		if to, ok := aliases[masked]; ok && to != "" {
+			if ti := net.ParseIP(to); ti != nil {
+				return ti.String(), "masked"
+			}
+		}
+	}
+	return masked, ""
+}
+
 // keyArgsFor builds the 16-byte BPF key as a slice of hex strings.
 // For v4: 10 zero bytes + 2 0xff bytes + 4 v4 bytes.
 // For v6: 16 v6 bytes (no v4-mapped prefix).
@@ -343,6 +442,36 @@ func keyArgsFor(ipStr string) []string {
 			v6 = v6.Mask(mask)
 		}
 		raw = v6
+	}
+	args := make([]string, 16)
+	for i, b := range raw {
+		args[i] = fmt.Sprintf("%02x", b)
+	}
+	return args
+}
+
+// keyArgsForExact builds the 16-byte BPF key from an ALREADY-CANONICAL
+// host string WITHOUT applying the prefix mask. Used by the writeback
+// after canonicalWritebackHost: the mask path returns an already-masked
+// address (re-masking would be a no-op but is still wrong for /32 v4
+// masks), and an alias target is used verbatim as the bucket key by the
+// daemon, so it must never be re-masked here.
+// For v4: 10 zero bytes + 2 0xff bytes + 4 v4 bytes.
+// For v6: 16 v6 bytes (no v4-mapped prefix).
+// Returns nil if the IP is invalid.
+func keyArgsForExact(ipStr string) []string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return nil
+	}
+	var raw []byte
+	if v4 := ip.To4(); v4 != nil {
+		raw = make([]byte, 16)
+		raw[10] = 0xff
+		raw[11] = 0xff
+		copy(raw[12:16], v4)
+	} else {
+		raw = ip.To16()
 	}
 	args := make([]string, 16)
 	for i, b := range raw {
@@ -688,20 +817,27 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	}
 	detectMask(mapID)
 
-	// Pre-compute masked host + both outcomes for each swap.
+	// Pre-compute canonical host + both outcomes for each swap.
 	// Filter to swaps that have at least one outcome (immediate OR sustained).
 	// Mirrors Python: new_swaps = [s for s in swaps if s.get('outcome_sustained') or s.get('outcome')]
 	var rows []wbRow
 	skippedNoDest := 0
+	foldsRaw, foldsMasked := 0, 0
 	for _, sw := range swaps {
 		rawDest := swapDestToIP(sw)
 		if rawDest == "" {
 			skippedNoDest++
 			continue
 		}
-		h := maskedIP(rawDest)
+		h, foldKind := canonicalWritebackHost(rawDest)
 		if h == "" {
 			continue
+		}
+		switch foldKind {
+		case "raw":
+			foldsRaw++
+		case "masked":
+			foldsMasked++
 		}
 		o := outcomeComposite(met, sw.Cookie, sw.Ts)
 		o3 := outcomeSustained(srate, sw.Cookie, sw.Ts)
@@ -719,6 +855,9 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	if skippedNoDest > 0 {
 		fmt.Fprintf(os.Stderr, "[writeback] %d swaps skipped (no remote_host)\n", skippedNoDest)
 	}
+	if foldsRaw > 0 || foldsMasked > 0 {
+		fmt.Fprintf(os.Stderr, "[writeback] alias fold: %d raw + %d masked hits this cycle\n", foldsRaw, foldsMasked)
+	}
 	if len(rows) == 0 {
 		return 0, 0
 	}
@@ -731,7 +870,10 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 
 	totalHosts, totalSlots := 0, 0
 	for host, hostRows := range byHost {
-		keyArgs := keyArgsFor(host)
+		// host is key-ready (already aliased and/or masked) — see
+		// canonicalWritebackHost. Use the exact builder so alias
+		// targets are not re-masked.
+		keyArgs := keyArgsForExact(host)
 		if keyArgs == nil {
 			continue
 		}
