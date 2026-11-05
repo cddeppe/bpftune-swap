@@ -508,8 +508,19 @@ func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
 		fmt.Fprintf(os.Stderr, "sqlite: insert failed: %v\n", err)
 		return
 	}
-	// Record hashes only after successful INSERT
+	// Record hashes only after successful INSERT.
+	// v0.9.116 fix: nil-guard — writeBucketSQLite can run before
+	// initSQLite() has initialized the dedup maps (unit tests reset them
+	// to nil via resetSQLiteForTest; any future refactor that misses the
+	// sync.Once init would otherwise panic here in production). Reads on
+	// nil maps are safe; writes are not.
 	lastWriteHashMu.Lock()
+	if lastWriteHash == nil {
+		lastWriteHash = make(map[string]uint64, 8)
+	}
+	if lastPreHash == nil {
+		lastPreHash = make(map[string]uint64, 8)
+	}
 	lastWriteHash[h.Addr] = snapHash
 	lastPreHash[h.Addr] = pre
 	lastWriteHashMu.Unlock()
