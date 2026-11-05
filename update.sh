@@ -600,6 +600,27 @@ EOF
     fi
 fi
 
+# ---------- Step 3b: logrotate for the trace log (idempotent) ----------
+# v0.9.126 fix: install.sh now ships this, but hosts installed before that
+# never got it — /var/log/bpftune-met-live.log grows unbounded (a new line
+# per decision event with bpf_debug=1). Always (re)write; identical content
+# to install.sh so the two never diverge. copytruncate because the trace
+# service keeps appending to the same path.
+step "3b. Logrotate for the trace log"
+cat > /etc/logrotate.d/bpftune-dashboard <<'EOF'
+# managed by bpftune update.sh — trace_pipe capture log
+/var/log/bpftune-met-live.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+chmod 644 /etc/logrotate.d/bpftune-dashboard
+ok "logrotate configured for bpftune-met-live.log (weekly, 4 rotations)"
+
 # ---------- Step 4: Remove stale GODEBUG=madvdontneed (v0.9.107) ----------
 # v0.9.105 added GODEBUG=madvdontneed=1 to the service file. This caused
 # CPU spikes every few seconds (Go's background scavenger works harder with

@@ -147,7 +147,12 @@ for r in releases:
     ver = tuple(int(x) for x in m.group(1).split('.'))
     for a in r.get('assets', []):
         name = a.get('name', '')
-        if 'bpftune_' in name and '${ARCH}' in name and name.endswith('.deb'):
+        # v0.9.126 fix: accept BOTH asset namings — the underscore form
+        # (bpftune_0.4.106_amd64.deb, current) and the hyphen form
+        # (bpftune-custom-0.4.105-amd64.deb, used by v0.4.105 assets).
+        # update.sh already matches both; install.sh did not, so a fresh
+        # install could not fall back to a bpftune-custom-* release asset.
+        if ('bpftune_' in name or 'bpftune-custom-' in name) and '${ARCH}' in name and name.endswith('.deb'):
             candidates.append((ver, a.get('browser_download_url', '')))
             break
 if not candidates:
@@ -477,6 +482,26 @@ EOF
 EOF
     chmod 644 /etc/cron.d/bpftune-state-backup
     ok "state backup cron configured (3am daily)"
+
+    # --- 3i-b. Logrotate for the trace log (unbounded-growth guard) ---
+    # v0.9.126 fix: /var/log/bpftune-met-live.log grows unbounded — the trace
+    # service appends continuously, and with bpf_debug=1 (the install default)
+    # it receives every decision event. The legacy install.py shipped a
+    # logrotate config; install.sh never did. copytruncate because the trace
+    # service keeps appending to the same path.
+    cat > /etc/logrotate.d/bpftune-dashboard <<'EOF'
+# managed by bpftune install.sh — trace_pipe capture log
+/var/log/bpftune-met-live.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    chmod 644 /etc/logrotate.d/bpftune-dashboard
+    ok "logrotate configured for bpftune-met-live.log (weekly, 4 rotations)"
 
     # --- 3j. Start Go collector + verify ---
     mkdir -p "$SERVED/data"
