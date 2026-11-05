@@ -20,6 +20,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -76,6 +77,12 @@ var (
 	maskCacheTTL  = 30 * time.Minute
 	cachedMapID   = -1
 )
+
+// v0.9.126 fix: the daemon pins tuner_config_map at
+// /sys/fs/bpf/bpftune/tcp_conn/explore (src/tcp_conn_tuner.c EXPLORE_PIN_DIR,
+// since 0.4.64). Older dashboard code probed /sys/fs/bpftune/... — never this
+// daemon's pin location — kept as a legacy fallback for forks only.
+// (Constants live in config_handler.go: tunerConfigPinMain/Legacy.)
 
 // prefixFields is the ordered list of u64 fields at the start of the
 // remote_host value (offsets 0..111).  Used to re-serialize the JSON
@@ -143,6 +150,37 @@ func resolveRemoteHostMapID() (int, error) {
 // v0.9.36: cached for 30 min — the mask only changes when prefix4/prefix6
 // tunables change. Was doing a full `bpftool map dump` every 2 min.
 func detectMask(mapID int) {
+	// v0.9.126 fix: PRIMARY source = the daemon's actual prefix4/prefix6,
+	// read live from the pinned tuner_config_map (slots 1 and 2, live
+	// since 0.4.79). The key-scan inference below cannot distinguish a
+	// prefix-masked bucket key from an ALIAS TARGET stored verbatim by
+	// the daemon (bucket_key_alias_or_prefix: *key = *a), so on hosts
+	// with operator-folded aliases (e.g. 104.16.9.9 as a Cloudflare fold
+	// target) it inferred /32 — and every streak correction then missed
+	// its bucket key. Reading the map is 2 syscalls; no caching needed.
+	if v4, ok4 := readTunerConfigSlot(1); ok4 && v4 >= 1 && v4 <= 32 {
+		if v6, ok6 := readTunerConfigSlot(2); ok6 && v6 >= 1 && v6 <= 128 {
+			if int(v4) != maskBitsV4 {
+				maskBitsV4 = int(v4)
+				if int(v4) != lastMaskV4 {
+					lastMaskV4 = int(v4)
+					fmt.Fprintf(os.Stderr, "[writeback] /%d v4 mask (from tuner_config_map slot 1)\n", v4)
+				}
+			}
+			if int(v6) != maskBitsV6 {
+				maskBitsV6 = int(v6)
+				if int(v6) != lastMaskV6 {
+					lastMaskV6 = int(v6)
+					fmt.Fprintf(os.Stderr, "[writeback] /%d v6 mask (from tuner_config_map slot 2)\n", v6)
+				}
+			}
+			return
+		}
+	}
+
+	// Fallback (pin unavailable — older tuner, bpffs not mounted):
+	// cached key-scan inference. v0.9.126 fix: alias-target keys are
+	// excluded from the scan (see excludeAliasTargetKeys).
 	maskCacheMu.Lock()
 	if mapID == cachedMapID && time.Since(maskCacheAt) < maskCacheTTL {
 		maskCacheMu.Unlock()
@@ -158,13 +196,75 @@ func detectMask(mapID int) {
 	maskCacheMu.Unlock()
 }
 
+// readTunerConfigSlot reads tuner_config_map[slot] (BPF_MAP_TYPE_ARRAY,
+// __u32 key, __u32 value) from the daemon's pinned map. Returns (value, true)
+// on success. Tries the real pin path first, then the legacy dashboard path.
+func readTunerConfigSlot(slot uint32) (uint32, bool) {
+	for _, pin := range []string{tunerConfigPinMain, tunerConfigPinLegacy} {
+		fd, err := bpfOpenPinnedMap(pin)
+		if err != nil {
+			continue
+		}
+		key := make([]byte, 4)
+		binary.LittleEndian.PutUint32(key, slot)
+		val := make([]byte, 4)
+		err = bpfMapLookupElem(fd, key, val)
+		unix.Close(fd)
+		if err == nil {
+			return binary.LittleEndian.Uint32(val), true
+		}
+	}
+	return 0, false
+}
+
+// excludeAliasTargetKeys drops keys that are alias TARGETS. The daemon
+// stores alias targets verbatim in remote_host_map, so they are unaligned
+// by construction and poison the trailing-zero inference (v0.9.126 fix).
+// v4 keys are 4-byte slices, v6 keys are 16-byte slices (see detectMaskSyscall).
+// The alias map is passed in (not loaded here) so the exclusion is unit-testable
+// and loaded once per detection pass.
+func excludeAliasTargetKeys(keys [][]byte, v6 bool, aliases map[string]string) [][]byte {
+	if len(aliases) == 0 || len(keys) == 0 {
+		return keys
+	}
+	targets := make(map[string]bool, len(aliases))
+	for _, to := range aliases {
+		targets[to] = true
+	}
+	out := make([][]byte, 0, len(keys))
+	for _, k := range keys {
+		var ip net.IP
+		if v6 {
+			if len(k) != 16 {
+				out = append(out, k)
+				continue
+			}
+			ip = net.IP(append([]byte(nil), k...))
+		} else {
+			if len(k) != 4 {
+				out = append(out, k)
+				continue
+			}
+			ip = net.IPv4(k[0], k[1], k[2], k[3])
+		}
+		if !targets[ip.String()] {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // detectMaskUncached does the actual mask detection.
 // v0.9.86: uses BPF_MAP_GET_NEXT_KEY to iterate keys via raw syscall
 // (no bpftool fork). Falls back to bpftool dump if the syscall path fails.
 func detectMaskUncached(mapID int) {
 	// v0.9.86: try raw syscall path first.
 	if v4Keys, v6Keys, ok := detectMaskSyscall(mapID); ok {
-		applyMaskDetection(v4Keys, v6Keys)
+		// v0.9.126 fix: alias targets are stored verbatim by the
+		// daemon and must not feed the mask inference.
+		aliases := loadAliasCanonicalMap()
+		applyMaskDetection(excludeAliasTargetKeys(v4Keys, false, aliases),
+			excludeAliasTargetKeys(v6Keys, true, aliases))
 		return
 	}
 
@@ -205,7 +305,8 @@ func detectMaskUncached(mapID int) {
 			v6 = append(v6, b)
 		}
 	}
-	applyMaskDetection(v4, v6)
+	applyMaskDetection(excludeAliasTargetKeys(v4, false, loadAliasCanonicalMap()),
+		excludeAliasTargetKeys(v6, true, loadAliasCanonicalMap()))
 }
 
 // detectMaskSyscall iterates BPF map keys via raw syscall and separates
@@ -619,14 +720,32 @@ func mapLookupBytesSyscall(mapID int, keyArgs []string) ([]byte, error) {
 
 	// Read the map entry via raw syscall.
 	if err := bpfMapLookupElem(fd, key, value); err != nil {
-		// If the FD is stale (EBADF), invalidate the cache so the next
-		// call re-resolves the FD.
-		if err == unix.EBADF {
-			cachedMapFD = -1
+		// If the FD is stale (EBADF), invalidate the caches so the next
+		// call re-resolves the FD and the map ID. v0.9.126 fix:
+		// bpfMapLookupElem wraps the errno with %w, so the old
+		// `err == unix.EBADF` was ALWAYS FALSE — after a tuner
+		// restart the cached FD stayed EBADF forever and every
+		// writeback forked bpftool per host per cycle. errors.Is
+		// unwraps correctly.
+		if errors.Is(err, unix.EBADF) {
+			invalidateMapCaches()
 		}
 		return nil, err
 	}
 	return value, nil
+}
+
+// invalidateMapCaches drops the cached map FD and the cached map ID after
+// an EBADF: the map was destroyed (tuner reload/restart) and both caches
+// may point at the dead object. The next writeback cycle re-resolves the
+// ID via `bpftool map show`. (v0.9.126 fix — the map-ID cache previously
+// kept pointing at the dead map for up to 5 minutes.)
+func invalidateMapCaches() {
+	cachedMapFD = -1
+	maskCacheMu.Lock()
+	cachedMapID = -1
+	mapIDCacheAt = time.Time{}
+	maskCacheMu.Unlock()
 }
 
 // getMapFD resolves a BPF map ID to a file descriptor, with caching.
@@ -692,8 +811,9 @@ func mapUpdateBytesSyscall(mapID int, keyArgs []string, buf []byte) bool {
 		return false
 	}
 	if err := bpfMapUpdateElem(fd, key, buf, 0); err != nil {
-		if err == unix.EBADF {
-			cachedMapFD = -1 // invalidate stale FD
+		// v0.9.126 fix: errors.Is — see mapLookupBytesSyscall.
+		if errors.Is(err, unix.EBADF) {
+			invalidateMapCaches()
 		}
 		return false
 	}
@@ -953,9 +1073,8 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 		}
 		origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
 		freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
-		if origSeq != freshSeq {
-			fmt.Fprintf(os.Stderr, "[writeback] %s seq changed (%d → %d); kernel updated mid-cycle, skip\n",
-				host, origSeq, freshSeq)
+		if skip, why := writebackSeqCheck(origSeq, freshSeq); skip {
+			fmt.Fprintf(os.Stderr, "[writeback] %s %s; skip\n", host, why)
 			continue
 		}
 		// Copy our 2-byte streak patches into the fresh buffer so we don't
@@ -983,4 +1102,21 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 			totalHosts, totalSlots, len(rows))
 	}
 	return totalHosts, totalSlots
+}
+
+// writebackSeqCheck decides whether the C1 re-lookup must abort the
+// writeback for this host. v0.9.126 fix: adds the odd-seq torn-read guard —
+// the kernel seq-wraps every multi-field update (__sync_fetch_and_add(&seq,1)
+// before AND after), so an odd freshSeq means the re-lookup landed mid-update
+// and freshBuf is torn. The daemon's own userspace readers skip on odd seq
+// (tcp_conn_tuner.c, "BPF mid-update"); the writeback must too, or we graft
+// the 2 patch bytes onto a torn buffer and persist it. Returns (skip, reason).
+func writebackSeqCheck(origSeq, freshSeq uint64) (bool, string) {
+	if origSeq != freshSeq {
+		return true, fmt.Sprintf("seq changed (%d → %d); kernel updated mid-cycle", origSeq, freshSeq)
+	}
+	if freshSeq&1 == 1 {
+		return true, fmt.Sprintf("seq %d odd (kernel mid-update; torn read)", freshSeq)
+	}
+	return false, ""
 }
