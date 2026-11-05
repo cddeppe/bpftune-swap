@@ -229,9 +229,19 @@ if [ "$DASHBOARD" = 1 ]; then
     # --- 3a. git clone or update (for frontend files + Go source) ---
     if [ -d /root/bpftune/.git ]; then
         cd /root/bpftune
+        # Force-push-safe sync (matches update.sh). `git pull --rebase`
+        # dies when origin/dashboard was force-pushed, aborting the whole
+        # install under `set -e`; fetch + reset always converges.
+        # Also heal a rebase/merge left mid-flight by the old pull.
         git fetch origin --prune
+        git rebase --abort 2>/dev/null || true
+        git merge --abort 2>/dev/null || true
+        if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+            warn "local changes in /root/bpftune - stashing before reset"
+            git stash 2>/dev/null || true
+        fi
         git checkout dashboard 2>/dev/null || git checkout -B dashboard origin/dashboard
-        git pull --rebase --autostash
+        git reset --hard origin/dashboard
         ok "git checkout updated (branch: dashboard)"
     else
         printf "  cloning dashboard branch (depth 1, minimal history)...\n"
@@ -251,7 +261,10 @@ if [ "$DASHBOARD" = 1 ]; then
     systemctl stop bpftune-collector-go 2>/dev/null || true
     sleep 1
 
-    # Try to download pre-built binary from GitHub Releases
+    # Try to download pre-built binary from GitHub Releases.
+    # v0.9.116 fix: verify the download is a real ELF binary before
+    # installing it (same gate update.sh uses) — a truncated/corrupted
+    # download used to be installed as-is, leaving a dead service.
     DASH_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null \
         | python3 -c "
 import json, sys, re
@@ -278,22 +291,40 @@ print(candidates[0][1])
     if [ -n "$DASH_TAG" ]; then
         BIN_URL="https://github.com/${REPO}/releases/download/${DASH_TAG}/bpftune-dashboard-${ARCH}"
     fi
+    BIN_OK=0
     if [ -n "${BIN_URL:-}" ] && curl -fsSL "${BIN_URL:-}" -o /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null; then
-        cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
-        chmod +x "$GO_BIN"
-        ok "downloaded Go binary from GitHub Releases ($ARCH, tag $DASH_TAG)"
-    elif [ -f "$BACKUP_DIR/bpftune-dashboard-$ARCH" ]; then
+        DL_SIZE=$(stat -c %s /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null || echo 0)
+        DL_MAGIC=$(head -c 4 /tmp/bpftune-dashboard-"$ARCH" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        if [ "$DL_SIZE" -lt 1000000 ] || [ "$DL_MAGIC" != "7f454c46" ]; then
+            warn "downloaded dashboard binary invalid (size=${DL_SIZE}, magic=${DL_MAGIC:-none}) — not an ELF >1MB"
+        else
+            cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN"
+            chmod +x "$GO_BIN"
+            ok "downloaded Go binary from GitHub Releases ($ARCH, tag $DASH_TAG)"
+            BIN_OK=1
+        fi
+    fi
+    if [ "$BIN_OK" = 0 ] && [ -f "$BACKUP_DIR/bpftune-dashboard-$ARCH" ]; then
         cp "$BACKUP_DIR/bpftune-dashboard-$ARCH" "$GO_BIN"
         chmod +x "$GO_BIN"
         ok "copied Go binary from $BACKUP_DIR"
-    elif command -v go >/dev/null 2>&1; then
+        BIN_OK=1
+    fi
+    if [ "$BIN_OK" = 0 ] && command -v go >/dev/null 2>&1; then
         printf "  building Go binary from source...\n"
         cd /root/bpftune/dashboard/bin/go
-        CGO_ENABLED=0 go build -ldflags "-X main.dashVersionStr=0.7.5p" -o "$GO_BIN" .
+        # v0.9.116 fix: version string derives from the release tag (was
+        # hardcoded "0.7.5p", which showed a wrong version in the journal
+        # and on the dashboard). Falls back to the git hash like update.sh.
+        DASH_VER="${DASH_TAG#v}"
+        [ -z "$DASH_VER" ] && DASH_VER=$(git rev-parse --short HEAD 2>/dev/null || echo source)
+        CGO_ENABLED=0 go build -ldflags "-X main.dashVersionStr=$DASH_VER" -o "$GO_BIN" .
         chmod +x "$GO_BIN"
-        ok "built Go binary from source"
+        ok "built Go binary from source (version $DASH_VER)"
+        BIN_OK=1
         cd /root/bpftune
-    else
+    fi
+    if [ "$BIN_OK" = 0 ]; then
         fail "Could not get Go binary. Options:
    (a) Create a GitHub release with bpftune-dashboard-{amd64,arm64} assets
    (b) Install Go: apt-get install -y golang-go && re-run install.sh
@@ -310,6 +341,11 @@ print(candidates[0][1])
     cp dashboard/bin/dashboard.js dashboard/bin/dashboard.css "$DASH_BIN"/ 2>/dev/null || true
     cp /root/bpftune/dashboard/bin/index.html "$DASH_BIN"/ 2>/dev/null || true
     cp /root/bpftune/dashboard/bin/labels-api.py "$DASH_BIN"/ 2>/dev/null || true
+    # v0.9.116 fix: chart.js libs were never copied to $DASH_BIN on fresh
+    # installs, so the SERVED copies below silently failed and the dashboard
+    # rendered without charts until the first update.sh run.
+    cp /root/bpftune/dashboard/bin/chart.umd.min.js "$DASH_BIN"/ 2>/dev/null || true
+    cp /root/bpftune/dashboard/bin/chartjs-adapter-date-fns.bundle.min.js "$DASH_BIN"/ 2>/dev/null || true
     # ALSO copy to histDir where the HTTP handler actually looks for index.html
     cp "$DASH_BIN"/index.html "$SERVED"/ 2>/dev/null || true
     cp "$DASH_BIN"/dashboard.js "$DASH_BIN"/dashboard.css "$SERVED"/ 2>/dev/null || true
@@ -375,7 +411,10 @@ Wants=bpftune.service
 Type=simple
 WorkingDirectory=$DASH_BIN
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
-Environment=GODEBUG=madvdontneed=1  # v0.9.105: return freed pages to OS immediately
+# v0.9.107: the GODEBUG madvdontneed=1 line is intentionally ABSENT here:
+# it made Go's background scavenger cause periodic CPU spikes, and
+# update.sh Step 4 strips it from existing service files — a fresh
+# install must not re-add it.
 ExecStart=$DASH_BIN/bpftune-collector-go --port 8080 --bind 0.0.0.0
 Restart=always
 RestartSec=5
