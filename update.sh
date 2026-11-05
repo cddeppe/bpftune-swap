@@ -361,8 +361,13 @@ print(candidates[0][1])
                 # when the running binary has an open file handle.
                 systemctl stop bpftune-collector-go 2>/dev/null || true
                 sleep 2
-                # Save old MD5 for post-install verification
-                OLD_MD5=$(md5sum "$GO_BIN" 2>/dev/null | awk '{print $1}')
+                # Save old MD5 for post-install verification.
+                # v0.9.116 fix: on hosts where the collector binary does not
+                # exist yet, md5sum fails and -- with pipefail + set -e --
+                # aborted the whole update at this line. Tolerate a missing
+                # binary (OLD_MD5 stays empty, verification still compares
+                # the new copy against the download).
+                OLD_MD5=$(md5sum "$GO_BIN" 2>/dev/null | awk '{print $1}') || OLD_MD5=""
                 # Copy and verify
                 if cp /tmp/bpftune-dashboard-"$ARCH" "$GO_BIN" && chmod +x "$GO_BIN"; then
                     NEW_MD5=$(md5sum "$GO_BIN" 2>/dev/null | awk '{print $1}')
@@ -401,7 +406,11 @@ print(candidates[0][1])
     # exact source behind the release. Falls back to the branch checkout
     # when no tag resolved. The version string now derives from the tag
     # (was hardcoded 0.9.104).
-    if [ "$BINARY_UPDATED" = "0" ] && [ -d /root/bpftune/.git ] && command -v go >/dev/null 2>&1; then
+    # v0.9.116 fix: also require the Go source dir. A checkout on main
+    # (bootstrap fallback) or a partial checkout has no dashboard/bin/go —
+    # `cd` into it aborted the whole update under `set -e`. Skip to
+    # "keep existing binary" instead.
+    if [ "$BINARY_UPDATED" = "0" ] && [ -d /root/bpftune/.git ] && [ -d /root/bpftune/dashboard/bin/go ] && command -v go >/dev/null 2>&1; then
         printf "  building Go binary from source...\n"
         systemctl stop bpftune-collector-go 2>/dev/null || true
         sleep 2
@@ -460,20 +469,35 @@ print(candidates[0][1])
         chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
         ok "frontend files synced"
     else
-        warn "no local checkout - downloading frontend files from GitHub"
+        # No local checkout: download frontend files from GitHub.
+        # v0.9.116 fix: when the releases API was rate-limited/unavailable,
+        # DASH_TAG was empty and the raw.githubusercontent URL contained
+        # "//" -> every file 404'd while the script still printed
+        # "frontend files downloaded from GitHub". Fall back to the branch
+        # ref, verify each file landed, and only copy non-empty files.
+        FE_REF="${DASH_TAG:-$BRANCH}"
+        warn "no local checkout - downloading frontend files from GitHub ($FE_REF)"
+        FE_OK=0
         for ff in index.html dashboard.js dashboard.css chart.umd.min.js chartjs-adapter-date-fns.bundle.min.js labels-api.py; do
-            curl -fsSL -o "$DASH_BIN/$ff" \
-                "https://raw.githubusercontent.com/${REPO}/${DASH_TAG}/dashboard/bin/$ff" 2>/dev/null || true
+            if curl -fsSL -o "$DASH_BIN/$ff" \
+                "https://raw.githubusercontent.com/${REPO}/${FE_REF}/dashboard/bin/$ff" 2>/dev/null \
+                && [ -s "$DASH_BIN/$ff" ]; then
+                FE_OK=$((FE_OK + 1))
+            else
+                rm -f "$DASH_BIN/$ff" 2>/dev/null || true
+            fi
         done
-        cp "$DASH_BIN"/index.html "$SERVED"/ 2>/dev/null || true
-        cp "$DASH_BIN"/dashboard.js "$SERVED"/ 2>/dev/null || true
-        cp "$DASH_BIN"/dashboard.css "$SERVED"/ 2>/dev/null || true
-        cp "$DASH_BIN"/chart.umd.min.js "$SERVED"/ 2>/dev/null || true
-        cp "$DASH_BIN"/chartjs-adapter-date-fns.bundle.min.js "$SERVED"/ 2>/dev/null || true
+        for ff in index.html dashboard.js dashboard.css chart.umd.min.js chartjs-adapter-date-fns.bundle.min.js; do
+            [ -s "$DASH_BIN/$ff" ] && cp "$DASH_BIN/$ff" "$SERVED"/ 2>/dev/null || true
+        done
         chmod 644 "$SERVED"/*.css "$SERVED"/*.js 2>/dev/null || true
         chmod 644 "$DASH_BIN"/*.css "$DASH_BIN"/*.js 2>/dev/null || true
         chmod 755 "$DASH_BIN"/labels-api.py 2>/dev/null || true
-        ok "frontend files downloaded from GitHub"
+        if [ "$FE_OK" -ge 5 ]; then
+            ok "frontend files downloaded from GitHub ($FE_OK/6)"
+        else
+            warn "frontend download incomplete ($FE_OK/6 files) - dashboard may serve stale/missing files; re-run update.sh later"
+        fi
     fi
 
     # --- 2e. Restart Go collector ---
