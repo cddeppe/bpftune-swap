@@ -183,7 +183,7 @@ func perfMakeLogText(nCycles int) string {
                 sb.WriteString(ts + ": x proof cookie=" + cookie +
                         " alg=1 rate=12500000 tier=2 dest=" + dest + "\n")
                 sb.WriteString(ts + ": x midsamp cookie=" + cookie +
-                        " mid srate=900000 rport=8443\n")
+                        " port=8443 rport=8443 alg=1 thr=4096 segs=10 smin=100 savg=200 srate=900000\n")
                 if i%5 == 0 {
                         sb.WriteString(ts + ": bpf_trace_printk: swap cookie=" + cookie +
                                 " from=0 to=1 bc=3 ac=4 d=2 mt=0 rb=1 dest=" + dest + "\n")
