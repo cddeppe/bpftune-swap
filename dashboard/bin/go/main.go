@@ -882,6 +882,7 @@ func main() {
 		for range ticker.C {
 			ensureTraceBufferSize()
 			syncExplorePctToBPF()
+			syncProofThresholdsToBPF() // v0.9.126 fix: re-apply after tuner restarts
 			ensureTraceCaptureService()
 		}
 	}()

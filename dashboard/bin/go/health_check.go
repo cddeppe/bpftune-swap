@@ -73,6 +73,11 @@ func ensureSystemHealth() {
 	// (5%). This re-applies the saved value.
 	syncExplorePctToBPF()
 
+	// v0.9.126 fix: also re-apply saved proof thresholds (slots 4/5) —
+	// the daemon never initializes them, so tuner restarts would
+	// otherwise silently revert to compiled defaults.
+	syncProofThresholdsToBPF()
+
 	// 3. Ensure the trace capture service is running
 	// v0.9.46: This is the #1 cause of "no swaps in dashboard".
 	// The bpftune-met-trace service reads trace_pipe and writes to
@@ -118,98 +123,113 @@ func ensureTraceBufferSize() {
 	fmt.Fprintf(os.Stderr, "  trace buffer: increased %dKB → %dKB (stops event loss)\n", currentSize, targetSize)
 }
 
-// syncExplorePctToBPF reads the saved explore_pct from
-// /var/lib/bpftune/explore_pct and writes it to the BPF tuner_config_map.
-// This ensures the tuner uses the user's saved setting even after
-// bpftune restarts or the BPF map is reset.
-func syncExplorePctToBPF() {
-	saved := explorePctValue()
-	if saved < 0 || saved > 100 {
-		saved = 5 // default
+// resolveTunerConfigPin returns the first existing tuner_config_map pin
+// path. v0.9.126 fix: the daemon pins at /sys/fs/bpf/bpftune/tcp_conn/explore;
+// the /sys/fs/bpftune/... path used here since v0.9.86 was never this daemon's
+// pin location, so this sync silently failed ("could not read BPF map") and
+// the user's saved explore_pct was NOT re-applied after tuner restarts.
+func resolveTunerConfigPin() string {
+	for _, p := range []string{tunerConfigPinMain, tunerConfigPinLegacy} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
 	}
+	return tunerConfigPinMain // default: report errors against the real path
+}
 
-	// Try to read current BPF map value
-	// The pinned map is at /sys/fs/bpftune/tcp_conn/explore
-	// (pinned by the tuner on startup)
-	pinPath := "/sys/fs/bpftune/tcp_conn/explore"
+// syncConfigSlotToBPF syncs one saved config value into the live
+// tuner_config_map via raw syscall (bpftool fallback), so the tuner keeps
+// the user's setting after bpftune restarts (the daemon re-inits slots from
+// state files, but proof slots 4/5 have no daemon-side init — see
+// syncProofThresholdsToBPF). Returns true if the map was written.
+func syncConfigSlotToBPF(slot uint32, saved int, label string) bool {
+	pinPath := resolveTunerConfigPin()
+	key := make([]byte, 4)
+	binary.LittleEndian.PutUint32(key, slot)
 
-	// v0.9.86: use raw BPF syscall instead of forking bpftool.
-	// The map key is 4 bytes (uint32 = 0), value is 4 bytes (uint32 = explore_pct).
-	var currentPct int = -1
-	fd, err := bpfOpenPinnedMap(pinPath)
-	if err == nil {
-		key := []byte{0, 0, 0, 0}
+	var current int = -1
+	if fd, err := bpfOpenPinnedMap(pinPath); err == nil {
 		value := make([]byte, 4)
 		if err := bpfMapLookupElem(fd, key, value); err == nil {
-			currentPct = int(binary.LittleEndian.Uint32(value))
+			current = int(binary.LittleEndian.Uint32(value))
 		}
 		unix.Close(fd)
 	}
-
-	if currentPct < 0 {
-		// Fall back to bpftool if the syscall path failed
-		out, err := exec.Command("bpftool", "map", "lookup", "pinned", pinPath,
-			"key", "hex", "00 00 00 00").Output()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  explore_pct: could not read BPF map (non-fatal): %v\n", err)
-			return
-		}
-		// Parse current value from bpftool output
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "value:") {
-				parts := strings.SplitN(line, "value:", 2)
-				if len(parts) == 2 {
-					hexStr := strings.TrimSpace(parts[1])
-					hexParts := strings.Fields(hexStr)
-					if len(hexParts) > 0 {
-						hexVal := hexParts[0]
-						hexVal = strings.TrimPrefix(hexVal, "0x")
-						if v, err := strconv.ParseUint(hexVal, 16, 32); err == nil {
-							currentPct = int(v)
-						}
-					}
-				}
-				break
-			}
-		}
-	}
-
-	if currentPct == saved {
-		fmt.Fprintf(os.Stderr, "  explore_pct: BPF map already %d%% (OK)\n", saved)
-		return
+	if current == saved {
+		fmt.Fprintf(os.Stderr, "  %s: BPF map already %d (OK)\n", label, saved)
+		return false
 	}
 
 	// Write saved value to BPF map via raw syscall
 	written := false
-	fd2, err := bpfOpenPinnedMap(pinPath)
-	if err == nil {
-		key := []byte{0, 0, 0, 0}
+	if fd, err := bpfOpenPinnedMap(pinPath); err == nil {
 		value := make([]byte, 4)
 		binary.LittleEndian.PutUint32(value, uint32(saved))
-		if err := bpfMapUpdateElem(fd2, key, value, 0); err == nil {
+		if err := bpfMapUpdateElem(fd, key, value, 0); err == nil {
 			written = true
 		}
-		unix.Close(fd2)
+		unix.Close(fd)
 	}
 	if !written {
 		// Fall back to bpftool
 		hexVal := fmt.Sprintf("%02x %02x %02x %02x",
 			byte(saved), byte(saved>>8), byte(saved>>16), byte(saved>>24))
-		err = exec.Command("bpftool", "map", "update", "pinned", pinPath,
-			"key", "hex", "00 00 00 00",
-			"value", "hex", hexVal).Run()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  explore_pct: WARNING could not sync %d%% to BPF map: %v\n", saved, err)
-			return
+		hexKey := fmt.Sprintf("%02x %02x %02x %02x",
+			byte(slot), byte(slot>>8), byte(slot>>16), byte(slot>>24))
+		if err := exec.Command("bpftool", "map", "update", "pinned", pinPath,
+			"key", "hex", hexKey,
+			"value", "hex", hexVal).Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: WARNING could not sync %d to BPF map: %v\n", label, saved, err)
+			return false
 		}
+		written = true
 	}
-
-	if currentPct >= 0 {
-		fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map %d%% → %d%% (from saved config)\n", currentPct, saved)
+	if current >= 0 {
+		fmt.Fprintf(os.Stderr, "  %s: synced BPF map %d → %d (from saved config)\n", label, current, saved)
 	} else {
-		fmt.Fprintf(os.Stderr, "  explore_pct: synced BPF map → %d%% (from saved config)\n", saved)
+		fmt.Fprintf(os.Stderr, "  %s: synced BPF map → %d (from saved config)\n", label, saved)
 	}
+	return written
+}
+
+// syncExplorePctToBPF reads the saved explore_pct from
+// /var/lib/bpftune/explore_pct and writes it to the BPF tuner_config_map.
+// This ensures the tuner uses the user's saved setting even after
+// bpftune restarts or the BPF map is reset.
+// v0.9.126 fix: correct pin path (see resolveTunerConfigPin) and shared
+// implementation via syncConfigSlotToBPF (behavior otherwise unchanged).
+func syncExplorePctToBPF() {
+	saved := explorePctValue()
+	if saved < 0 || saved > 100 {
+		saved = 5 // default
+	}
+	syncConfigSlotToBPF(0, saved, "explore_pct")
+}
+
+// syncProofThresholdsToBPF re-applies the saved proof thresholds to
+// tuner_config_map slots 4/5 after a bpftune restart. v0.9.126 fix: the
+// daemon (0.4.91+) reads slots 4/5 live (get_proof_good_bps/
+// get_proof_proved_bps) but never initializes them itself — without this
+// sync the compiled defaults (3750000 / 12500000) silently override the
+// user's saved values after every tuner restart.
+func syncProofThresholdsToBPF() {
+	syncConfigSlotToBPF(4, proofGoodBpsValue(), "proof_good_bps")
+	syncConfigSlotToBPF(5, proofProvedBpsValue(), "proof_proved_bps")
+}
+
+// bpfDebugEnabled reports whether the tuner's BPF debug output is on.
+// Authority: tuner_config_map[3] (what the BPF program actually gates on,
+// 0.4.91+), then the /var/lib/bpftune/bpftune_debug state file. Fail-open:
+// if neither can be read, assume ENABLED so a genuinely broken trace path
+// is never masked by a failed probe (historical behavior).
+func bpfDebugEnabled() bool {
+	if v, ok := readTunerConfigSlot(3); ok {
+		return v != 0
+	}
+	if data, err := os.ReadFile("/var/lib/bpftune/bpftune_debug"); err == nil {
+		return strings.TrimSpace(string(data)) != "0"
+	}
+	return true
 }
 
 // checkBPFPrograms verifies that the bpftune BPF programs are loaded.
@@ -353,6 +373,19 @@ func ensureTraceCaptureService() {
 			return
 		}
 
+		// v0.9.126 fix: with bpf_debug=0 the BPF program gates ALL
+		// decision-event bpf_printk output on tuner_config_map[3]
+		// (0.4.91+), so a deliberately silenced tuner produces no new
+		// trace lines and isLogContentStale fires forever. Escalating
+		// then (3 trace restarts → restart bpftune → needs_reboot)
+		// disrupts real connections for a non-problem. Stand down when
+		// tracing was deliberately silenced. Fail-open: unknown debug
+		// state keeps the historical escalation behavior.
+		if !bpfDebugEnabled() {
+			fmt.Fprintf(os.Stderr, "  trace service: log stale but bpf_debug=0 (tracing deliberately silenced) — standing down\n")
+			return
+		}
+
 		// Log content is stale — escalate
 		traceEscalation.mu.Lock()
 		defer traceEscalation.mu.Unlock()
@@ -431,18 +464,23 @@ func ensureTraceCaptureService() {
 // createTraceServiceFile writes the systemd service file for the trace
 // capture service. This service reads trace_pipe and writes to the log
 // file that the collector reads.
+// v0.9.126 fix: emit the SAME unit install.sh/update.sh install — the old
+// variant here (debugfs path /sys/kernel/debug/tracing + bare `cat`, which
+// blocks indefinitely when no BPF events flow, v0.9.104 fixed that in the
+// scripts) resurrected a divergent, blocking unit whenever the service
+// file went missing. /sys/kernel/tracing is the tracefs mount both scripts
+// use; `timeout 1 cat` + touch + sleep 1 matches the v0.9.104 fix.
 func createTraceServiceFile(path string) {
 	const serviceContent = `[Unit]
 Description=bpftune trace_pipe capture to /var/log/bpftune-met-live.log
-After=sys-kernel-debug.mount sys-kernel-tracing.mount bpftune.service
-ConditionPathExists=/sys/kernel/debug/tracing/trace_pipe
+After=bpftune.service
+Wants=bpftune.service
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'while true; do cat /sys/kernel/debug/tracing/trace_pipe >> /var/log/bpftune-met-live.log 2>&1; sleep 0.1; done'
+ExecStart=/bin/sh -c 'while true; do timeout 1 cat /sys/kernel/tracing/trace_pipe >> /var/log/bpftune-met-live.log 2>/dev/null; touch /var/log/bpftune-met-live.log; sleep 1; done'
 Restart=always
 RestartSec=3
-User=root
 
 [Install]
 WantedBy=multi-user.target
