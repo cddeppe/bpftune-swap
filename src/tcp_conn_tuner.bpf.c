@@ -34,12 +34,6 @@ BPF_MAP_DEF(sk_storage_map, BPF_MAP_TYPE_SK_STORAGE, int, struct conn_state, 0, 
 
 BPF_MAP_DEF(midsamp_map, BPF_MAP_TYPE_SK_STORAGE, int, __u64, 0, BPF_F_NO_PREALLOC);
 
-<<<<<<< Updated upstream
-/* 0.4.64: runtime config map.  Currently a single __u32 at key 0:
- * exploration percent for fresh sockets.  Pinned by the userspace
- * daemon so 'bpftune --exp=N' can update it live. */
-BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 1, 0);
-=======
 /* 0.4.64: runtime config map.  Pinned by the userspace daemon so
  * 'bpftune --exp=N', --prefix4=N, --prefix6=N, --bpf-debug=N can
  * update values live without restarting.
@@ -54,7 +48,6 @@ BPF_MAP_DEF(tuner_config_map, BPF_MAP_TYPE_ARRAY, __u32, __u32, 6, 0);
  * one bucket.  Loaded from /etc/bpftune/aliases at daemon start. */
 BPF_MAP_DEF(dest_alias_map, BPF_MAP_TYPE_HASH, struct in6_addr,
             struct in6_addr, 1024, 0);
->>>>>>> Stashed changes
 
 /* per-CPU scratch buffer used to initialize new remote_host entries without
  * placing a >512B struct temporary on the BPF stack (NUM_TCP_CONG_ALGS=16
