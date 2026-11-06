@@ -5,8 +5,10 @@
 # with the operator decision (2026-11-06): the fix bases off v0.4.106 EXACTLY —
 # NOT the unreleased, untagged 0.4.107 (mystery provenance):
 #
-#   source of truth : branch v0.4.108-corpse-fix = 735026d7487acdcc61e942b466483367aeb946c1
-#   parent          : tag v0.4.106              = eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e
+#   source of truth : branch v0.4.108-corpse-fix = 238e441b64ff9431cec328a1318bc61bd06d3ac5
+#                     (corpse-map leak fix 735026d + net_buffer_tuner.c comment fix
+#                      238e441 — the tagged 0.4.106 source did not compile as-is)
+#   base            : tag v0.4.106              = eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e
 #   artifact        : bpftune_0.4.108_<arch>.deb
 #
 # Run on EACH arch builder (amd64 first — it creates the release;
@@ -32,7 +34,8 @@ set -euo pipefail
 
 REPO='cddeppe/bpftune-swap'
 REPO_URL="https://github.com/${REPO}.git"
-COMMIT='735026d7487acdcc61e942b466483367aeb946c1'   # v0.4.108-corpse-fix tip
+COMMIT='238e441b64ff9431cec328a1318bc61bd06d3ac5'   # v0.4.108-corpse-fix tip (corpse fix + comment fix)
+PARENT='735026d7487acdcc61e942b466483367aeb946c1'  # corpse-map leak fix
 BASE='eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e'     # tag v0.4.106
 BRANCH='v0.4.108-corpse-fix'
 TAG='v0.4.108'
@@ -117,10 +120,11 @@ BRANCH_SHA="$(git rev-parse "refs/remotes/origin/${BRANCH}")"
 [ "$BRANCH_SHA" = "$COMMIT" ] || \
     die "origin/${BRANCH} = ${BRANCH_SHA:0:12}, expected ${COMMIT:0:12} — the branch moved; do NOT build a moving target (re-pin or revert it first)"
 git checkout -q -B build "$COMMIT"
-[ "$(git rev-parse HEAD)"  = "$COMMIT" ] || die "HEAD is not $COMMIT"
-[ "$(git rev-parse HEAD^)" = "$BASE"   ] || die "parent is NOT v0.4.106 — refusing to build"
+[ "$(git rev-parse HEAD)"   = "$COMMIT" ] || die "HEAD is not $COMMIT"
+[ "$(git rev-parse HEAD^)"  = "$PARENT" ] || die "parent is not the corpse-fix commit ${PARENT:0:12}"
+[ "$(git rev-parse HEAD^^)" = "$BASE"   ] || die "grandparent is NOT v0.4.106 — refusing to build"
 [ -z "$(git status --porcelain)" ]     || die "working tree not clean"
-echo "   HEAD = ${COMMIT:0:12}  (parent = v0.4.106 ${BASE:0:12})  tree clean"
+echo "   HEAD = ${COMMIT:0:12}  (corpse fix ${PARENT:0:12} on v0.4.106 ${BASE:0:12})  tree clean"
 
 # ---------- 2. semantics guard ----------
 say "2. semantics guard — no .bpf.c may change, changelog must be ${VER}"
@@ -129,6 +133,12 @@ echo "   changed vs v0.4.106:"; printf '     %s\n' $CHANGED
 if printf '%s\n' $CHANGED | grep -qE '\.bpf\.c$'; then
     die "a .bpf.c file was modified — tuning semantics guard tripped, aborting"
 fi
+# net_buffer_tuner.c may ONLY differ from v0.4.106 in comments (the
+# tagged 0.4.106 comment early-terminated at the '*/' in '/proc/*/comm' —
+# the shipped 0.4.106 .deb was built from a locally-fixed, uncommitted tree)
+NB_NONCOMMENT="$(git diff "$BASE" HEAD -- src/net_buffer_tuner.c \
+    | grep -E '^[+-][^+-]' | grep -vE '^[+-][[:space:]]*(/\*|\*|//|$)' || true)"
+[ -z "$NB_NONCOMMENT" ] || { printf 'FATAL: net_buffer_tuner.c diff is NOT comment-only:\n%s\n' "$NB_NONCOMMENT" >&2; exit 1; }
 grep -q "^bpftune (${VER})" debian/changelog || die "debian/changelog is not bumped to ${VER}"
 
 # ---------- 3. build dependencies ----------
@@ -236,13 +246,15 @@ BODY="$(mktemp)"
 cat >"$BODY" <<'NOTES'
 # bpftune (tuner) v0.4.108 — stop the corpse-map leak
 
-**Built from tag `v0.4.108` → commit `735026d7487acdcc61e942b466483367aeb946c1`** (parent: tag `v0.4.106` → `eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e`). Gate on the exact build commit: `bpftool prog load src/tcp_conn_tuner.bpf.o` silent. Branch: `v0.4.108-corpse-fix`.
+**Built from tag `v0.4.108` → commit `238e441b64ff9431cec328a1318bc61bd06d3ac5`** (corpse-map leak fix `735026d` on tag `v0.4.106` → `eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e`). Gate on the exact build commit: `bpftool prog load src/tcp_conn_tuner.bpf.o` silent. Branch: `v0.4.108-corpse-fix`.
 
 **Base: v0.4.106 exactly** — the version deployed on all hosts. The unreleased 0.4.107 (tail-call split of `bpftune_conn_tuner`) is deliberately **not** included: the branch is cut from the `v0.4.106` tag, so the .deb delta is exactly these fixes. **No BPF-side (`.bpf.c`) file is touched** — logging, structure and robustness only.
 
 ## Why
 
 `remote_host_map` generations accumulate on hosts (16+ observed). The collector has merged them all since v0.9.128 ("corpse" maps: frozen values, still referenced, nothing writing them), and a daemon restart does not reliably clear them. This release closes every path in the 0.4.106 source that creates them under a running daemon, and makes the leftover situation observable at every start.
+
+**Build note:** the TAGGED v0.4.106 source never compiled as-is — a block comment in `net_buffer_tuner.c` early-terminated at the `*/` inside `/proc/*/comm`, so the shipped 0.4.106 .deb was necessarily built from a locally-fixed, uncommitted tree (the tag/binary divergence HANDOFF rule 2 exists to prevent). `238e441` fixes that comment (comment-only; provably zero difference in compiled code), making v0.4.108 the first tuner release where tag == build commit == shipped binary, provably.
 
 ## The four leaks (all in the 0.4.106 source)
 
@@ -275,6 +287,7 @@ Independent of collector v0.9.133 (flat regardless of N); ship in either order.
 - `src/bpftune.c` — basename-matched IN_DELETE fini
 - `src/libbpftune.c` — duplicate-tuner fini + multi-detach sweep
 - `src/tcp_conn_tuner.c` — reanchor retarget + leftover-count log
+- `src/net_buffer_tuner.c` — comment-only fix: '/proc/*/comm' → '/proc/<pid>/comm' (the tagged 0.4.106 comment terminated the comment early; no code change)
 - `debian/changelog` — 0.4.108 entry
 - `HANDOFF.md` — session note (2026-11-06)
 NOTES

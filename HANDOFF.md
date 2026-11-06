@@ -33,14 +33,31 @@ tag, provenance unverifiable, never shipped to the fleet); all hosts run
 SUPERSEDED — do not build that lineage.
 
 **Source of truth: branch `v0.4.108-corpse-fix`, tip
-`735026d7487acdcc61e942b466483367aeb946c1`** (parent: tag `v0.4.106` →
-`eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e`). Content: v0.4.106 semantics
+`238e441b64ff9431cec328a1318bc61bd06d3ac5`** = corpse-map leak fix
+`735026d` on tag `v0.4.106` (`eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e`)
+plus a comment-only fix in `net_buffer_tuner.c` (see the build note
+below). Content: v0.4.106 semantics
 unchanged PLUS the corpse-map leak fix (four leaks closed: basename-
 matched inotify IN_DELETE fini; duplicate-tuner fini before append;
 multi-detach sweep for ALLOW_MULTI zombies; reanchor retarget on
 re-init) + an init-time `N leftover remote_host_map generation(s)`
 diagnostic. No `.bpf.c` file is touched (rule 5 holds). Full notes in the
 release body and in `release-notes-tuner-v0.4.108.md` on the branch.
+
+**BUILD NOTE (found on the first real builder run, 2026-11-06):** the
+TAGGED v0.4.106 source never compiled as-is — the block comment at
+`src/net_buffer_tuner.c:62` (`scan /proc/*/comm`) early-terminated at
+the `*/`, turning the rest of the comment into code. The shipped
+0.4.106 .deb was therefore built from a locally-fixed, uncommitted
+tree — exactly the tag/binary divergence rule 2 exists to prevent
+(and likely the same story behind the mystery 0.4.107). `238e441`
+fixes the comment (`/proc/<pid>/comm`, comment-only, zero compiled-code
+difference — the builder script enforces this with a comment-only
+guard). v0.4.108 is the first tuner release where tag == build commit
+== shipped binary, provably. The same builder run also validated the
+corpse-fix sources: `bpftune.c`, `libbpftune.c`, `tcp_conn_tuner.c`
+compiled clean on Debian 13 before the build hit the 0.4.106 comment
+bug.
 
 ### TASK 1B — build + publish v0.4.108 (CURRENT, atomic — GitHub only)
 
@@ -60,8 +77,10 @@ script picks up its token automatically instead.
 
 (or `bash build-tuner-v0.4.108.sh --no-publish` for a build + verifier
 gate dry run that pushes nothing). The script enforces §0 end-to-end:
-fresh clone of the PINNED tip `735026d` (aborts if the branch moved or
-the parent is not v0.4.106), aborts if any `.bpf.c` changed, installs
+fresh clone of the PINNED tip `238e441` (aborts if the branch moved or
+the commit chain is not corpse-fix-on-0.4.106), aborts if any `.bpf.c`
+changed or if `net_buffer_tuner.c` differs from 0.4.106 outside
+comments, installs
 Build-Depends (explicit list — stock VPS images lack deb-src entries),
 Build-Depends, builds, runs the silent `bpftool prog load` gate,
 builds `bpftune_0.4.108_<arch>.deb`, pushes tag `v0.4.108` → `735026d`
