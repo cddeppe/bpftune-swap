@@ -347,6 +347,13 @@
   }
   table.tbl tr.inactive td { opacity: .45; }
 
+  /* v0.9.129 leaderboard honesty: an ACTIVE row that fails the picker's
+     own eligibility gate (votes < min_leader_trust, zero swap score, or
+     zero rate). Greyed but readable — dimmed less than inactive rows so
+     the measured data stays visible while showing the picker will not
+     target it. See renderMetric() in dashboard.js. */
+  table.tbl tr.untrusted td { color: var(--muted); opacity: .7; }
+
   /* 0.4.78.2: proof leaderboard
    * - nowrap: keep the inline covbar and its value on the same
    *   line instead of wrapping or overflowing.

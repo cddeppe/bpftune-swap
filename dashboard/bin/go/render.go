@@ -276,6 +276,11 @@ func (h *historyStore) renderMetaToDisk(buckets []map[string]interface{}) {
                 "buckets":        bucketEntries,
                 "default_bucket": defaultBucket,
                 "has_tcp_rmem":   false,
+                // v0.9.129 (leaderboard honesty): carry the picker's own
+                // eligibility threshold (MIN_LEADER_TRUST, mirrors
+                // src/tcp_conn_tuner.h) so the frontend pick highlight and
+                // row greying enforce the same gate the picker does.
+                "min_leader_trust": minLeaderTrust,
         }
         writeJSONToDisk("meta.json", doc)
 }

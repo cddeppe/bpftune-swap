@@ -87,7 +87,9 @@
       <div id="lv-metric"></div>
       <div class="note">
         <b>score</b> = <code>Rate EMA &times; Swap Score / 256 &times; penalty</code>.
-        Top row is what the picker would choose right now.
+        Highlighted row = the picker's current choice among <b>eligible</b> rows
+        (&ge;10 votes, non-zero swap score, non-zero rate).
+        Greyed rows are measured but not yet trusted &mdash; the picker will not target them.
       </div>
     </section>
 

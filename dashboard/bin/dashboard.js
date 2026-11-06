@@ -496,22 +496,32 @@
       if (v === 0) return "cell-good";
       return "cell-bad";
     }
-    // Top row is the picker's choice: sorted by score in the CLI, so
-    // the first non-inactive row wins.
+    // v0.9.129 (leaderboard honesty): the pick highlight enforces the
+    // picker's OWN eligibility — >= min_leader_trust votes (carried via
+    // meta.json, fallback 10), a non-zero swap score (v0.4.99 skip) and
+    // a non-zero rate. The pre-0.9.129 highlight took the first active
+    // row, which overstated untrusted candidates.
+    var MLT = (state.meta && state.meta.min_leader_trust) || 10;
+    function pickerEligible(r) {
+      return r && r.votes != null && r.votes >= MLT &&
+             r.swap_score != null && r.swap_score !== 0 &&
+             r.rate_ema != null && r.rate_ema !== 0;
+    }
     var picked = null;
     for (var i = 0; i < rows.length; i++) {
-      if (rows[i].active) { picked = i; break; }
+      if (rows[i].active && pickerEligible(rows[i])) { picked = i; break; }
     }
     var html = '<table class="tbl"><thead><tr>' +
       '<th>alg</th><th>Rate EMA<br>'
         + '<span style="font-weight:400;text-transform:none;letter-spacing:0">Mb/s</span></th>'
         + '<th>Swap Score</th>' +
-      '<th>penalty</th><th>score</th><th>metric</th>' +
+      '<th>penalty</th><th>score</th><th>metric</th><th>votes</th>' +
       '<th>bad</th><th>null</th>' +
       '</tr></thead><tbody>';
     rows.forEach(function (r, i) {
       var cls = [];
       if (!r.active) cls.push("inactive");
+      else if (!pickerEligible(r)) cls.push("untrusted");
       if (i === picked) cls.push("pick");
       var trClass = cls.length ? ' class="' + cls.join(" ") + '"' : "";
       var pen = (r.penalty == null) ? "-" : r.penalty.toFixed(3);
@@ -531,6 +541,8 @@
         '<td class="mono dim">' +
           (r.metric == null ? "-" : r.metric.toFixed(1)) +
         '</td>' +
+        '<td class="mono ' + (pickerEligible(r) ? "" : "dim") + '">' +
+          (r.votes == null ? "-" : r.votes) + '</td>' +
         '<td class="mono ' + colorStreak(r.bad_streak) + '">' +
           (r.bad_streak == null ? "-" : r.bad_streak) + '</td>' +
         '<td class="mono ' + colorStreak(r.null_streak) + '">' +
@@ -540,7 +552,9 @@
     setHTML("lv-metric", html + '</tbody></table>' +
       '<div class="note" style="margin-top:8px">' +
       'Rate EMA is <b>Mb/s</b> in this table, matching the chart and NOW. ' +
-      'The raw 100&nbsp;KB/s value the picker uses is shown in parenthesis.' +
+      'The raw 100&nbsp;KB/s value the picker uses is shown in parenthesis. ' +
+      'A row needs <b>\u2265' + MLT + ' votes</b>, a non-zero swap score and a ' +
+      'non-zero rate to be pickable; greyed rows are not yet trusted.' +
       '</div>');
   }
 

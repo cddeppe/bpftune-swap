@@ -94,8 +94,13 @@ func (c *Collector) collect() {
         topSwaps, topProofs, swapOutcomes, bucketIPs, logWindow, proofsRaw := buildLogPanels(allSwaps, allMets, allSrates, cdest, logText, now)
 
         // v0.7.6: streak writeback — async to avoid blocking the 30s cycle.
+        // v0.9.129: the picker writeback (collector-side reanchor substitute)
+        // takes the odd cycles — alternating with the streak writeback under
+        // the shared writebackMu. See picker_writeback.go.
         if cycleCount % 2 == 0 {
                 go c.writebackStreaks(allSwaps, allMets, allSrates)
+        } else {
+                go c.pickerWriteback()
         }
         doc["recent_swaps"] = topSwaps
         doc["recent_proofs"] = topProofs

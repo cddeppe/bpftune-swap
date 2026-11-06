@@ -12,7 +12,7 @@ var CONGS = []string{
 
 // collectorVersion is reported by -version (used by update-dashboard.sh).
 // Bumped per release; keep in sync with the git tag.
-const collectorVersion = "v0.9.128"
+const collectorVersion = "v0.9.129"
 
 const (
 	bpsToMbps      = 1_000_000.0 / 8.0
