@@ -1,6 +1,6 @@
 # HANDOFF — full state + exact instructions (READ EVERY WORD)
 
-Date: 2026-11-03 (updated). Every SHA below was verified via the GitHub API.
+Date: 2026-11-06 (updated). Every SHA below was verified via the GitHub API.
 Do not deviate from this document. Do not "improve" anything not listed.
 
 ## 0. HARD RULES (violated repeatedly; every failure traced to these)
@@ -24,50 +24,64 @@ Do not deviate from this document. Do not "improve" anything not listed.
    reanchor rules, win/null/loss logic. Everything we ship is logging,
    structure, and robustness only.
 
-## 1. TUNER (src/, include/) — primary task
+## 1. TUNER (src/, include/) — REOPENED 2026-11-06 (corpse-map fix, base 0.4.106)
 
-**Source of truth: branch `v0.4.107-lean`, tip `b1945b0bf9bf5ef6e22e4d2112b308ad9f22f219`.**
+**OPERATOR DECISION (2026-11-06): the tuner fix is cut from v0.4.106
+EXACTLY — NOT from 0.4.107.** 0.4.107 is a mystery (release exists, NO
+tag, provenance unverifiable, never shipped to the fleet); all hosts run
+0.4.106. The former source of truth `v0.4.107-lean` tip `b1945b0` is
+SUPERSEDED — do not build that lineage.
 
-Content: v0.4.106 (`eb4d8ba`) semantics, unchanged, PLUS this session's
-work in 5 commits:
-- `4b343fe` — T1: feed/diagnostics log split (feed lines estab/met/srate/
-  midsamp/swap/proof + action records unconditional; cwnd/swapctx/
-  swapscore/closport/heal_* gated by bpftune_debug, default 0); T6 config
-  read moved past early-exit gates; T7 cookie hoisted; T8 srate dedup
-- `1bd3909` — T2: reanchor per-bucket journal line -> DEBUG, one aggregate
-  line/cycle; bpf-debug default 0 in pin_explore_map; T3: ENOBUFS path
-  now sampled (udp_buffer_tuner.bpf.c); T3b: UDP log line -> DEBUG
-- `ed9c5e1` — T4: tcp_sndbuf_expand now sampled + registered;
-  T9: ringbuf poll 100ms -> 1000ms (bpftune.c)
-- `306194e` — T10: bpftune_sample adaptive-rate clamp at 256x (storm-proof)
-- `b1945b0` — VERIFIER FIX: the 16-iter ESTABLISHED rescan replaced by
-  tracker reads (kills the E2BIG 'Processed 1000001 insn' rejection)
+**Source of truth: branch `v0.4.108-corpse-fix`, tip
+`735026d7487acdcc61e942b466483367aeb946c1`** (parent: tag `v0.4.106` →
+`eb4d8ba5a80a0f5e400690e6c9c3349ec0dce77e`). Content: v0.4.106 semantics
+unchanged PLUS the corpse-map leak fix (four leaks closed: basename-
+matched inotify IN_DELETE fini; duplicate-tuner fini before append;
+multi-detach sweep for ALLOW_MULTI zombies; reanchor retarget on
+re-init) + an init-time `N leftover remote_host_map generation(s)`
+diagnostic. No `.bpf.c` file is touched (rule 5 holds). Full notes in the
+release body and in `release-notes-tuner-v0.4.108.md` on the branch.
 
-**STATE PROBLEM**: release `v0.4.107` exists with
-`bpftune_0.4.107_amd64.deb` but there is NO `v0.4.107` git tag —
-provenance unverifiable. Installed on hosts by update.sh. TREAT AS UNKNOWN.
+### TASK 1B — build + publish v0.4.108 (CURRENT, atomic — GitHub only)
 
-**OPERATOR DECISION (2026-11-03): the tuner will NOT be rebuilt.** The
-tuner task is closed unless the operator reopens it. If reopened, the
-steps below are the verified path.
+Everything ships from GitHub: the branch is pushed, and this `main`
+carries the builder script `build-tuner-v0.4.108.sh`. On EACH arch
+builder (amd64 first — creates the release; arm64 second — adds its
+deb):
 
-### TASK 1A — build v0.4.108 (only if operator reopens):
-1. `git fetch origin v0.4.107-lean && git checkout -B build b1945b0bf9bf5ef6e22e4d2112b308ad9f22f219`
-2. `git rev-parse HEAD` must print exactly `b1945b0bf9bf5ef6e22e4d2112b308ad9f22f219`.
-3. Bump the package version to **0.4.108** in the .deb packaging
-   (debian/changelog or equivalent) — REQUIRED so update.sh's
-   highest-version picker prefers it over the installed 0.4.107.
-   Artifact name must be `bpftune_0.4.108_amd64.deb`.
-4. Build the .deb with the same packaging flow used for 0.4.106/0.4.107.
-5. GATE (non-negotiable):
-   `cd src && make -j"$(nproc)" && sudo bpftool prog load src/tcp_conn_tuner.bpf.o /sys/fs/bpf/t`
-   -> must print NOTHING. Any output = stop, report, do not publish.
-6. Publish WITH THE TAG:
-   `git tag v0.4.108 b1945b0bf9bf5ef6e22e4d2112b308ad9f22f219 && git push origin v0.4.108`
-   `gh release create v0.4.108 bpftune_0.4.108_amd64.deb -t "v0.4.108 — verified rebuild of b1945b0" -n "Built from tag v0.4.108 -> commit b1945b0. Gate: bpftool prog load silent. v0.4.106 semantics preserved; adds T1-T10 + verifier fix."`
-7. Verify: `git ls-remote --tags origin v0.4.108` returns the tag.
-8. Neutralize the unknown artifact: `gh release delete v0.4.107 --yes`
-   (or `gh release edit v0.4.107 --draft`).
+    git clone https://github.com/cddeppe/bpftune-swap.git && cd bpftune-swap
+    gh auth login   # once per builder; the repo is PRIVATE
+    bash build-tuner-v0.4.108.sh
+
+(or `bash build-tuner-v0.4.108.sh --no-publish` for a build + verifier
+gate dry run that pushes nothing). The script enforces §0 end-to-end:
+fresh clone of the PINNED tip `735026d` (aborts if the branch moved or
+the parent is not v0.4.106), aborts if any `.bpf.c` changed, installs
+Build-Depends, builds, runs the silent `bpftool prog load` gate,
+builds `bpftune_0.4.108_<arch>.deb`, pushes tag `v0.4.108` → `735026d`
+and verifies it on the remote BEFORE creating the release (with
+SHA-citing notes, `--latest=false` so releases/latest stays on the
+collector), then neutralizes the orphaned v0.4.107 if it ever exists.
+
+Post-deploy check per host: `journalctl -u bpftune | grep "leftover
+remote_host_map"` — no line = clean; `N > 0` = holders survived that
+restart, send the line back.
+
+### TASK 1A — SUPERSEDED 2026-11-06 (kept for the record; 107 lineage)
+
+History: `v0.4.107-lean` (5 commits on top of v0.4.106 semantics —
+`4b343fe` T1 log split, `1bd3909` T2 reanchor journal to DEBUG,
+`ed9c5e1` T4 sndbuf sampling + ringbuf poll 1000ms, `306194e` T10
+sampler clamp, `b1945b0` verifier E2BIG fix) was the 2026-11-03 source
+of truth. The 2026-11-03 operator decision ("tuner will NOT be
+rebuilt") was superseded on 2026-11-06: the tuner fix was REOPENED and
+re-cut from v0.4.106 exactly (TASK 1B above), because the orphaned
+release `v0.4.107` has NO git tag (provenance unverifiable — a mystery)
+and was never the deployed base. The old TASK 1A steps (build v0.4.108
+from `b1945b0`: checkout, bump changelog, build .deb, silent
+`bpftool prog load` gate, tag+push, `gh release create`, verify
+`ls-remote --tags`, delete the orphaned v0.4.107 release) are retained
+in git history (HANDOFF.md at `main` before commit `e2da390`).
 
 ## 2. COLLECTOR (dashboard/bin/go/) — v0.9.x — ACTIVE TASK
 
