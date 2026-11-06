@@ -748,7 +748,15 @@ func main() {
 	// proactively instead of letting RSS stick at the high-water mark.
 	// Use --mem-limit-mib 200 for v0.9.104-equivalent tuning.
 	memLimitFlag := flag.Int("mem-limit-mib", 128, "Go soft memory limit in MiB (GOMEMLIMIT); 200 = v0.9.104 behaviour")
+	// v0.9.128: -version so update-dashboard.sh --check can report the
+	// installed collector version (it greps 'v<digits>.<digits>' from
+	// this output).
+	versionFlag := flag.Bool("version", false, "print collector version and exit")
 	flag.Parse()
+	if *versionFlag {
+		fmt.Printf("bpftune-collector-go %s\n", collectorVersion)
+		return
+	}
 	collectorMode = parseCollectorMode(*collectorModeFlag)
 	// v0.9.81: removed --route-monitor flag + route monitor goroutine +
 	// Origin Health panel + ctrld integration. They added complexity

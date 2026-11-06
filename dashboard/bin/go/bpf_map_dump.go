@@ -33,17 +33,58 @@ import (
 	"strings"
 )
 
-// readBPFMapSyscall reads the entire remote_host_map via raw BPF syscalls.
-// Returns []map[string]interface{} with the same structure as bpftool's
-// JSON output (each entry has "formatted" → "key" + "value" → field maps).
-// Falls back to the caller (bpftool fork) if any syscall fails.
+// readBPFMapSyscall reads every remote_host_map generation via raw BPF
+// syscalls (BPF_MAP_GET_NEXT_KEY + BPF_MAP_LOOKUP_ELEM) and parses the
+// 1024-byte value struct into the same map[string]interface{} structure that
+// the bpftool JSON parser produces.
+//
+// v0.9.128: MULTIPLE remote_host_map instances can coexist after a mid-run
+// tuner reload (netdev event / strategy rollback re-inits the tuner BPF
+// object; the old generation's maps stay alive on the daemon's leaked fds
+// with nothing writing them). All generations are read, NEWEST FIRST, and
+// each entry is tagged with its generation index ("map_gen"; 0 = newest)
+// so mergeBPFMapEntries lets the live generation win per bucket instead of
+// summing corpse values into the leaderboard. A single unreadable
+// generation (gone / torn reload race / geometry mismatch such as the
+// remote_host_scr scratch map) is skipped; the caller's bpftool fork
+// fallback only triggers when EVERY candidate is unreadable.
 func readBPFMapSyscall() ([]map[string]interface{}, error) {
-	// Get the map ID (cached for 5 min by resolveRemoteHostMapID).
-	mapID, err := resolveRemoteHostMapID()
-	if err != nil || mapID < 0 {
-		return nil, fmt.Errorf("resolveRemoteHostMapID: %w", err)
+	// Get the map IDs (cached for 5 min by resolveRemoteHostMapIDs).
+	mapIDs, err := resolveRemoteHostMapIDs()
+	if err != nil {
+		return nil, fmt.Errorf("resolveRemoteHostMapIDs: %w", err)
 	}
 
+	var entries []map[string]interface{}
+	read := 0
+	var lastErr error
+	for gen, mapID := range mapIDs {
+		genEntries, err := readRemoteHostMapByID(mapID)
+		if err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			continue
+		}
+		read++
+		for i := range genEntries {
+			genEntries[i]["map_gen"] = float64(gen)
+		}
+		entries = append(entries, genEntries...)
+	}
+	if read == 0 {
+		return nil, fmt.Errorf("all %d remote_host_map candidates unreadable (newest failure: %v)", len(mapIDs), lastErr)
+	}
+	if entries == nil {
+		// All readable maps are empty — that's valid (v0.9.86 contract).
+		return []map[string]interface{}{}, nil
+	}
+	return entries, nil
+}
+
+// readRemoteHostMapByID reads ONE map (by id) start to end via raw syscalls.
+// This is the pre-v0.9.128 readBPFMapSyscall body, unchanged.
+func readRemoteHostMapByID(mapID int) ([]map[string]interface{}, error) {
 	// VERIFIED FD — proven to be remote_host_map before use;
 	// closed when this read completes (no shared cache to poison).
 	fd, info, err := bpfMapGetFDByIDVerified(uint32(mapID), "remote_host")
@@ -207,7 +248,7 @@ func getMapEntryCountSyscall(mapID int) (int, error) {
 	defer bpfCloseFD(fd)
 	count := 0
 	nextKey := make([]byte, 16) // remote_host_map key size
-	var curKey []byte          // nil = start of iteration
+	var curKey []byte           // nil = start of iteration
 	for {
 		ok, err := bpfMapGetNextKey(fd, curKey, nextKey)
 		if err != nil {

@@ -67,15 +67,21 @@ var (
 	lastMaskV4 = -1
 	lastMaskV6 = -1
 	v6Warned   = false
-	// v0.9.36: cache for resolveRemoteHostMapID + detectMask.
-	// mapIDCache: caches the BPF map ID for 5 min (changes only on tuner reload).
+	// v0.9.36: cache for the map-ID resolver + detectMask.
+	// mapIDCache: caches the resolved remote_host_map ID list for 5 min
+	// (changes only on tuner reload).
 	// maskCache: caches the mask detection for 30 min (changes only on tunable edit).
 	maskCacheMu   sync.Mutex
 	mapIDCacheAt  time.Time
 	mapIDCacheTTL = 5 * time.Minute
 	maskCacheAt   time.Time
 	maskCacheTTL  = 30 * time.Minute
-	cachedMapID   = -1
+	// v0.9.128: cachedMapIDs (plural, newest first) replaces the single
+	// cachedMapID. See resolveRemoteHostMapIDs.
+	cachedMapIDs []int
+	// maskScannedMapID remembers which map the last key-scan inference
+	// ran on (was: cachedMapID, doubling as the resolver cache pre-0.9.128).
+	maskScannedMapID int
 )
 
 // v0.9.126 fix: the daemon pins tuner_config_map at
@@ -107,40 +113,100 @@ var (
 // BPF map access helpers
 // ============================================================================
 
-// resolveRemoteHostMapID finds the remote_host_map by name via
-// `bpftool map show`.  Returns the numeric id, or -1 if not found.
-// Mirrors Python _resolve_remote_host_map_id.
-// v0.9.36: cached for 5 min — the map ID only changes when the BPF
-// program is reloaded (tuner restart). Was forking bpftool every 2 min.
-func resolveRemoteHostMapID() (int, error) {
+// resolveRemoteHostMapIDs finds ALL remote_host_map instances by name via
+// `bpftool map show` and returns their numeric ids, NEWEST (highest id)
+// FIRST. Mirrors the multi-map reality of a live host.
+//
+// v0.9.128 FIX — the frozen-leaderboard root cause. The pre-0.9.128 code
+// returned the FIRST name match from `bpftool map show` (lowest id) and
+// cached it for 5 min, forever if the id never disappeared. But the daemon
+// can re-initialize the tcp_conn tuner BPF mid-run (observed: netdev event
+// at daemon start +9 min re-loaded the object — new maps, new programs, old
+// programs detached). The old generation's remote_host_map survives on the
+// daemon's leaked fds with a LOWER id than the live generation, so
+// "first match" glued the collector to a detached map whose contents froze
+// at the reload instant — while the live map (higher id) kept updating.
+// Restarting the daemon reproduced the same ordering every time, which is
+// why daily restarts never fixed it.
+//
+// Resolution order, newest first, is correct because BPF object ids are
+// monotonic: the live generation is always the newest, and orphans from
+// earlier reloads/restarts always have lower ids. The scratch map
+// (remote_host_scr, percpu_array, 4-byte key) also matches the name and is
+// excluded by geometry when bpftool reports it.
+//
+// v0.9.36: cached for 5 min — the id set only changes on tuner reload.
+// Was forking bpftool every 2 min.
+func resolveRemoteHostMapIDs() ([]int, error) {
 	maskCacheMu.Lock()
-	if cachedMapID > 0 && time.Since(mapIDCacheAt) < mapIDCacheTTL {
-		id := cachedMapID
+	if len(cachedMapIDs) > 0 && time.Since(mapIDCacheAt) < mapIDCacheTTL {
+		ids := append([]int(nil), cachedMapIDs...)
 		maskCacheMu.Unlock()
-		return id, nil
+		return ids, nil
 	}
 	maskCacheMu.Unlock()
 
 	out, err := exec.Command("bpftool", "--json", "map", "show").Output()
 	if err != nil {
-		return -1, fmt.Errorf("bpftool map show: %w", err)
+		return nil, fmt.Errorf("bpftool map show: %w", err)
 	}
+	ids, err := pickRemoteHostMapIDs(out)
+	if err != nil {
+		return nil, err
+	}
+	maskCacheMu.Lock()
+	cachedMapIDs = ids
+	mapIDCacheAt = time.Now()
+	maskCacheMu.Unlock()
+	return ids, nil
+}
+
+// pickRemoteHostMapIDs is the pure parsing core of resolveRemoteHostMapIDs
+// (unit-testable without bpftool). Input: `bpftool --json map show` output.
+// Output: matching map ids, NEWEST FIRST.
+func pickRemoteHostMapIDs(out []byte) ([]int, error) {
 	var maps []map[string]interface{}
 	if err := json.Unmarshal(out, &maps); err != nil {
-		return -1, fmt.Errorf("bpftool map show json: %w", err)
+		return nil, fmt.Errorf("bpftool map show json: %w", err)
 	}
+	var ids []int
 	for _, m := range maps {
 		name, _ := m["name"].(string)
-		if strings.Contains(name, "remote_host") {
-			id := int(toInt(m["id"]))
-			maskCacheMu.Lock()
-			cachedMapID = id
-			mapIDCacheAt = time.Now()
-			maskCacheMu.Unlock()
-			return id, nil
+		if !strings.Contains(name, "remote_host") {
+			continue
+		}
+		// v0.9.128: skip the scratch map (remote_host_scr,
+		// percpu_array, key 4B). Only the real remote_host_map has
+		// the 16-byte key / 1024-byte value geometry. Apply the
+		// filter only when bpftool reports geometry (real bpftool:
+		// bytes_key/bytes_value; some builds/tests: key_size/value_size).
+		if ks, ok := mapJSONSize(m, "bytes_key", "key_size"); ok && ks != 16 {
+			continue
+		}
+		if vs, ok := mapJSONSize(m, "bytes_value", "value_size"); ok && vs != sizeofRemoteHost {
+			continue
+		}
+		ids = append(ids, int(toInt(m["id"])))
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("remote_host_map not found")
+	}
+	// Newest first: higher id = newer generation = the live one.
+	sort.Sort(sort.Reverse(sort.IntSlice(ids)))
+	return ids, nil
+}
+
+// mapJSONSize reads a size field by any of the given JSON names. Returns
+// (value, true) when a positive size is reported, (0, false) otherwise.
+func mapJSONSize(m map[string]interface{}, names ...string) (int, bool) {
+	for _, n := range names {
+		if v, ok := m[n]; ok {
+			if i := toInt(v); i > 0 {
+				return i, true
+			}
 		}
 	}
-	return -1, fmt.Errorf("remote_host_map not found")
+	return 0, false
 }
 
 // detectMask auto-detects the v4/v6 prefix length by inspecting existing
@@ -182,7 +248,7 @@ func detectMask(mapID int) {
 	// cached key-scan inference. v0.9.126 fix: alias-target keys are
 	// excluded from the scan (see excludeAliasTargetKeys).
 	maskCacheMu.Lock()
-	if mapID == cachedMapID && time.Since(maskCacheAt) < maskCacheTTL {
+	if mapID == maskScannedMapID && time.Since(maskCacheAt) < maskCacheTTL {
 		maskCacheMu.Unlock()
 		return // cache hit — mask unchanged
 	}
@@ -191,7 +257,7 @@ func detectMask(mapID int) {
 	detectMaskUncached(mapID)
 
 	maskCacheMu.Lock()
-	cachedMapID = mapID
+	maskScannedMapID = mapID
 	maskCacheAt = time.Now()
 	maskCacheMu.Unlock()
 }
@@ -698,7 +764,7 @@ func mapLookupBytes(mapID int, keyArgs []string) ([]byte, error) {
 // v0.9.86: cached BPF map FD (file descriptor). The FD is valid until the
 // map is destroyed (bpftune reload). If the FD becomes stale, the syscall
 // will return EBADF and we fall back to bpftool.
-var cachedMapFD int = -1
+var cachedMapFDs = map[int]int{}
 
 // mapLookupBytesSyscall uses BPF_MAP_LOOKUP_ELEM syscall to read a map
 // entry without forking bpftool. Returns the raw value bytes.
@@ -735,29 +801,32 @@ func mapLookupBytesSyscall(mapID int, keyArgs []string) ([]byte, error) {
 	return value, nil
 }
 
-// invalidateMapCaches drops the cached map FD and the cached map ID after
-// an EBADF: the map was destroyed (tuner reload/restart) and both caches
-// may point at the dead object. The next writeback cycle re-resolves the
-// ID via `bpftool map show`. (v0.9.126 fix — the map-ID cache previously
-// kept pointing at the dead map for up to 5 minutes.)
+// invalidateMapCaches drops the cached map FDs and the cached map-ID list
+// after an EBADF: a map was destroyed (tuner reload/restart) and the caches
+// may point at dead objects. The next writeback cycle re-resolves the ids
+// via `bpftool map show`. (v0.9.126 fix — the map-ID cache previously
+// kept pointing at the dead map for up to 5 minutes. v0.9.128: per-id FD
+// cache + id LIST, since several generations can coexist.)
 func invalidateMapCaches() {
-	cachedMapFD = -1
+	cachedMapFDs = map[int]int{}
 	maskCacheMu.Lock()
-	cachedMapID = -1
+	cachedMapIDs = nil
 	mapIDCacheAt = time.Time{}
 	maskCacheMu.Unlock()
 }
 
-// getMapFD resolves a BPF map ID to a file descriptor, with caching.
+// getMapFD resolves a BPF map ID to a file descriptor, with per-id caching.
+// v0.9.128: keyed by map id (was a single cached fd — wrong as soon as
+// more than one remote_host_map generation is in play).
 func getMapFD(mapID int) (int, error) {
-	if cachedMapFD > 0 {
-		return cachedMapFD, nil
+	if fd, ok := cachedMapFDs[mapID]; ok && fd > 0 {
+		return fd, nil
 	}
-	fd, _, err := bpfMapGetFDByIDVerified(uint32(mapID), "remote_host_map")
+	fd, _, err := bpfMapGetFDByIDVerified(uint32(mapID), "remote_host")
 	if err != nil {
 		return -1, err
 	}
-	cachedMapFD = fd
+	cachedMapFDs[mapID] = fd
 	return fd, nil
 }
 
@@ -930,12 +999,12 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	}
 	defer writebackMu.Unlock()
 
-	mapID, err := resolveRemoteHostMapID()
+	mapIDs, err := resolveRemoteHostMapIDs()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[writeback] no remote_host_map: %v\n", err)
 		return 0, 0
 	}
-	detectMask(mapID)
+	detectMask(mapIDs[0])
 
 	// Pre-compute canonical host + both outcomes for each swap.
 	// Filter to swaps that have at least one outcome (immediate OR sustained).
@@ -989,117 +1058,125 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
 	}
 
 	totalHosts, totalSlots := 0, 0
-	for host, hostRows := range byHost {
-		// host is key-ready (already aliased and/or masked) — see
-		// canonicalWritebackHost. Use the exact builder so alias
-		// targets are not re-masked.
-		keyArgs := keyArgsForExact(host)
-		if keyArgs == nil {
-			continue
-		}
+	// v0.9.128: patch EVERY remote_host_map generation (newest first).
+	// After a mid-run tuner reload the live map is the newest, but
+	// userspace cannot prove liveness cheaply — patching all
+	// generations guarantees the live one receives the correction.
+	// The C1 seq-check rejects torn/raced buffers on the live map;
+	// detached generations are inert and a patch there is harmless.
+	for _, mapID := range mapIDs {
+		for host, hostRows := range byHost {
+			// host is key-ready (already aliased and/or masked) — see
+			// canonicalWritebackHost. Use the exact builder so alias
+			// targets are not re-masked.
+			keyArgs := keyArgsForExact(host)
+			if keyArgs == nil {
+				continue
+			}
 
-		// Lookup current value (1 BPF map lookup per host).
-		buf, err := mapLookupBytes(mapID, keyArgs)
-		if err != nil {
-			continue
-		}
-		if buf == nil || len(buf) != sizeofRemoteHost {
-			fmt.Fprintf(os.Stderr, "[writeback] WARN: %s buf %d!=%d; skip\n", host, len(buf), sizeofRemoteHost)
-			continue
-		}
+			// Lookup current value (1 BPF map lookup per host).
+			buf, err := mapLookupBytes(mapID, keyArgs)
+			if err != nil {
+				continue
+			}
+			if buf == nil || len(buf) != sizeofRemoteHost {
+				fmt.Fprintf(os.Stderr, "[writeback] WARN: %s buf %d!=%d; skip\n", host, len(buf), sizeofRemoteHost)
+				continue
+			}
 
-		// Find unique algs in this host's swaps.
-		algSet := map[int]bool{}
-		for _, r := range hostRows {
-			algSet[r.toAlg] = true
-		}
-
-		patches := 0
-		for algIdx := range algSet {
-			// Take last writebackWindow swaps with sustained outcome for (host, alg).
-			// Mirrors Python:
-			//   recent = sorted([s for s in swaps
-			//                    if masked_ip(s.remote_host)==host
-			//                    and s.to_alg==alg_idx
-			//                    and s.outcome_sustained], by ts)[-8:]
-			var recent []wbRow
+			// Find unique algs in this host's swaps.
+			algSet := map[int]bool{}
 			for _, r := range hostRows {
-				if r.toAlg != algIdx {
-					continue
-				}
-				if r.sustained == "" {
-					continue
-				}
-				recent = append(recent, r)
+				algSet[r.toAlg] = true
 			}
-			if len(recent) == 0 {
+
+			patches := 0
+			for algIdx := range algSet {
+				// Take last writebackWindow swaps with sustained outcome for (host, alg).
+				// Mirrors Python:
+				//   recent = sorted([s for s in swaps
+				//                    if masked_ip(s.remote_host)==host
+				//                    and s.to_alg==alg_idx
+				//                    and s.outcome_sustained], by ts)[-8:]
+				var recent []wbRow
+				for _, r := range hostRows {
+					if r.toAlg != algIdx {
+						continue
+					}
+					if r.sustained == "" {
+						continue
+					}
+					recent = append(recent, r)
+				}
+				if len(recent) == 0 {
+					continue
+				}
+
+				// Sort by ts ascending (oldest first).
+				sort.Slice(recent, func(i, j int) bool { return recent[i].ts < recent[j].ts })
+
+				// Take last writebackWindow (most recent 8).
+				if len(recent) > writebackWindow {
+					recent = recent[len(recent)-writebackWindow:]
+				}
+
+				// Compute streaks from the outcomes.
+				outcomes := make([]string, len(recent))
+				for i, r := range recent {
+					outcomes[i] = r.sustained
+				}
+				bad, null := streaksFromHistory(outcomes)
+
+				// Patch the 2 bytes for this alg slot.
+				patchStreaks(buf, algIdx, bad, null)
+				patches++
+			}
+
+			if patches == 0 {
 				continue
 			}
 
-			// Sort by ts ascending (oldest first).
-			sort.Slice(recent, func(i, j int) bool { return recent[i].ts < recent[j].ts })
-
-			// Take last writebackWindow (most recent 8).
-			if len(recent) > writebackWindow {
-				recent = recent[len(recent)-writebackWindow:]
-			}
-
-			// Compute streaks from the outcomes.
-			outcomes := make([]string, len(recent))
-			for i, r := range recent {
-				outcomes[i] = r.sustained
-			}
-			bad, null := streaksFromHistory(outcomes)
-
-			// Patch the 2 bytes for this alg slot.
-			patchStreaks(buf, algIdx, bad, null)
-			patches++
-		}
-
-		if patches == 0 {
-			continue
-		}
-
-		// C1-fix: re-lookup the buffer immediately before writeback and
-		// compare the seq field. The kernel increments seq on every update
-		// to the remote_host entry. If seq changed between the original
-		// lookup (T0) and now (T1), the kernel has updated metric_count /
-		// rate_ema / swap_score / etc. in the meantime, and writing back
-		// our stale buf would clobber those updates.
-		freshBuf, err := mapLookupBytes(mapID, keyArgs)
-		if err != nil || len(freshBuf) != sizeofRemoteHost {
-			fmt.Fprintf(os.Stderr, "[writeback] WARN: %s re-lookup failed; skip\n", host)
-			continue
-		}
-		origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
-		freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
-		if skip, why := writebackSeqCheck(origSeq, freshSeq); skip {
-			fmt.Fprintf(os.Stderr, "[writeback] %s %s; skip\n", host, why)
-			continue
-		}
-		// Copy our 2-byte streak patches into the fresh buffer so we don't
-		// lose any other kernel-side updates that happened between T0 and T1.
-		for algIdx := range algSet {
-			base := offMetricsArray + (algIdx * sizeofTCPConnMetric)
-			if base+offMetricNullStreak+1 > len(freshBuf) || base+offMetricNullStreak+1 > len(buf) {
+			// C1-fix: re-lookup the buffer immediately before writeback and
+			// compare the seq field. The kernel increments seq on every update
+			// to the remote_host entry. If seq changed between the original
+			// lookup (T0) and now (T1), the kernel has updated metric_count /
+			// rate_ema / swap_score / etc. in the meantime, and writing back
+			// our stale buf would clobber those updates.
+			freshBuf, err := mapLookupBytes(mapID, keyArgs)
+			if err != nil || len(freshBuf) != sizeofRemoteHost {
+				fmt.Fprintf(os.Stderr, "[writeback] WARN: %s re-lookup failed; skip\n", host)
 				continue
 			}
-			freshBuf[base+offMetricBadStreak] = buf[base+offMetricBadStreak]
-			freshBuf[base+offMetricNullStreak] = buf[base+offMetricNullStreak]
-		}
-		buf = freshBuf
+			origSeq := binary.LittleEndian.Uint64(buf[sizeofRemoteHost-sizeofSeqField:])
+			freshSeq := binary.LittleEndian.Uint64(freshBuf[sizeofRemoteHost-sizeofSeqField:])
+			if skip, why := writebackSeqCheck(origSeq, freshSeq); skip {
+				fmt.Fprintf(os.Stderr, "[writeback] %s %s; skip\n", host, why)
+				continue
+			}
+			// Copy our 2-byte streak patches into the fresh buffer so we don't
+			// lose any other kernel-side updates that happened between T0 and T1.
+			for algIdx := range algSet {
+				base := offMetricsArray + (algIdx * sizeofTCPConnMetric)
+				if base+offMetricNullStreak+1 > len(freshBuf) || base+offMetricNullStreak+1 > len(buf) {
+					continue
+				}
+				freshBuf[base+offMetricBadStreak] = buf[base+offMetricBadStreak]
+				freshBuf[base+offMetricNullStreak] = buf[base+offMetricNullStreak]
+			}
+			buf = freshBuf
 
-		// Write back the modified buffer (1 BPF map update per host).
-		if mapUpdateBytes(mapID, keyArgs, buf) {
-			totalHosts++
-			totalSlots += patches
-			fmt.Fprintf(os.Stderr, "[writeback] %s: patched %d alg slots\n", host, patches)
+			// Write back the modified buffer (1 BPF map update per host).
+			if mapUpdateBytes(mapID, keyArgs, buf) {
+				totalHosts++
+				totalSlots += patches
+				fmt.Fprintf(os.Stderr, "[writeback] %s: patched %d alg slots\n", host, patches)
+			}
 		}
 	}
 
 	if totalHosts > 0 {
-		fmt.Fprintf(os.Stderr, "[writeback] done: %d hosts, %d algorithm slots corrected (processed %d swaps)\n",
-			totalHosts, totalSlots, len(rows))
+		fmt.Fprintf(os.Stderr, "[writeback] done: %d host-map writes, %d algorithm slots corrected across %d map(s) (processed %d swaps)\n",
+			totalHosts, totalSlots, len(mapIDs), len(rows))
 	}
 	return totalHosts, totalSlots
 }

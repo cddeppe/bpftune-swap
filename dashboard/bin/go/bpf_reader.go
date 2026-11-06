@@ -59,6 +59,10 @@ type hostEntry struct {
 	V6MinRTT float64 // v0.9.38: separate v6 min_rtt (microseconds)
 	V4Inst   int     // v0.9.38: v4-only instance count
 	V6Inst   int     // v0.9.38: v6-only instance count
+	// v0.9.128: map generation this bucket's data came from (0 = newest,
+	// lower = newer; see readBPFMapSyscall). Older generations = maps
+	// abandoned by a mid-run tuner reload — their values are frozen.
+	Gen int `json:"-"`
 }
 
 // v0.9.111: pooled bpftool output buffers.  The pool entry is a
@@ -169,36 +173,50 @@ func readBPFMap() ([]hostEntry, error) {
 	// v0.9.111: tell the operator WHY we are forking bpftool (once/10min).
 	logBpfSyscallFallback(sysErr)
 
-	// Fallback: bpftool fork path (used when syscalls fail — e.g.,
-	// kernel < 4.4 without BPF_MAP_GET_FD_BY_ID, or map FD is stale).
-	// v0.9.33: check if the map size changed since last call.
-	// v0.9.127: ...AND the cache is within TTL. Count stability alone
-	// proved nothing about value freshness (in-place updates don't
-	// change the count), so a stale snapshot could be served for hours
-	// on a stable bucket set.
-	if collectorMode.CacheBPFMap && bpfMapCache != nil && time.Since(bpfMapCacheAt) < bpfMapCacheTTL {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		var mapInfo []map[string]interface{}
-		if runBpftoolJSON(ctx, &mapInfo, "--json", "map", "show", "name", "remote_host_map") == nil && len(mapInfo) > 0 {
-			sz := toInt(mapInfo[0]["entries"])
-			if sz == bpfMapCacheSize {
-				return bpfMapCache, bpfMapCacheErr
-			}
-			bpfMapCacheSize = sz
-		}
-	}
-
-	// v0.9.27: add 10s timeout to prevent collector hanging on bpftool
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var rawDump []map[string]interface{}
-	if err := runBpftoolJSON(ctx, &rawDump, "--json", "map", "dump", "name", "remote_host_map"); err != nil {
+	// v0.9.128: dump EVERY remote_host_map generation by ID, newest
+	// first, tagged with its generation index — mirroring
+	// readBPFMapSyscall. The old single `map dump name remote_host_map`
+	// fork dumped every same-name map but WITHOUT ids in the output, so
+	// generations were indistinguishable and the instances-priority
+	// merge could let a detached generation's frozen values dominate
+	// live data. (The v0.9.33 count-based cache shortcut is gone:
+	// with several maps the first map's entry count said nothing about
+	// the merged snapshot, and v0.9.127 had already restricted it to a
+	// 60s TTL nicety.)
+	mapIDs, err := resolveRemoteHostMapIDs()
+	if err != nil {
 		if collectorMode.CacheBPFMap {
 			bpfMapCache = nil
 			bpfMapCacheErr = err
 		}
 		return nil, err
+	}
+	// v0.9.27: add 10s timeout to prevent collector hanging on bpftool.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var rawDump []map[string]interface{}
+	dumped := 0
+	var dumpErr error
+	for gen, id := range mapIDs {
+		var perMap []map[string]interface{}
+		if err := runBpftoolJSON(ctx, &perMap, "--json", "map", "dump", "id", strconv.Itoa(id)); err != nil {
+			if dumpErr == nil {
+				dumpErr = err
+			}
+			continue // unreadable generation — skip, not fail
+		}
+		dumped++
+		for i := range perMap {
+			perMap[i]["map_gen"] = float64(gen)
+		}
+		rawDump = append(rawDump, perMap...)
+	}
+	if dumped == 0 {
+		if collectorMode.CacheBPFMap {
+			bpfMapCache = nil
+			bpfMapCacheErr = dumpErr
+		}
+		return nil, dumpErr
 	}
 	if collectorMode.CacheBPFMap {
 		bpfMapCacheSize = len(rawDump)
@@ -220,6 +238,11 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 		if !ok {
 			continue
 		}
+		// v0.9.128: generation tag (0 = newest, lower = newer). Set by
+		// readBPFMapSyscall and the per-ID fork path; absent on legacy
+		// single-map dumps → 0 (untagged entries all merge, which is
+		// the pre-0.9.128 behaviour).
+		gen := toInt(entry["map_gen"])
 		val, ok := fmtData["value"].(map[string]interface{})
 		if !ok {
 			continue
@@ -268,6 +291,20 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 		rttUs := toFloat(val["min_rtt"])
 		isV6 := strings.HasPrefix(addr, "v6:")
 		if existing, ok := merged[final]; ok {
+			// v0.9.128 generation rules (frozen-leaderboard fix):
+			//  - an OLDER generation (higher gen index) arriving for
+			//    a bucket the newest generation already has is a
+			//    detached map's frozen snapshot — it must NOT be
+			//    summed or merged into the live values.
+			//  - a NEWER generation (lower gen index) arriving after
+			//    older entries replaces the bucket outright.
+			if gen > existing.Gen {
+				continue
+			}
+			if gen < existing.Gen {
+				merged[final] = newHostEntry(final, addr, val, inst, rttUs, isV6, gen)
+				continue
+			}
 			existing.Inst += inst
 			// B3-fix: keep the entry with the largest single inst as the
 			// representative for non-instance fields.
@@ -290,19 +327,7 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 			// v0.9.39: merge ALL metrics across v4+v6.
 			existing.V = mergeHostValues(existing.V, val)
 		} else {
-			he := &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val}
-			if isV6 {
-				he.V6Inst = inst
-				if rttUs > 0 {
-					he.V6MinRTT = rttUs
-				}
-			} else {
-				he.V4Inst = inst
-				if rttUs > 0 {
-					he.V4MinRTT = rttUs
-				}
-			}
-			merged[final] = he
+			merged[final] = newHostEntry(final, addr, val, inst, rttUs, isV6, gen)
 			order = append(order, final)
 		}
 	}
@@ -320,6 +345,24 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
 		}
 	}
 	return out, nil
+}
+
+// newHostEntry builds a fresh bucket entry (v0.9.128: extracted so the
+// generation-replace path and the first-seen path share one constructor).
+func newHostEntry(final, addr string, val map[string]interface{}, inst int, rttUs float64, isV6 bool, gen int) *hostEntry {
+	he := &hostEntry{Inst: inst, MaxInst: inst, Addr: final, V: val, Gen: gen}
+	if isV6 {
+		he.V6Inst = inst
+		if rttUs > 0 {
+			he.V6MinRTT = rttUs
+		}
+	} else {
+		he.V4Inst = inst
+		if rttUs > 0 {
+			he.V4MinRTT = rttUs
+		}
+	}
+	return he
 }
 
 // mergeHostValues combines two BPF map values (v4 + v6) into a single
