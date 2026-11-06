@@ -182,47 +182,56 @@ if [ "$DO_TUNER" = 1 ]; then
     DEB_TO_INSTALL=""
 
     printf "  checking GitHub releases for %s/%s...\n" "$REPO" "$ARCH"
-    DEB_INFO=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" 2>/dev/null \
-        | python3 -c "
-import json, sys
-try:
-    releases = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
+    # v0.9.129 fix (2026-11-06): the old scan read only the newest 30
+    # releases (per_page=30). This repo now has 100+ releases (dashboard
+    # releases accumulate daily), so the v0.4.x tuner .deb releases fell out
+    # of that window and the script reported "no .deb found" even though the
+    # assets were never deleted. Scan ALL release pages now (up to 10 pages
+    # of 100). Same matching rules as the v0.4.95 fix:
+    #   - new: bpftune-custom-0.4.95-amd64.deb
+    #   - old: bpftune_0.4.93_amd64.deb
+    DEB_INFO=$(
+        REPO="${REPO}" ARCH="${ARCH}" python3 2>/dev/null <<'PYEOF' || true
+import json, os, re, sys, urllib.request
 
-# v0.4.95 fix: collect ALL .deb assets across ALL releases, parse the
-# version from each, then pick the one with the highest version number.
-# Supports both naming conventions:
-#   - new: bpftune-custom-0.4.95-amd64.deb
-#   - old: bpftune_0.4.93_amd64.deb
-
-import re
+repo = os.environ.get("REPO", "")
+arch = os.environ.get("ARCH", "")
 candidates = []
-for r in releases:
-    tag = r.get('tag_name', '').lstrip('v')
-    for a in r.get('assets', []):
-        name = a.get('name', '')
-        url = a.get('browser_download_url', '')
-        if not url:
-            continue
-        m = re.match(r'^bpftune-custom-([0-9.]+)-${ARCH}\.deb\$', name)
-        if m:
-            ver = m.group(1)
-            candidates.append((tuple(int(x) for x in ver.split('.')), ver, url))
-            continue
-        m = re.match(r'^bpftune_([0-9.]+)_${ARCH}\.deb\$', name)
-        if m:
-            ver = m.group(1)
-            candidates.append((tuple(int(x) for x in ver.split('.')), ver, url))
-            continue
+page = 1
+while page <= 10:
+    url = "https://api.github.com/repos/%s/releases?per_page=100&page=%d" % (repo, page)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "bpftune-update"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            releases = json.load(resp)
+    except Exception:
+        break
+    if not isinstance(releases, list) or not releases:
+        break
+    for r in releases:
+        for a in r.get("assets", []):
+            name = a.get("name", "")
+            dl = a.get("browser_download_url", "")
+            if not dl:
+                continue
+            m = re.match(r"^bpftune-custom-([0-9.]+)-%s\.deb$" % arch, name)
+            if not m:
+                m = re.match(r"^bpftune_([0-9.]+)_%s\.deb$" % arch, name)
+            if m:
+                ver = m.group(1)
+                candidates.append((tuple(int(x) for x in ver.split(".")), ver, dl))
+    if len(releases) < 100:
+        break
+    page += 1
 
 if not candidates:
     sys.exit(0)
 
 candidates.sort(key=lambda c: c[0], reverse=True)
 best = candidates[0]
-print(best[1] + ' ' + best[2])
-" 2>/dev/null || true)
+print(best[1] + " " + best[2])
+PYEOF
+    )
 
     if [ -n "$DEB_INFO" ]; then
         NEW_VER=$(printf "%s" "$DEB_INFO" | awk '{print $1}')
