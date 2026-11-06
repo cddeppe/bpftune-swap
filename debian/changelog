@@ -38,6 +38,11 @@ bpftune (0.4.108) unstable; urgency=medium
       sweep. 0 = clean; >0 = holders survived this daemon start (leaked
       fds from another process or a zombie attachment the sweep could
       not remove) — one restart now PROVES whether the sweep works.
+  * net_buffer_tuner.c: fix a block comment that early-terminated at
+    the '*/' inside '/proc/*/comm' (line 62) — the TAGGED v0.4.106
+    source did not compile as-is; the shipped 0.4.106 .deb was built
+    from a tree with this fixed locally and never committed. Comment-
+    only change: zero difference in compiled code.
 
  -- cddeppe <91772433+cddeppe@users.noreply.github.com>  Fri, 06 Nov 2026 21:13:21 +0000
 
