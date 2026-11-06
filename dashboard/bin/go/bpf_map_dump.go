@@ -53,7 +53,15 @@ func readBPFMapSyscall() ([]map[string]interface{}, error) {
         if err != nil {
                 return nil, fmt.Errorf("resolveRemoteHostMapIDs: %w", err)
         }
+        return readMapGens(mapIDs)
+}
 
+// readMapGens reads the given remote_host_map generations (any order) and
+// tags each entry with its id-rank generation index. v0.9.132: split out of
+// readBPFMapSyscall so the steady-state path (bpf_reader.go) can dump ONLY
+// the newest generation while the refresh path keeps the full all-gens
+// semantics unchanged.
+func readMapGens(mapIDs []int) ([]map[string]interface{}, error) {
         var entries []map[string]interface{}
         read := 0
         var lastErr error
