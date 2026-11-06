@@ -48,7 +48,8 @@ PUBLISH=1
 
 # ---------- 0. preflight ----------
 say "0. preflight"
-for tool in git curl python3 dpkg-buildpackage sha256sum; do
+# only base tools here — build toolchain is installed in step 3
+for tool in git curl python3 sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || die "missing tool: $tool — install it and rerun"
 done
 # root needs no sudo; non-root needs sudo
@@ -58,23 +59,49 @@ if [ "$(id -u)" = 0 ]; then
 else
     command -v sudo >/dev/null 2>&1 || die "missing sudo (run as root, or install sudo)"
 fi
-# resolve a token for the publish steps (gh CLI optional, GH_TOKEN preferred)
+# resolve a token for the publish steps. Order: GH_TOKEN env > gh CLI >
+# git's stored credentials for github.com (credential.helper store/cache/…).
+# NOTE: a token is ONLY needed for WRITES (tag push + release create/upload).
+# The clone/pull worked anonymously because the repo is PUBLIC — that is
+# not a login, and GitHub requires a token for every write, no exceptions.
 API_TOKEN=""
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    API_TOKEN="$(gh auth token)"
-    echo "   gh CLI authenticated — using its token"
-elif [ -n "${GH_TOKEN:-}" ]; then
-    API_TOKEN="$GH_TOKEN"
-    echo "   using \$GH_TOKEN from the environment"
+TOKEN_SRC=""
+if [ -n "${GH_TOKEN:-}" ]; then
+    API_TOKEN="$GH_TOKEN"; TOKEN_SRC="\$GH_TOKEN from the environment"
+elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    API_TOKEN="$(gh auth token)"; TOKEN_SRC="the authenticated gh CLI"
 else
-    [ "$PUBLISH" = 1 ] && die "publishing needs a GitHub token:  read -rs GH_TOKEN; export GH_TOKEN  (paste your PAT; or install+auth the gh CLI)  — or rerun with --no-publish"
-    echo "   no token (fine for --no-publish)"
+    # ask git for stored github.com credentials (never prompts: prompts off, 10s timeout)
+    cred_out="$(printf 'protocol=https\nhost=github.com\n\n' | \
+        timeout 10 env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true git credential fill 2>/dev/null || true)"
+    API_TOKEN="$(printf '%s\n' "$cred_out" | awk -F= '$1=="password" {print $2; exit}')"
+    [ -n "$API_TOKEN" ] && TOKEN_SRC="git's stored credentials for github.com"
 fi
-# git wrapper: wires the token into push/ls-remote when we have one
+if [ -n "$API_TOKEN" ]; then
+    echo "   auth for writes: ${TOKEN_SRC}"
+elif [ "$PUBLISH" = 1 ]; then
+    cat >&2 <<'MSG'
+FATAL: publishing needs a GitHub token.
+  The git pull worked WITHOUT a login only because the repo is PUBLIC
+  (anyone can read it). Creating the release is a WRITE, and GitHub
+  requires a token for every write — no way around it.
+  Fix (paste the PAT you use for GitHub — cursor waits silently):
+      read -rs GH_TOKEN && export GH_TOKEN
+      bash build-tuner-v0.4.108.sh
+  Or build WITHOUT publishing (no token needed at all) and publish later:
+      bash build-tuner-v0.4.108.sh --no-publish
+MSG
+    exit 1
+else
+    echo "   no token (fine for --no-publish — nothing will be pushed)"
+fi
+# git wrapper: wires the token into push/ls-remote when we have one.
+# 'credential.helper=' (empty) RESETS any globally configured helper first,
+# so OUR token is always the one git uses.
 CRED_HELPER='!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f'
 if [ -n "$API_TOKEN" ]; then
     export GH_TOKEN="$API_TOKEN"
-    git_auth() { git -c "credential.helper=$CRED_HELPER" "$@"; }
+    git_auth() { git -c credential.helper= -c "credential.helper=$CRED_HELPER" "$@"; }
 else
     git_auth() { git "$@"; }   # public repo: reads work anonymously; push prompts
 fi
@@ -106,7 +133,7 @@ grep -q "^bpftune (${VER})" debian/changelog || die "debian/changelog is not bum
 
 # ---------- 3. build dependencies ----------
 say "3. build dependencies (debian/control: clang, llvm, bpftool, libbpf-dev, …)"
-if dpkg-checkbuilddeps >/dev/null 2>&1; then
+if command -v dpkg-checkbuilddeps >/dev/null 2>&1 && dpkg-checkbuilddeps >/dev/null 2>&1; then
     echo "   all Build-Depends satisfied"
 else
     echo "   missing Build-Depends — installing (explicit list; apt-get build-dep"
@@ -114,15 +141,15 @@ else
     sudo apt-get update -qq || true
     if ! sudo apt-get install -y build-essential fakeroot debhelper python3-docutils \
             libbpf-dev libcap-dev clang llvm bpftool libnl-3-dev libnl-route-3-dev iperf3; then
-        dpkg-checkbuilddeps || true
+        command -v dpkg-checkbuilddeps >/dev/null 2>&1 && dpkg-checkbuilddeps || true
         die "apt install of Build-Depends failed — install the packages listed above, then rerun"
     fi
 fi
-for tool in clang bpftool; do
+for tool in clang bpftool dpkg-buildpackage; do
     command -v "$tool" >/dev/null 2>&1 \
-        || die "$tool still missing after build-dep — install it manually and rerun"
+        || die "$tool still missing after the dependency step — install it manually and rerun"
 done
-echo "   clang + bpftool present"
+echo "   clang + bpftool + dpkg-buildpackage present"
 
 # ---------- 4. build ----------
 say "4. build (cd src && make -j)"
