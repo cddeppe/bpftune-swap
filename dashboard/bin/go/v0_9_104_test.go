@@ -53,10 +53,11 @@ func TestV0_9_104_SQLiteDedupSkipsUnchanged(t *testing.T) {
 	h := hostEntry{Addr: "1.2.3.4", Inst: 5}
 	now := int64(1700000000)
 
-	// Force even cycle (so throttle lets the write through)
-	sqliteWriteCycleMu.Lock()
-	sqliteWriteCycle = 1 // next call increments to 2 (even)
-	sqliteWriteCycleMu.Unlock()
+	// v0.9.131: throttle is time-based (≥45s between write passes).
+	// Reset the gate so the first write passes deterministically.
+	sqliteWriteMu.Lock()
+	sqliteLastWriteAt = 0
+	sqliteWriteMu.Unlock()
 
 	writeBucketSQLite(h, now, 4096, 87380, 6291456)
 	count1 := sqliteRowCount(t)
@@ -64,13 +65,9 @@ func TestV0_9_104_SQLiteDedupSkipsUnchanged(t *testing.T) {
 		t.Fatalf("after first write: expected 1 row, got %d", count1)
 	}
 
-	// Reset cycle to odd then increment to even for second call
-	sqliteWriteCycleMu.Lock()
-	sqliteWriteCycle = 1
-	sqliteWriteCycleMu.Unlock()
-
-	// Second write - SAME data, different ts. Should be skipped by dedup.
-	writeBucketSQLite(h, now+30, 4096, 87380, 6291456)
+	// Second write - SAME data, next allowed pass (now+60).
+	// The throttle lets it through; the DEDUP hash must skip it.
+	writeBucketSQLite(h, now+60, 4096, 87380, 6291456)
 	count2 := sqliteRowCount(t)
 	if count2 != 1 {
 		t.Fatalf("after dedup: expected 1 row (unchanged data), got %d", count2)
@@ -309,9 +306,9 @@ func TestV0_9_104_GetServiceHealthCacheTTL(t *testing.T) {
 // ============================================================================
 
 func TestV0_9_104_WriteBucketSQLiteThrottle(t *testing.T) {
-	sqliteWriteCycleMu.Lock()
-	sqliteWriteCycle = 0
-	sqliteWriteCycleMu.Unlock()
+	sqliteWriteMu.Lock()
+	sqliteLastWriteAt = 0
+	sqliteWriteMu.Unlock()
 
 	dir := t.TempDir()
 	origHist := histDir
@@ -326,18 +323,28 @@ func TestV0_9_104_WriteBucketSQLiteThrottle(t *testing.T) {
 	h := hostEntry{Addr: "9.9.9.9", Inst: 1}
 	now := int64(1700000010)
 
+	// v0.9.131: time-based throttle — a pass 30s after the previous
+	// one is skipped even when the data CHANGED (proves it is the
+	// throttle, not the dedup hash, doing the skipping).
 	writeBucketSQLite(h, now, 4096, 87380, 6291456)
-	writeBucketSQLite(h, now+30, 4096, 87380, 6291456)
+	h2 := hostEntry{Addr: "9.9.9.9", Inst: 2, V: map[string]interface{}{
+		"best_i": 1, "metrics": []interface{}{
+			map[string]interface{}{"metric_value": 42.0, "metric_count": 1},
+		}}}
+	writeBucketSQLite(h2, now+30, 4096, 87380, 6291456) // 30s < 45s: throttled
 
-	sqliteWriteCycleMu.Lock()
-	cycle := sqliteWriteCycle
-	sqliteWriteCycleMu.Unlock()
-	if cycle != 2 {
-		t.Fatalf("sqliteWriteCycle = %d, expected 2 after 2 calls", cycle)
+	count1 := sqliteRowCount(t)
+	if count1 != 1 {
+		t.Fatalf("after throttled pass: expected 1 row, got %d", count1)
 	}
 
-	count := sqliteRowCount(t)
-	t.Logf("OK after 2 calls (cycle=%d), DB has %d rows (throttle skipped cycle 1)", cycle, count)
+	writeBucketSQLite(h2, now+60, 4096, 87380, 6291456) // ≥45s: writes
+	count2 := sqliteRowCount(t)
+	if count2 != 2 {
+		t.Fatalf("after next pass: expected 2 rows, got %d", count2)
+	}
+
+	t.Logf("OK time-based throttle: 30s pass skipped, 60s pass written (%d rows)", count2)
 }
 
 // ============================================================================
@@ -520,31 +527,37 @@ func TestV0_9_104_NoRaceOnDedupMap(t *testing.T) {
 }
 
 func TestV0_9_104_NoRaceOnWriteCycle(t *testing.T) {
-	sqliteWriteCycleMu.Lock()
-	sqliteWriteCycle = 0
-	sqliteWriteCycleMu.Unlock()
+	sqliteWriteMu.Lock()
+	sqliteLastWriteAt = 0
+	sqliteWriteMu.Unlock()
 
+	// v0.9.131: the parity counter became the time-based throttle
+	// gate — hammer it concurrently to prove it stays race-free and
+	// consistent (the -race detector enforces that at test time).
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				sqliteWriteCycleMu.Lock()
-				sqliteWriteCycle++
-				sqliteWriteCycleMu.Unlock()
+			for j := 0; j < 50; j++ {
+				// 30s apart, shared base — goroutines race
+				// for the stamp; the mutex keeps it sane.
+				sqliteThrottleAllows(int64(1700000000 + j*30))
 			}
 		}()
 	}
 	wg.Wait()
 
-	sqliteWriteCycleMu.Lock()
-	final := sqliteWriteCycle
-	sqliteWriteCycleMu.Unlock()
-	if final != 1000 {
-		t.Fatalf("sqliteWriteCycle = %d, expected 1000", final)
+	// At least one goroutine must have seen an allowed pass (the
+	// first stamp always allows), and none may panic/race (the
+	// -race detector enforces that at test time).
+	sqliteWriteMu.Lock()
+	final := sqliteLastWriteAt
+	sqliteWriteMu.Unlock()
+	if final < 1700000000 {
+		t.Fatalf("sqliteLastWriteAt = %d, expected ≥ 1700000000", final)
 	}
-	t.Logf("OK no race on write cycle counter (10 goroutines x 100 incs = %d)", final)
+	t.Logf("OK no race on throttle gate (20 goroutines x 50 gate calls)")
 }
 
 // ============================================================================
@@ -561,14 +574,14 @@ func TestV0_9_104_SQLiteDBSizeStaysSmall(t *testing.T) {
 	sqliteDB = nil
 	openTestDB(t, dir)
 	lastWriteHash = make(map[string]uint64, 8)
+	sqliteWriteMu.Lock()
+	sqliteLastWriteAt = 0
+	sqliteWriteMu.Unlock()
 
 	h := hostEntry{Addr: "5.5.5.5", Inst: 7}
 	now := int64(1700000000)
 
 	for i := 0; i < 50; i++ {
-		sqliteWriteCycleMu.Lock()
-		sqliteWriteCycle = 1 // force even on next call
-		sqliteWriteCycleMu.Unlock()
 		writeBucketSQLite(h, now+int64(i*30), 4096, 87380, 6291456)
 	}
 
@@ -775,10 +788,10 @@ func TestV0_9_104_SQLiteWriteReadRoundtrip(t *testing.T) {
 	openTestDB(t, dir)
 	lastWriteHash = make(map[string]uint64, 8)
 
-	// Force cycle to be even
-	sqliteWriteCycleMu.Lock()
-	sqliteWriteCycle = 1
-	sqliteWriteCycleMu.Unlock()
+	// v0.9.131: time-based throttle — reset so the write passes.
+	sqliteWriteMu.Lock()
+	sqliteLastWriteAt = 0
+	sqliteWriteMu.Unlock()
 
 	h := hostEntry{Addr: "7.7.7.7", Inst: 4}
 	now := int64(1700000030)

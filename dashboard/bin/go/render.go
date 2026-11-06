@@ -66,8 +66,13 @@ func (c *Collector) renderToDisk() {
         // renderSlowToDisk reads the full CSV (for 7d+30d+all, daily at 4am).
         // v0.9.90: skip readCSVTail if buckets.v2.csv mtime unchanged
         // since last render — saves reading 432K lines when no new data.
+        // v0.9.131 fix: stat bucketsCSVPath (the --data-root-aware var),
+        // NOT a hardcoded /var/lib/... path. With --data-root the old
+        // probe either always missed (sandbox: stat fails → mtime 0 ==
+        // lastBucketsMtime 0 → csvAll never refreshed) or tracked a file
+        // this collector was not writing (stale default-install leftover).
         bucketsMtime := int64(0)
-        if fi, err := os.Stat("/var/lib/bpftune/history/buckets.v2.csv"); err == nil {
+        if fi, err := os.Stat(bucketsCSVPath); err == nil {
             bucketsMtime = fi.ModTime().Unix()
         }
         if bucketsMtime != lastBucketsMtime {
@@ -866,9 +871,6 @@ func jsonMarshal(v interface{}) ([]byte, error) {
 func jsonUnmarshal(data []byte, v interface{}) error {
         return json.Unmarshal(data, v)
 }
-
-// toString forces import of strconv for loadCSVTailIntoRingBuffer's panic message
-var _ = strconv.Itoa
 
 // v0.7.5f: helpers for fleet diagnostics logging.
 func boolStr(b bool) string {

@@ -44,7 +44,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 // CSV file paths.  These are vars (not consts) so the --data-root flag
@@ -512,10 +511,3 @@ type proofCSVRow struct {
 	Tier    string
 	Dest    string
 }
-
-// ============================================================================
-// suppress unused warning
-// ============================================================================
-
-var _ = fmt.Sprintf
-var _ = time.Now

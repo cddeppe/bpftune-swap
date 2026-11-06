@@ -277,11 +277,18 @@ func (c *Collector) handleIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if sub == "swaps.json" {
-			c.mu.RLock()
-			so := c.current["swap_outcomes"]
-			c.mu.RUnlock()
-			if m, ok := so.(map[string]interface{}); ok {
-				hist.handleSwapsJSON(w, r, m)
+			// v0.9.131 fix: the dynamic fallback used to serve
+			// c.current["swap_outcomes"] — a completely different
+			// shape ({composite,srate,sustained,...}) than the
+			// static swaps.json the frontend expects
+			// ({ranges:[...],"1h":{ts,swaps,...}}), so
+			// doc[rng] was undefined whenever the static file
+			// was >10min stale or missing. Serve the static file
+			// whenever it exists (renderToDisk rewrites it every
+			// 5 min); only fall back to {} at cold start.
+			staticPath := filepath.Join(histDir, "data", "swaps.json")
+			if _, err := os.Stat(staticPath); err == nil {
+				c.serveStatic(w, r, staticPath, "")
 			} else {
 				// v0.7.0: return empty object instead of 404 when no swaps yet.
 				w.Header().Set("Content-Type", "application/json")

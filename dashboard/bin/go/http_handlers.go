@@ -175,16 +175,6 @@ func (h *historyStore) handleMetaJSON(w http.ResponseWriter, r *http.Request, bu
 }
 
 // ============================================================================
-// HTTP handler: /data/swaps.json
-// ============================================================================
-
-func (h *historyStore) handleSwapsJSON(w http.ResponseWriter, r *http.Request, swapOutcomes map[string]interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-cache")
-	jsonEncoder(w).Encode(swapOutcomes)
-}
-
-// ============================================================================
 // HTTP handler: /data/fleet.json
 // ============================================================================
 

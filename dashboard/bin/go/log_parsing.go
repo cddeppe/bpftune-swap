@@ -18,7 +18,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -284,6 +283,11 @@ var currentParsedLog *parsedLog
 var sustainedOutcomeCache = map[string]string{}
 var sustainedOutcomeMu sync.RWMutex
 
+// sustainedOutcomeOrder records insertion order for FIFO eviction.
+// v0.9.131: the old eviction looped over the MAP (random iteration) and
+// could discard a freshly computed outcome while a stale one survived.
+var sustainedOutcomeOrder []string
+
 // getCachedOutcome returns a cached sustained outcome for a swap, or "".
 func getCachedOutcome(cookie int64, ts float64) string {
 	sustainedOutcomeMu.RLock()
@@ -299,15 +303,16 @@ func setCachedOutcome(cookie int64, ts float64, outcome string) {
 	sustainedOutcomeMu.Lock()
 	defer sustainedOutcomeMu.Unlock()
 	key := fmt.Sprintf("%d:%.6f", cookie, ts)
+	if _, exists := sustainedOutcomeCache[key]; !exists {
+		sustainedOutcomeOrder = append(sustainedOutcomeOrder, key)
+	}
 	sustainedOutcomeCache[key] = outcome
-	// Evict old entries to prevent unbounded growth (keep last 1000)
-	if len(sustainedOutcomeCache) > 1000 {
-		for k := range sustainedOutcomeCache {
-			delete(sustainedOutcomeCache, k)
-			if len(sustainedOutcomeCache) <= 1000 {
-				break
-			}
-		}
+	// v0.9.131: FIFO eviction — oldest-inserted leaves first (was:
+	// random map-range deletion). Keep the last 1000.
+	for len(sustainedOutcomeOrder) > 1000 {
+		oldest := sustainedOutcomeOrder[0]
+		sustainedOutcomeOrder = sustainedOutcomeOrder[1:]
+		delete(sustainedOutcomeCache, oldest)
 	}
 }
 
@@ -1141,17 +1146,13 @@ func destIP(s string) string {
 // files, sorted newest-first.  Mirrors bpftune_log.py:tail_recent.
 func readLogTail(budget int64) string {
 	// v0.9.31 (Bug 6): match rotated logs too (was *.log, missed .log.1 etc.)
-	pattern := "/var/log/bpftune-met-live.log*"
-	files, _ := filepath.Glob(pattern)
+	// v0.9.131: share logTailFiles() with readLogTailCached — .gz rotations
+	// are excluded (compressed bytes are not parseable text; logrotate
+	// ships compress+delaycompress).
+	files := logTailFiles()
 	if len(files) == 0 {
 		return ""
 	}
-	// Sort newest-first by mtime.
-	sort.Slice(files, func(i, j int) bool {
-		fi, _ := os.Stat(files[i])
-		fj, _ := os.Stat(files[j])
-		return fi.ModTime().After(fj.ModTime())
-	})
 	// v0.9.9: use a strings.Builder with pooled buffer to reduce GC pressure.
 	// Was: var chunks []string + strings.Join — allocated a new []string
 	// slice and concatenated all chunks into one big string per cycle.

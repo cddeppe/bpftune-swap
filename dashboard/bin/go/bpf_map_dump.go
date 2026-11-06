@@ -30,7 +30,6 @@ package main
 import (
         "encoding/binary"
         "fmt"
-        "strings"
 )
 
 // readBPFMapSyscall reads every remote_host_map generation via raw BPF
@@ -266,5 +265,3 @@ func getMapEntryCountSyscall(mapID int) (int, error) {
         return count, nil
 }
 
-// _ = strings.TrimSpace // keep import if needed later
-var _ = strings.TrimSpace

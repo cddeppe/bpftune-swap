@@ -10,30 +10,36 @@ and historical charts.
 
 ## Quick start
 
+All install/update scripts live in this repo — download the one you need
+and run it as root. (The old `dashboard/install.sh` one-liner was removed
+in v0.9.131 — that file never existed on this branch, so the curl 404'd.)
+
 ### Install bpftune + dashboard (recommended)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash
+curl -sSL -o deploy-and-check.sh \
+  https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/deploy-and-check.sh
+sudo bash deploy-and-check.sh
 ```
 
-This installs the bpftune kernel module AND the dashboard. The installer
-prompts whether you want the dashboard — answer `Y` (or use `--with-dashboard`
-for non-interactive use).
+`deploy-and-check.sh` downloads the latest tuner `.deb` + the dashboard
+binary and static assets, installs everything, starts trace capture, and
+finishes with a health check. Useful flags: `--tuner-only`,
+`--dashboard-only`, `--check-only`, or pin versions
+(`sudo bash deploy-and-check.sh v0.4.106 v0.9.131`).
 
-### Install bpftune only (headless)
+### Install / update the dashboard only (bpftune already running)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --no-dashboard
+curl -sSL -o update-dashboard.sh \
+  https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/update-dashboard.sh
+sudo bash update-dashboard.sh            # latest release, auto-detects arch
+sudo bash update-dashboard.sh --check    # show installed vs latest
 ```
 
-bpftune runs perfectly fine without the dashboard. Use this on production
-servers where you don't need local monitoring.
-
-### Install dashboard only (bpftune already running)
-
-```bash
-curl -sSL https://raw.githubusercontent.com/cddeppe/bpftune-swap/main/dashboard/install.sh | bash -s -- --dashboard-only
-```
+bpftune runs perfectly fine without the dashboard — simply skip the
+dashboard parts (or use `--tuner-only` above) on servers where you don't
+need local monitoring.
 
 ## What is bpftune?
 

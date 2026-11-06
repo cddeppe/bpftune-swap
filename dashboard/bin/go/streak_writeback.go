@@ -806,13 +806,43 @@ func mapLookupBytesSyscall(mapID int, keyArgs []string) ([]byte, error) {
 // may point at dead objects. The next writeback cycle re-resolves the ids
 // via `bpftool map show`. (v0.9.126 fix — the map-ID cache previously
 // kept pointing at the dead map for up to 5 minutes. v0.9.128: per-id FD
-// cache + id LIST, since several generations can coexist.)
+// cache + id LIST, since several generations can coexist. v0.9.131: every
+// cached fd is CLOSED before dropping — the fds used to be leaked.)
 func invalidateMapCaches() {
+        closeMapFDs()
         cachedMapFDs = map[int]int{}
         maskCacheMu.Lock()
         cachedMapIDs = nil
         mapIDCacheAt = time.Time{}
         maskCacheMu.Unlock()
+}
+
+// closeMapFD closes one map fd. Production: bpfCloseFD. Tests substitute
+// a recorder so fake fd numbers are never actually closed.
+var closeMapFD = bpfCloseFD
+
+// closeMapFDs closes every cached map fd and empties the cache.
+//
+// v0.9.131: the fd cache used to survive across writeback cycles — and an
+// open fd PINS the map's kernel memory. Every destroyed map generation the
+// writeback ever touched (corpse maps after a tuner reload/restart) stayed
+// alive AND stayed listed in `bpftool map show` for the life of the
+// collector, because the cached fd was the last reference and was never
+// closed (EBADF could not fire — the pinned map keeps answering lookups).
+// Both writeback cycles now close their fds when the cycle ends: live maps
+// are re-opened per cycle (one BPF_MAP_GET_FD_BY_ID per map per 30s —
+// negligible), and corpse generations finally get freed, so the map list
+// self-heals after a reload.
+//
+// Only called while writebackMu is held: both writeback cycles hold it for
+// their whole body, and they are the sole users of cachedMapFDs — the
+// reader path opens its own verified fd per dump (readRemoteHostMapByID,
+// "no shared cache to poison").
+func closeMapFDs() {
+        for id, fd := range cachedMapFDs {
+                closeMapFD(fd)
+                delete(cachedMapFDs, id)
+        }
 }
 
 // getMapFD resolves a BPF map ID to a file descriptor, with per-id caching.
@@ -998,6 +1028,10 @@ func (c *Collector) writebackStreaks(swaps []swapRow, met map[int64][]metEntry, 
                 return 0, 0
         }
         defer writebackMu.Unlock()
+        // v0.9.131: close this cycle's map fds before releasing the lock
+        // (LIFO: runs before the Unlock). Fds no longer survive across
+        // cycles, so they can never pin a destroyed map generation.
+        defer closeMapFDs()
 
         mapIDs, err := resolveRemoteHostMapIDs()
         if err != nil {

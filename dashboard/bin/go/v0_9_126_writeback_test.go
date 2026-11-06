@@ -15,6 +15,7 @@ import (
         "errors"
         "fmt"
         "net"
+        "sort"
         "testing"
         "time"
 
@@ -129,7 +130,14 @@ func TestErrorsIsDetectsWrappedEBADF(t *testing.T) {
 
 // TestInvalidateMapCaches — the per-id FD cache and the map-ID list cache
 // are dropped, so the next cycle re-resolves via `bpftool map show`.
+// v0.9.131: the fds must now be CLOSED, not just dropped (leak fix).
 func TestInvalidateMapCaches(t *testing.T) {
+        // Stub the close hook: the fake fd numbers below (42, 43) must never
+        // be passed to the real close — they could belong to the test process.
+        var closed []int
+        closeMapFD = func(fd int) { closed = append(closed, fd) }
+        defer func() { closeMapFD = bpfCloseFD }()
+
         cachedMapFDs = map[int]int{223: 42, 282: 43}
         maskCacheMu.Lock()
         cachedMapIDs = []int{282, 223}
@@ -140,6 +148,10 @@ func TestInvalidateMapCaches(t *testing.T) {
 
         if len(cachedMapFDs) != 0 {
                 t.Fatalf("cachedMapFDs not cleared: %v", cachedMapFDs)
+        }
+        sort.Ints(closed)
+        if len(closed) != 2 || closed[0] != 42 || closed[1] != 43 {
+                t.Fatalf("invalidateMapCaches must close every cached fd (42, 43); closed=%v", closed)
         }
         maskCacheMu.Lock()
         ids, at := cachedMapIDs, mapIDCacheAt

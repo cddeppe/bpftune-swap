@@ -53,22 +53,50 @@ var (
         tailJoined  string
 )
 
+// logTailFiles returns the trace log plus its UNCOMPRESSED rotations,
+// sorted newest-first by mtime. v0.9.131: .gz rotations are excluded —
+// the shipped logrotate runs `compress` + `delaycompress`, so
+// .2.gz … .14.gz match the glob and their raw compressed bytes were
+// cached and scanned as garbage text (a .gz chunk can never contain a
+// parseable event line).
+func logTailFiles() []string {
+        files, _ := filepath.Glob(logGlobPattern)
+        out := make([]string, 0, len(files))
+        for _, p := range files {
+                if strings.HasSuffix(p, ".gz") {
+                        continue
+                }
+                out = append(out, p)
+        }
+        sort.Slice(out, func(i, j int) bool {
+                fi, _ := os.Stat(out[i])
+                fj, _ := os.Stat(out[j])
+                return fi.ModTime().After(fj.ModTime())
+        })
+        return out
+}
+
 // readLogTailCached returns the last `budget` bytes across all files
 // matching logGlobPattern, sorted newest-first by mtime, each chunk
-// terminated by '\n' — byte-identical to v0.9.104's readLogTail().
+// terminated by '\n' — byte-identical to v0.9.104's readLogTail() on
+// uncompressed files (v0.9.131 deliberately skips .gz rotations).
+//
+// v0.9.131 memory bound: chunks used to be capped per-FILE at
+// min(size, budget) EACH, so the ~15 files logrotate keeps (rotate 14
+// + live, size 100M) could legally cache ~15×budget (~120MB for an
+// 8MB budget). The trim pass below mirrors the join's accounting
+// exactly, so the joined output is byte-identical while the TOTAL
+// cached bytes stay ≤ budget; if a file's allowance later GROWS
+// (copytruncate shrinks the live file, freeing budget for older
+// rotations), the join re-reads just the bytes it emits.
 func readLogTailCached(budget int64) string {
         tailMu.Lock()
         defer tailMu.Unlock()
 
-        files, _ := filepath.Glob(logGlobPattern)
+        files := logTailFiles()
         if len(files) == 0 {
                 return ""
         }
-        sort.Slice(files, func(i, j int) bool {
-                fi, _ := os.Stat(files[i])
-                fj, _ := os.Stat(files[j])
-                return fi.ModTime().After(fj.ModTime())
-        })
 
         if budget != tailBudget {
                 tailFiles = map[string]*tailFile{}
@@ -78,7 +106,10 @@ func readLogTailCached(budget int64) string {
 
         var sig strings.Builder
         order := make([]*tailFile, 0, len(files))
+        orderPaths := make([]string, 0, len(files))
+        live := make(map[string]bool, len(files))
         for _, p := range files {
+                live[p] = true
                 fi, err := os.Stat(p)
                 if err != nil {
                         continue
@@ -112,6 +143,42 @@ func readLogTailCached(budget int64) string {
                         fc.size, fc.mtime = size, mtime
                 }
                 order = append(order, fc)
+                orderPaths = append(orderPaths, p)
+        }
+
+        // v0.9.131: purge cache entries for files that no longer exist —
+        // logrotate deletes old rotations; their chunks (up to budget
+        // bytes each) used to stay referenced forever.
+        for p := range tailFiles {
+                if !live[p] {
+                        delete(tailFiles, p)
+                }
+        }
+
+        // v0.9.131 trim pass: clamp each chunk to what the join below
+        // would take from it (newest-first, total ≤ budget). Identical
+        // accounting to the join loop, so the output is unchanged; the
+        // copy frees the discarded front of each over-budget chunk.
+        {
+                remaining := budget
+                for _, fc := range order {
+                        take := fc.size
+                        if take > remaining {
+                                take = remaining
+                        }
+                        if take < 0 {
+                                take = 0
+                        }
+                        if int64(len(fc.chunk)) > take {
+                                trimmed := make([]byte, take)
+                                copy(trimmed, fc.chunk[int64(len(fc.chunk))-take:])
+                                fc.chunk = trimmed
+                        }
+                        if take > int64(len(fc.chunk)) {
+                                take = int64(len(fc.chunk))
+                        }
+                        remaining -= take
+                }
         }
 
         s := sig.String()
@@ -121,7 +188,7 @@ func readLogTailCached(budget int64) string {
 
         var sb strings.Builder
         remaining := budget
-        for _, fc := range order {
+        for i, fc := range order {
                 if remaining <= 0 {
                         break
                 }
@@ -129,7 +196,21 @@ func readLogTailCached(budget int64) string {
                 if take > remaining {
                         take = remaining
                 }
-                if int64(len(fc.chunk)) < take {
+                if fc.chunk != nil && int64(len(fc.chunk)) < take {
+                        // v0.9.131 regrow: this chunk was trimmed by an
+                        // earlier pass and its allowance has since grown
+                        // (e.g. copytruncate shrank the live file). Re-read
+                        // exactly the bytes this join emits — keeps the
+                        // output byte-identical to the untrimmed cache.
+                        // (nil chunk = the update pass failed to read it:
+                        // keep v0.9.104 behaviour and emit nothing.)
+                        if data := readTailRegion(orderPaths[i], fc.size, take); data != nil {
+                                fc.chunk = data
+                        } else {
+                                take = int64(len(fc.chunk))
+                        }
+                }
+                if take > int64(len(fc.chunk)) {
                         take = int64(len(fc.chunk))
                 }
                 sb.Write(fc.chunk[int64(len(fc.chunk))-take:])

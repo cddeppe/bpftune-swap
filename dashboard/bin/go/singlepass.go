@@ -104,6 +104,8 @@ type midsampRow struct {
         Srate int64
         Rport string
         Dest  string  // v0.9.32: resolved dest for bucket filtering
+        Ts    float64 // v0.9.131: the event's own boot ktime (dedup identity)
+        Cookie int64  // v0.9.131: the event's cookie (dedup identity)
 }
 
 // parseLogSinglePass does ONE pass over text and extracts everything.
@@ -406,10 +408,12 @@ func parseLogSinglePass(text string) *parsedLog {
                                         }
                                 }
                                 pl.MidsampRows = append(pl.MidsampRows, midsampRow{
-                                        Thr:   thr,
-                                        Srate: srate,
-                                        Rport: mr[1],
-                                        Dest:  dest,
+                                        Thr:    thr,
+                                        Srate:  srate,
+                                        Rport:  mr[1],
+                                        Dest:   dest,
+                                        Ts:     mts,
+                                        Cookie: mcookie,
                                 })
                         }
 

@@ -87,9 +87,21 @@ var (
 
 	// v0.9.104 H6: throttle writeBucketSQLite to 60s (was 30s).
 	// Combined with the dedup hash, this cuts SQL round-trips by
-	// ~75% on stable hosts. Counted at collect cycle granularity.
-	sqliteWriteCycle   int64
-	sqliteWriteCycleMu sync.Mutex
+	// ~75% on stable hosts.
+	//
+	// v0.9.131 FIX: this used to be a per-CALL parity counter
+	// (sqliteWriteCycle++ on every writeBucketSQLite invocation).
+	// writeBucketSQLite is called once per HOST per cycle, so the
+	// counter advanced once per host, not once per cycle: with an
+	// EVEN number of hosts (e.g. 324 on the main host), the hosts
+	// at odd call positions were skipped on EVERY cycle — permanent
+	// silent data loss for ~half the buckets. The throttle is now
+	// time-based: a write pass is allowed only if ≥45s have passed
+	// since the last one, so every 30s cycle writes the whole fleet
+	// every other cycle (60s resolution), independent of host
+	// count, host order, and cycle timing jitter.
+	sqliteLastWriteAt int64 // unix seconds of the last allowed write pass
+	sqliteWriteMu     sync.Mutex
 )
 
 // sqlitePath returns the path to the SQLite database file.
@@ -383,16 +395,34 @@ func snapshotPreHash(mv, re, ss, bs, ns []interface{}, bestI int, bestAlg string
 	return h.Sum64()
 }
 
+// sqliteThrottleAllows decides whether this collect cycle may write bucket
+// rows to SQLite. All hosts in one cycle share the same `now`, so the
+// first caller through the gate stamps the cycle time and every other
+// caller in the same pass gets the same verdict. A new `now` is allowed
+// only once ≥45s have passed (30s cycles → every other cycle writes the
+// whole fleet, 60s row resolution — independent of host count/order).
+func sqliteThrottleAllows(now int64) bool {
+	sqliteWriteMu.Lock()
+	defer sqliteWriteMu.Unlock()
+	if now == sqliteLastWriteAt {
+		return true // same cycle as the stamping call
+	}
+	if sqliteLastWriteAt != 0 && now-sqliteLastWriteAt < 45 {
+		return false
+	}
+	sqliteLastWriteAt = now
+	return true
+}
+
 // writeBucketSQLite inserts a bucket snapshot into the SQLite database.
 // Called from writeBucketsCSV (dual-write during transition).
 func writeBucketSQLite(h hostEntry, now int64, rmemMin, rmemDef, rmemMax int) {
-	// v0.9.104 H6: throttle to 60s — skip odd cycles.
-	sqliteWriteCycleMu.Lock()
-	sqliteWriteCycle++
-	cycle := sqliteWriteCycle
-	sqliteWriteCycleMu.Unlock()
-	if cycle%2 == 1 {
-		return // odd cycle — skip; even cycle writes
+	// v0.9.104 H6: throttle to 60s.
+	// v0.9.131: time-based gate (see sqliteLastWriteAt comment) —
+	// the old per-call parity counter skipped the same hosts
+	// forever whenever the host count was even.
+	if !sqliteThrottleAllows(now) {
+		return
 	}
 	if sqliteDB == nil {
 		return

@@ -388,6 +388,9 @@ func (c *Collector) pickerWriteback() (hostsPatched, fieldsPatched int) {
 		return 0, 0
 	}
 	defer writebackMu.Unlock()
+	// v0.9.131: close this cycle's map fds before releasing the lock
+	// (LIFO: runs before the Unlock) — see closeMapFDs.
+	defer closeMapFDs()
 
 	mapIDs, err := resolveRemoteHostMapIDs()
 	if err != nil {

@@ -181,13 +181,26 @@ func (c *Collector) collect() {
                 if len(pl.MidsampRows) > 0 {
                         midsampEvents := make([]midsampEvent, 0, len(pl.MidsampRows))
                         for _, mr := range pl.MidsampRows {
+                                // v0.9.131 fix: pass each event's OWN boot ts
+                                // and cookie through. The old code stamped
+                                // every row with Cookie:0 / Ts:now, so all
+                                // rows in a cycle shared one dedup key
+                                // ("0:<now>") and writeMidsampCSV dropped
+                                // all but the FIRST row — midsamp.csv got at
+                                // most one sample per 30s cycle, and its
+                                // cookie/boot_ts columns were fake. Real
+                                // identity also makes the cycle-path keys
+                                // match the backfill path's keys (which
+                                // always parsed them from the log text), so
+                                // the first-cycle backfill no longer
+                                // double-writes.
                                 midsampEvents = append(midsampEvents, midsampEvent{
-                                        Ts:     float64(now),
+                                        Ts:     mr.Ts,
                                         Thr:    mr.Thr,
                                         Srate:  mr.Srate,
                                         Rport:  mr.Rport,
                                         Alg:    -1,
-                                        Cookie: 0,
+                                        Cookie: mr.Cookie,
                                 })
                         }
                         writeMidsampCSV(midsampEvents, now)
