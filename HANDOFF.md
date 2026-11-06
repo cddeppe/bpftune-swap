@@ -50,13 +50,19 @@ builder (amd64 first — creates the release; arm64 second — adds its
 deb):
 
     git clone https://github.com/cddeppe/bpftune-swap.git && cd bpftune-swap
-    gh auth login   # once per builder; the repo is PRIVATE
+    read -rs GH_TOKEN && export GH_TOKEN   # paste your PAT (Enter); stays out of shell history
     bash build-tuner-v0.4.108.sh
+
+NO gh CLI needed (the repo is public — clone is anonymous; only the tag
+push + release creation use the token, via curl). Works as root (no
+sudo needed) and on non-root. If the gh CLI IS present and authed, the
+script picks up its token automatically instead.
 
 (or `bash build-tuner-v0.4.108.sh --no-publish` for a build + verifier
 gate dry run that pushes nothing). The script enforces §0 end-to-end:
 fresh clone of the PINNED tip `735026d` (aborts if the branch moved or
 the parent is not v0.4.106), aborts if any `.bpf.c` changed, installs
+Build-Depends (explicit list — stock VPS images lack deb-src entries),
 Build-Depends, builds, runs the silent `bpftool prog load` gate,
 builds `bpftune_0.4.108_<arch>.deb`, pushes tag `v0.4.108` → `735026d`
 and verifies it on the remote BEFORE creating the release (with
