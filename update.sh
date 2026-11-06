@@ -191,7 +191,7 @@ if [ "$DO_TUNER" = 1 ]; then
     #   - new: bpftune-custom-0.4.95-amd64.deb
     #   - old: bpftune_0.4.93_amd64.deb
     DEB_INFO=$(
-        REPO="${REPO}" ARCH="${ARCH}" python3 2>/dev/null <<'PYEOF' || true
+        REPO="${REPO}" ARCH="${ARCH}" python3 <<'PYEOF' || true
 import json, os, re, sys, urllib.request
 
 repo = os.environ.get("REPO", "")
@@ -226,6 +226,21 @@ while page <= 10:
 
 if not candidates:
     sys.exit(0)
+
+# v0.4.107+ guard (2026-11-07): 0.4.107/0.4.108 are verifier-dead
+# (tcp_conn_tuner.bpf.c: "BPF program is too large. Processed 1000001
+# insn (limit 1000000)") and must never reach a host. Hard cap: the
+# update path will not offer any tuner .deb above 0.4.106. Raising this
+# is a deliberate one-line edit of MAX_VER - never done by publishing.
+MAX_VER = (0, 4, 106)
+skipped = [c for c in candidates if c[0] > MAX_VER]
+if skipped:
+    sys.stderr.write("guard: skipping newer tuner .deb %s - "
+        "verifier-dead 0.4.107+ is capped at 0.4.106\n"
+        % ", ".join(s[1] for s in skipped))
+    candidates = [c for c in candidates if c[0] <= MAX_VER]
+    if not candidates:
+        sys.exit(0)
 
 candidates.sort(key=lambda c: c[0], reverse=True)
 best = candidates[0]
