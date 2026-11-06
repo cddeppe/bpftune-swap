@@ -36,101 +36,12 @@ import (
 // fullMerge is what v0.9.128-131 computed EVERY cycle: dump all gens,
 // merge once. The v0.9.132+ steady path must reproduce this output from a
 // live-only dump plus the cached corpse contribution.
-func fullMerge(live, corpse []map[string]interface{}) []hostEntry {
-        raw := append(append([]map[string]interface{}{}, live...), corpse...)
-        out, err := mergeBPFMapEntries(raw)
-        if err != nil {
-                panic(err)
-        }
-        return out
-}
-
-func TestCorpseCacheSteadyStateMatchesFullMerge(t *testing.T) {
-        // Live map: 1.2.3.4 (also present as a fat corpse) + 9.9.9.9.
-        // Corpses: frozen 1.2.3.4 (must LOSE to live) + corpse-only 5.6.7.8.
-        live := []map[string]interface{}{
-                genEntry(1, 2, 3, 4, 0, 82, 187, 100),
-                genEntry(9, 9, 9, 9, 0, 40, 50, 60),
-        }
-        corpse := []map[string]interface{}{
-                genEntry(1, 2, 3, 4, 1, 726, 20, 5000),
-                genEntry(5, 6, 7, 8, 1, 726, 20, 5000),
-        }
-
-        want := fullMerge(live, corpse)
-
-        // Cache seeded from a full merge (what the legacy path does; a
-        // completed v0.9.133 warmup converges to the same state).
-        var cache corpseGenCache
-        cache.seedFromFullMerge([]int{282, 223}, want)
-
-        // Steady pass: merge ONLY the live dump, fold the cache.
-        liveOnly, err := mergeBPFMapEntries(append([]map[string]interface{}{}, live...))
-        if err != nil {
-                t.Fatalf("live-only merge: %v", err)
-        }
-        got := cache.fold(liveOnly)
-
-        if len(got) != len(want) {
-                t.Fatalf("steady output has %d buckets, full merge has %d — corpse-only labels lost", len(got), len(want))
-        }
-        byAddrWant := map[string]hostEntry{}
-        for _, h := range want {
-                byAddrWant[h.Addr] = h
-        }
-        for _, h := range got {
-                w, ok := byAddrWant[h.Addr]
-                if !ok {
-                        t.Fatalf("steady output has label %q the full merge lacks", h.Addr)
-                }
-                if h.Inst != w.Inst || h.Gen != w.Gen || h.MaxInst != w.MaxInst {
-                        t.Fatalf("label %q: steady {inst=%d gen=%d max=%d} != full {inst=%d gen=%d max=%d}",
-                                h.Addr, h.Inst, h.Gen, h.MaxInst, w.Inst, w.Gen, w.MaxInst)
-                }
-                // The metrics payload must be the same winner's values: compare the
-                // cubic rate_ema the way the v0.9.128 tests do.
-                if gotEMA, wantEMA := firstCubicEMA([]hostEntry{h}), firstCubicEMA([]hostEntry{w}); gotEMA != wantEMA {
-                        t.Fatalf("label %q: cubic rate_ema steady=%d full=%d", h.Addr, gotEMA, wantEMA)
-                }
-        }
-
-        // The fat corpse must NOT have won 1.2.3.4 in either path.
-        if e := findByAddr(got, ResolveBucket("1.2.3.4")); e == nil || firstCubicEMA([]hostEntry{*e}) != 82 {
-                t.Fatalf("live 1.2.3.4 must win with rate_ema 82 in the steady path too")
-        }
-        // The corpse-only label must survive the steady path.
-        if e := findByAddr(got, ResolveBucket("5.6.7.8")); e == nil || e.Gen != 1 {
-                t.Fatalf("corpse-only 5.6.7.8 must survive the steady path with Gen=1")
-        }
-}
-
-func TestCorpseCacheLiveRegainsLabelSkipsCorpse(t *testing.T) {
-        // Corpse-only label 5.6.7.8 is cached; the live map later re-gains it.
-        corpse := []map[string]interface{}{genEntry(5, 6, 7, 8, 1, 726, 20, 5000)}
-        want := fullMerge(nil, corpse)
-        var cache corpseGenCache
-        cache.seedFromFullMerge([]int{282, 223}, want)
-
-        liveNow := []map[string]interface{}{genEntry(5, 6, 7, 8, 0, 11, 22, 33)}
-        liveMerged, err := mergeBPFMapEntries(liveNow)
-        if err != nil {
-                t.Fatalf("merge: %v", err)
-        }
-        got := cache.fold(liveMerged)
-
-        if len(got) != 1 {
-                t.Fatalf("expected 1 bucket, got %d", len(got))
-        }
-        if got[0].Gen != 0 || firstCubicEMA(got) != 11 {
-                t.Fatalf("live-regained label must win: got Gen=%d ema=%d, want Gen=0 ema=11", got[0].Gen, firstCubicEMA(got))
-        }
-}
-
-// TestCorpseCacheCadence lived here until v0.9.133 replaced the
-// every-10-calls full refresh with the per-call round-robin sweep. The
-// cadence semantics are now tested in v0_9_133_test.go
-// (TestCorpseSweepCursorRoundRobin, TestCorpseWarmupProgressive,
-// TestCorpseIDSetChangeRewarms).
+// (v0.9.134) TestCorpseCacheSteadyStateMatchesFullMerge and
+// TestCorpseCacheLiveRegainsLabelSkipsCorpse tested the v0.9.132/133
+// round-robin VALUE cache, deleted in v0.9.134 after the production
+// freshness regression (stale corpse display vs fresh swap trackers).
+// Their intent is ported to v0_9_134_test.go:
+// TestCorpseSteadyStateMatchesFullMerge and TestCorpseLiveRegainsLabelSkipsCorpse.
 
 func TestSameIntIDs(t *testing.T) {
         cases := []struct {

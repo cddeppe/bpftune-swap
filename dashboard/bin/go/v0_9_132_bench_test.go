@@ -146,55 +146,171 @@ func benchBefore(b *testing.B, n int) {
         }
 }
 
-// benchAfter measures ONE v0.9.133 steady cycle at N gens: parse the live
-// generation (gen 0) plus ONE corpse generation (round-robin, like
-// nextSweepRank), merge both, storeGen the corpse step, fold the cache.
-// Every cycle costs the same — that is the point of v0.9.133. The cache is
-// seeded once (the legacy error path does this after a full merge; a
-// completed warmup converges to the same state — proven in
-// v0_9_133_test.go).
+// benchAfter measures ONE v0.9.134 STEADY cycle at N gens (nothing in
+// the corpse maps changed): parse + merge the live generation, build the
+// live-label set, then selectCorpseCarried — a label pass per corpse key
+// (real per-cycle work), one value lookup per corpse-carried label key
+// (modeled here as the byte copy the syscall performs) plus the
+// byte-compare against the cached signature, and ZERO parses (the
+// byte-validated cache). The key-set walk itself is
+// BPF_MAP_GET_NEXT_KEY syscalls — not measurable in a sandbox, ~µs per
+// key, ~10ms at 16 gens x 324 keys. In THIS geometry (disjoint
+// generations — every corpse label is corpse-carried) that is the WORST
+// case for lookups and label passes.
 func benchAfter(b *testing.B, n int) {
-        gens := benchFixture(n)
+	gens := benchFixture(n)
 
-        // Setup (NOT per-op): seed the cache from a full all-gens merge,
-        // exactly what seedFromFullMerge does on the legacy error path.
-        var all []map[string]interface{}
-        for g := 0; g < n; g++ {
-                all = append(all, parseGen(gens[g], g)...)
-        }
-        merged, err := mergeBPFMapEntries(all)
-        if err != nil {
-                b.Fatal(err)
-        }
-        var cache corpseGenCache
-        ids := make([]int, n)
-        for i := range ids {
-                ids[i] = 500 - i // newest first, like resolveRemoteHostMapIDs
-        }
-        cache.seedFromFullMerge(ids, merged)
+	// Setup (NOT per-op): per-generation key lists + key->value stores,
+	// then one warm cycle to populate the byte-validated cache.
+	type genStore struct {
+		keys [][]byte
+		vals map[string][]byte
+	}
+	stores := make([]genStore, n)
+	for g := 0; g < n; g++ {
+		stores[g].keys = make([][]byte, len(gens[g]))
+		stores[g].vals = make(map[string][]byte, len(gens[g]))
+		for i, kv := range gens[g] {
+			stores[g].keys[i] = kv.key
+			stores[g].vals[string(kv.key)] = kv.val
+		}
+	}
+	buildFeeds := func() []corpseMapFeed {
+		feeds := make([]corpseMapFeed, 0, n-1)
+		for g := 1; g < n; g++ {
+			st := stores[g]
+			feeds = append(feeds, corpseMapFeed{
+				rank:  g,
+				keys:  st.keys,
+				label: func(key []byte) (string, bool) { return rawKeyToFinalLabel(key) },
+				lookup: func(key []byte) ([]byte, bool) {
+					val, ok := st.vals[string(key)]
+					if !ok {
+						return nil, false
+					}
+					out := make([]byte, len(val)) // the syscall's copy
+					copy(out, val)
+					return out, true
+				},
+			})
+		}
+		return feeds
+	}
+	liveRaw := parseGen(gens[0], 0)
+	live, err := mergeBPFMapEntriesCore(liveRaw)
+	if err != nil {
+		b.Fatal(err)
+	}
+	liveLabels := make(map[string]bool, len(live))
+	for idx := range live {
+		liveLabels[live[idx].Addr] = true
+	}
+	selectCorpseCarried(buildFeeds(), liveLabels) // warm the cache
 
-        b.ReportAllocs()
-        b.ResetTimer()
-        for i := 0; i < b.N; i++ {
-                // (1) sweep step: one corpse generation, round-robin.
-                rank := 1 + (i % (n - 1))
-                corpseMerged, err := mergeBPFMapEntries(parseGen(gens[rank], rank))
-                if err != nil {
-                        b.Fatal(err)
-                }
-                cache.storeGen(rank, corpseMerged)
-                // (2) live dump + merge + fold.
-                live, err := mergeBPFMapEntries(parseGen(gens[0], 0))
-                if err != nil {
-                        b.Fatal(err)
-                }
-                out := cache.fold(live)
-                if len(out) != n*benchHostsPerGen {
-                        b.Fatalf("steady output %d, want %d (corpse-only labels lost)", len(out), n*benchHostsPerGen)
-                }
-        }
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		live, err := mergeBPFMapEntriesCore(liveRaw)
+		if err != nil {
+			b.Fatal(err)
+		}
+		liveLabels := make(map[string]bool, len(live))
+		for idx := range live {
+			liveLabels[live[idx].Addr] = true
+		}
+		out := append([]hostEntry(nil), live...)
+		out = append(out, selectCorpseCarried(buildFeeds(), liveLabels)...)
+		if len(out) != n*benchHostsPerGen {
+			b.Fatalf("steady output %d, want %d (corpse-carried labels lost)", len(out), n*benchHostsPerGen)
+		}
+	}
 }
 
+// benchAfterChurn measures the v0.9.134 WORST window: every corpse value
+// changed every cycle (a live zombie program updating the old map — or
+// the first cycle after a collector restart, with a cold cache). Every
+// corpse-carried label re-parses; the label-level merge keeps the peak
+// parsed-entry set at ONE label, never the N-gens slice.
+func benchAfterChurn(b *testing.B, n int) {
+	gens := benchFixture(n)
+	type genStore struct {
+		keys [][]byte
+		vals map[string][]byte
+	}
+	stores := make([]genStore, n)
+	for g := 0; g < n; g++ {
+		stores[g].keys = make([][]byte, len(gens[g]))
+		stores[g].vals = make(map[string][]byte, len(gens[g]))
+		for i, kv := range gens[g] {
+			stores[g].keys[i] = kv.key
+			stores[g].vals[string(kv.key)] = kv.val
+		}
+	}
+	buildFeeds := func(cycle int) []corpseMapFeed {
+		feeds := make([]corpseMapFeed, 0, n-1)
+		for g := 1; g < n; g++ {
+			st := stores[g]
+			churn := cycle // every value "changes" every cycle
+			feeds = append(feeds, corpseMapFeed{
+				rank:  g,
+				keys:  st.keys,
+				label: func(key []byte) (string, bool) { return rawKeyToFinalLabel(key) },
+				lookup: func(key []byte) ([]byte, bool) {
+					val, ok := st.vals[string(key)]
+					if !ok {
+						return nil, false
+					}
+					out := make([]byte, len(val))
+					copy(out, val)
+					// model a value update: flip a byte so the signature
+					// compare misses and the label re-parses
+					out[0] = byte(churn)
+					return out, true
+				},
+			})
+		}
+		return feeds
+	}
+	liveRaw := parseGen(gens[0], 0)
+	live, err := mergeBPFMapEntriesCore(liveRaw)
+	if err != nil {
+		b.Fatal(err)
+	}
+	liveLabels := make(map[string]bool, len(live))
+	for idx := range live {
+		liveLabels[live[idx].Addr] = true
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resetCorpseViewForBench()
+		live, err := mergeBPFMapEntriesCore(liveRaw)
+		if err != nil {
+			b.Fatal(err)
+		}
+		liveLabels := make(map[string]bool, len(live))
+		for idx := range live {
+			liveLabels[live[idx].Addr] = true
+		}
+		out := append([]hostEntry(nil), live...)
+		out = append(out, selectCorpseCarried(buildFeeds(i+1), liveLabels)...)
+		if len(out) != n*benchHostsPerGen {
+			b.Fatalf("churn output %d, want %d", len(out), n*benchHostsPerGen)
+		}
+	}
+}
+
+func resetCorpseViewForBench() {
+	corpseViewMu.Lock()
+	corpseView = map[string]*corpseLabelCache{}
+	corpseViewMu.Unlock()
+}
+
+// The measured entry points. Before = the v0.9.127-131 full dump every
+// cycle; After = the v0.9.134 steady cycle (byte-validated cache, zero
+// corpse parses); AfterChurn = the worst window (every corpse value
+// changed — cold cache or a live zombie).
 func BenchmarkCorpseTaxBefore2Gens(b *testing.B)  { benchBefore(b, 2) }
 func BenchmarkCorpseTaxBefore8Gens(b *testing.B)  { benchBefore(b, 8) }
 func BenchmarkCorpseTaxBefore16Gens(b *testing.B) { benchBefore(b, 16) }
@@ -202,3 +318,7 @@ func BenchmarkCorpseTaxBefore16Gens(b *testing.B) { benchBefore(b, 16) }
 func BenchmarkCorpseTaxAfter2Gens(b *testing.B)  { benchAfter(b, 2) }
 func BenchmarkCorpseTaxAfter8Gens(b *testing.B)  { benchAfter(b, 8) }
 func BenchmarkCorpseTaxAfter16Gens(b *testing.B) { benchAfter(b, 16) }
+
+func BenchmarkCorpseTaxChurn2Gens(b *testing.B)  { benchAfterChurn(b, 2) }
+func BenchmarkCorpseTaxChurn8Gens(b *testing.B)  { benchAfterChurn(b, 8) }
+func BenchmarkCorpseTaxChurn16Gens(b *testing.B) { benchAfterChurn(b, 16) }

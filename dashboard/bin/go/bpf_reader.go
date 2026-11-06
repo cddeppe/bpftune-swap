@@ -35,7 +35,6 @@ import (
         "fmt"
         "os"
         "os/exec"
-        "sort"
         "strconv"
         "strings"
         "sync"
@@ -180,262 +179,339 @@ var (
 const bpfMapCacheTTL = 60 * time.Second
 
 // ============================================================================
-// v0.9.133: incremental corpse cache — flat per-cycle cost, no all-gens
-// spikes (supersedes the v0.9.132 frozen-generation cache)
+// v0.9.134: fresh corpse view at flat cost — per-cycle key discovery +
+// byte-validated per-label cache (supersedes the v0.9.133 round-robin
+// VALUE cache)
 // ============================================================================
 //
-// v0.9.132 removed the per-cycle corpse tax but kept TWO all-gens dumps:
-// the every-10th-cycle cache refresh, and the first call after startup
-// (plus every reload). On a host with N accumulated generations ONE 30s
-// cycle still dumped and parsed N x ~324 entries (~165ms CPU + ~120MB of
-// allocations at N=16, real fleet geometry) — a CPU/GC spike every ~5
-// minutes, and at startup the single largest allocation event of the
-// process's life. Worse: readMapGens holds ALL generations' parsed entries
-// live in one slice until the merge returns, so at N > ~30 the live heap
-// alone (~240MB) walks through the watchdog's strict RSS arm (250MB, no
-// startup grace, 2-strike kill) -> kill -> systemd restart -> identical
-// spike -> the memory edition of the suicide loop v0.9.132 only gave a
-// CPU-arm grace.
+// REGRESSION THIS FIXES (observed in production within hours of v0.9.133
+// shipping): the swap-target leaderboard and the actual swaps disagreed
+// again — the exact v0.9.129 symptom. Root cause: v0.9.133 cached the
+// PARSED values of corpse-carried labels and refreshed one corpse
+// generation per cycle (round-robin), so a label carried only by corpses
+// was displayed up to (N-1) x 30s stale — ~8 minutes at 16 generations.
+// But corpse maps are NOT frozen: the collector's own streak writeback
+// patches bad_streak/null_streak on EVERY generation every 60s, the picker
+// writeback patches tracker fields, and an attached zombie program may
+// still update metrics. The pick highlight is computed from the DISPLAYED
+// penalty (16/(16+bad*4+null*2)) while the swap-driving tracker is
+// recomputed from the CURRENT map values — a stale display picked a
+// different winner than the live tracker. v0.9.128-131 never had this
+// class of bug because they re-read every generation fresh every cycle.
 //
-// v0.9.133 makes the cost FLAT: every dump call reads the live map plus
-// AT MOST ONE corpse generation (round-robin), no matter how many
-// generations exist. No call ever parses more than 2 maps.
+// v0.9.134 restores that freshness invariant WITHOUT the v0.9.128-131
+// cost. Every cycle:
 //
-// The cache stores, per corpse-carried label, the entry of the NEWEST
-// corpse generation carrying it — the same value the full merge's
-// generation rules pick (a newer gen replaces outright, an older gen is
-// skipped). Refreshing generation rank k stores k's entries only where k
-// is the newest carrier: an existing cache entry with a LOWER rank (a
-// NEWER generation) keeps the label; a HIGHER rank (older) is overwritten.
-// Because corpses are frozen, entries older than one sweep are still
-// correct; the sweep only refreshes what the collector itself can write
-// into a corpse (picker-writeback tracker fields, every 10th pass). After
-// one full round-robin sweep the cache equals the Gen>0 slice of the full
-// all-gens merge — proven by test, including randomized generation
-// contents (v0_9_133_test.go).
+//   1. dump the LIVE map only (as v0.9.133) — its labels are complete,
+//      fresh data from cycle 1;
+//   2. walk each corpse map's KEY SET (BPF_MAP_GET_NEXT_KEY only — no
+//      values): cheap cursor syscalls, no parse, no allocation spike
+//      (~10ms at 16 gens x 324 keys);
+//   3. for every corpse-carried label (absent from the live map, newest
+//      carrier), LOOK UP its key(s)' current value bytes and compare
+//      them byte-for-byte with the cached copy:
+//        - identical  -> reuse the cached merged entry (no parse) — and
+//          because the bytes match, the cached entry IS the current map
+//          state, bit for bit. No staleness is possible.
+//        - changed    -> re-parse that label (and only that label).
 //
-// Differences from v0.9.132, all improvements:
-//   - the every-10-cycle refresh spike is gone (one corpse map per cycle);
-//   - the startup/reload full dump is gone: warmup is incremental, one
-//     corpse generation per cycle (corpse-only labels appear over the
-//     first N cycles — logged; the live map is complete from cycle 1);
-//   - when the live map DROPS a label, the corpse fallback now appears
-//     the NEXT cycle. v0.9.132 needed the next 10-cycle refresh to even
-//     notice: its refresh-time Gen>0 slice never contained labels the
-//     then-live map carried, so a newly-dropped label lost its corpse
-//     history for up to 5 minutes.
+// So the per-cycle parse volume is bounded by the ACTUAL CHANGE RATE of
+// corpse maps (streak/tracker patches, zombie writes), not by their size:
+// an inert corpse costs one 1024-byte lookup per label per cycle and zero
+// parses; the freshly-reloaded window (live map has not re-seen the tail
+// yet) pays the full parse ONCE and then only for what actually changes.
+// The label-level merge keeps the peak parsed-entry set at ONE label
+// (1-2 entries) — never the N-gens-in-one-slice peak that walked into the
+// watchdog's no-grace RSS arm.
 //
-// A reload (id set change) re-ranks generations, so the cache resets and
-// re-warms incrementally — deliberately NOT a one-shot full rebuild: the
-// reload moment is exactly when the tuner is re-initializing BPF and the
-// box is busiest; the last thing to add there is an N-map dump burst.
-// The legacy error path still computes a full all-gens merge when it runs
-// (rare); it seeds the cache from that merge for free.
+// Output equals the v0.9.128-131 full all-gens merge EVERY cycle (not
+// just at sweep boundaries), corpse-only labels are fresh every cycle,
+// and everything is present from the FIRST cycle — no warmup window.
 
-type corpseBestEnt struct {
-        ent  hostEntry
-        rank int // generation rank that supplied it (1 = newest corpse; 0 = live, unused here)
+// corpseMapFeed is the per-map access a corpse generation exposes to the
+// selector: its full key set, the final-label derivation for a key, and a
+// raw value lookup (the 1024-byte map value). Abstract so the selection
+// core is unit-testable without BPF.
+type corpseMapFeed struct {
+	rank   int                                        // generation rank (1 = newest corpse)
+	keys   [][]byte                                   // every key in the map
+	label  func(key []byte) (final string, isV6 bool) // same normalization as mergeBPFMapEntriesCore
+	lookup func(key []byte) ([]byte, bool)            // raw value bytes (copy)
 }
 
-type corpseGenCache struct {
-        ids     []int                    // id set the cache is built from, newest first; len = generations
-        best    map[string]corpseBestEnt // corpse-carried label -> newest carrier's entry
-        labels  []hostEntry              // best values, sorted by Addr (the fold input)
-        cursor  int                      // round-robin position over corpse ranks 1..len(ids)-1
-        warmed  int                      // sweep steps completed since the last reset
-        warmDone bool                    // "warmup complete" logged once
-        calls   int                      // dump calls seen (diagnostics)
+// corpseLabelCache is the byte-validated per-label cache entry.
+type corpseLabelCache struct {
+	ent  hostEntry            // merged entry (Gen = rank when built)
+	rank int                  // carrier rank at build time
+	sigs map[string][]byte    // key (hex) -> value bytes at build time
 }
 
+// corpseViewMu guards corpseView (readBPFMap is single-threaded per
+// cycle, but the mutex keeps the invariant explicit and race-detector
+// clean).
 var (
-        corpseCacheMu sync.Mutex
-        corpseCache   = corpseGenCache{}
+	corpseViewMu sync.Mutex
+	corpseView   = map[string]*corpseLabelCache{} // label -> cached state
+
+	// corpseParse is the parse seam: tests wrap it to count parses (the
+	// steady-cycle parse bound is a shipped property, not a hope).
+	corpseParse = parseRawHostEntry
 )
+
+// selectCorpseCarried is the pure selection + cache-validation core.
+// Feeds are processed newest carrier first; a label carried by the live
+// map (liveLabels) is never fetched, and a label claimed by a newer
+// corpse generation is not re-fetched from older ones. A cached entry is
+// reused ONLY when the carrier rank and EVERY key's current value bytes
+// equal the cached copy — so a reused entry is the current map state,
+// bit for bit. Returns the per-label hostEntries (Gen = carrier rank) in
+// deterministic order (feeds in slice order, then first-seen label
+// order). Cache entries for labels not selected this cycle are pruned,
+// bounding the cache at the current corpse-carried label set.
+func selectCorpseCarried(feeds []corpseMapFeed, liveLabels map[string]bool) []hostEntry {
+	corpseViewMu.Lock()
+	defer corpseViewMu.Unlock()
+
+	claimed := make(map[string]bool, len(liveLabels)+16)
+	for l := range liveLabels {
+		claimed[l] = true
+	}
+	seen := make(map[string]bool, len(corpseView))
+	var out []hostEntry
+	for _, f := range feeds {
+		// One pass over this map's keys: group by final label (the label
+		// pass is real per-cycle work — it is what keeps discovery fresh).
+		byLabel := make(map[string][][]byte, len(f.keys))
+		var order []string
+		for _, key := range f.keys {
+			final, _ := f.label(key)
+			if final == "" {
+				continue
+			}
+			if claimed[final] {
+				continue // live map or a newer corpse supplies this label
+			}
+			if _, seenLabel := byLabel[final]; !seenLabel {
+				order = append(order, final)
+			}
+			byLabel[final] = append(byLabel[final], key)
+		}
+		for _, final := range order {
+			claimed[final] = true // this map is the NEWEST carrier
+			seen[final] = true
+
+			// Fetch every key's current bytes (the freshness check).
+			sigs := make(map[string][]byte, len(byLabel[final]))
+			ok := true
+			for _, k := range byLabel[final] {
+				val, found := f.lookup(k)
+				if !found || len(val) != sizeofRemoteHost {
+					ok = false
+					break
+				}
+				sigs[string(k)] = val
+			}
+			if !ok {
+				delete(corpseView, final) // a key vanished mid-cycle — rebuild next time
+				continue
+			}
+
+			// Byte-validated cache hit?
+			if c, cached := corpseView[final]; cached && c.rank == f.rank && sigsEqual(c.sigs, sigs) {
+				ent := c.ent
+				ent.Gen = f.rank
+				out = append(out, ent)
+				continue
+			}
+
+			// Miss / changed / carrier moved: re-parse this label only.
+			var raw []map[string]interface{}
+			for _, k := range byLabel[final] {
+				e := corpseParse(k, sigs[string(k)])
+				e["map_gen"] = float64(f.rank)
+				raw = append(raw, e)
+			}
+			merged, err := mergeBPFMapEntriesCore(raw)
+			if err != nil || len(merged) == 0 {
+				delete(corpseView, final)
+				continue
+			}
+			corpseView[final] = &corpseLabelCache{ent: merged[0], rank: f.rank, sigs: sigs}
+			out = append(out, merged[0])
+		}
+	}
+	// Prune labels not selected this cycle (dropped keys, labels the live
+	// map regained, maps that vanished) — bounds the cache at the current
+	// corpse-carried set.
+	for l := range corpseView {
+		if !seen[l] {
+			delete(corpseView, l)
+		}
+	}
+	return out
+}
+
+// sigsEqual compares two key->bytes signature maps byte-for-byte.
+func sigsEqual(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || !bytes.Equal(va, vb) {
+			return false
+		}
+	}
+	return true
+}
+
+// rawKeyToFinalLabel derives the final merge label from a raw 16-byte map
+// key, mirroring the byte-level logic in mergeBPFMapEntriesCore (v4
+// dotted-quad or v6:XXXXXXXX, ResolveBucket canon, cookie-dest fallback
+// for unresolvable v6 labels). Used BEFORE any value fetch so discovery
+// costs no lookups.
+func rawKeyToFinalLabel(key []byte) (string, bool) {
+	if len(key) != 16 {
+		return "", false
+	}
+	var addr string
+	isV6 := false
+	if key[10] == 0xff && key[11] == 0xff {
+		addr = fmt.Sprintf("%d.%d.%d.%d", key[12], key[13], key[14], key[15])
+	} else {
+		v6 := (int(key[0]) << 24) | (int(key[1]) << 16) | (int(key[2]) << 8) | int(key[3])
+		if v6 != 0 {
+			addr = fmt.Sprintf("v6:%08x", v6)
+			isV6 = true
+		} else {
+			addr = "0.0.0.0"
+		}
+	}
+	final := ResolveBucket(addr)
+	if final == "" {
+		final = addr
+	}
+	if strings.HasPrefix(final, "v6:") {
+		if v4Label := v6ToV4Label(addr); v4Label != "" {
+			final = v4Label
+		}
+	}
+	return final, isV6
+}
+
+// readCorpseCarriedRaw wires selectCorpseCarried to the real maps: for
+// each corpse generation (rank 1..len(mapIDs)-1, newest first) it opens a
+// VERIFIED fd (proven remote_host_map; closed per cycle — the collector
+// never pins a corpse across cycles, v0.9.131), walks the key set, and
+// looks up value bytes on demand. A map that fails to open/read is
+// skipped for this cycle (its labels reappear when it does); the id-set
+// list is refreshed by resolveRemoteHostMapIDs on its own cadence.
+func readCorpseCarriedRaw(mapIDs []int, liveLabels map[string]bool) []hostEntry {
+	feeds := make([]corpseMapFeed, 0, len(mapIDs)-1)
+	var fds []int
+	for rank := 1; rank < len(mapIDs); rank++ {
+		id := mapIDs[rank]
+		fd, info, err := bpfMapGetFDByIDVerified(uint32(id), "remote_host")
+		if err != nil {
+			continue // unreadable this cycle — skip, do not fail the cycle
+		}
+		if info.KeySize != 16 || info.ValueSize != sizeofRemoteHost {
+			bpfCloseFD(fd)
+			continue // wrong geometry — the parser's contract
+		}
+		f := corpseMapFeed{rank: rank}
+		f.label = func(key []byte) (string, bool) { return rawKeyToFinalLabel(key) }
+		f.lookup = func(key []byte) ([]byte, bool) {
+			value := make([]byte, sizeofRemoteHost)
+			if err := bpfMapLookupElem(fd, key, value); err != nil {
+				return nil, false // key vanished mid-cycle
+			}
+			return value, true
+		}
+		// Key-set walk: BPF_MAP_GET_NEXT_KEY only (no values). curKey
+		// nil = start; walk on a COPY (kernel contract, same as
+		// readRemoteHostMapByID).
+		var keys [][]byte
+		nextKey := make([]byte, 16)
+		var curKey []byte
+		for {
+			ok, err := bpfMapGetNextKey(fd, curKey, nextKey)
+			if err != nil || !ok {
+				break
+			}
+			k := make([]byte, 16)
+			copy(k, nextKey)
+			keys = append(keys, k)
+			curKey = append(curKey[:0], nextKey...)
+		}
+		f.keys = keys
+		feeds = append(feeds, f)
+		fds = append(fds, fd) // closed below, AFTER selection completes
+	}
+	out := selectCorpseCarried(feeds, liveLabels)
+	for _, fd := range fds {
+		bpfCloseFD(fd)
+	}
+	return out
+}
+
+// lastCorpseIDSet remembers the previous generation id list for the
+// one-line reload notice (diagnostics only — no correctness role: the
+// byte-validated cache needs no reset on reload, the per-label rank +
+// signature check handles re-ranking).
+var lastCorpseIDSet []int
 
 // sameIntIDs reports whether two id slices are element-wise equal.
 func sameIntIDs(a, b []int) bool {
-        if len(a) != len(b) {
-                return false
-        }
-        for i := range a {
-                if a[i] != b[i] {
-                        return false
-                }
-        }
-        return true
-}
-
-// noteIDs records the current id set and reports whether it changed (a
-// reload re-ranks generations, so a change resets the cache for an
-// incremental re-warm). Same set -> no change.
-func (c *corpseGenCache) noteIDs(ids []int) bool {
-        if c.ids != nil && sameIntIDs(c.ids, ids) {
-                return false
-        }
-        c.ids = append([]int(nil), ids...)
-        c.best = map[string]corpseBestEnt{}
-        c.labels = nil
-        c.cursor = 0
-        c.warmed = 0
-        c.warmDone = false
-        return true
-}
-
-// nextSweepRank picks the next corpse generation to refresh (round-robin
-// over ranks 1..len(ids)-1) and advances the cursor. Returns 0 when there
-// are no corpse generations. The cursor advances per ATTEMPT, so a
-// permanently unreadable corpse is retried once per round instead of
-// stalling the sweep (its previous slice — frozen data — stays cached).
-func (c *corpseGenCache) nextSweepRank() int {
-        corpses := len(c.ids) - 1
-        if corpses <= 0 {
-                return 0
-        }
-        rank := c.cursor + 1
-        c.cursor = (c.cursor + 1) % corpses
-        return rank
-}
-
-// storeGen folds one freshly dumped + merged corpse generation (rank >= 1)
-// into the cache. k's entry wins a label only when no NEWER corpse
-// generation (lower rank) already supplies it. Returns true exactly once,
-// when the post-reset warmup completes (for the one-shot log line).
-func (c *corpseGenCache) storeGen(rank int, merged []hostEntry) bool {
-        if rank <= 0 || rank >= len(c.ids) {
-                return false
-        }
-        for _, h := range merged {
-                if cur, ok := c.best[h.Addr]; ok && cur.rank < rank {
-                        continue // a newer corpse generation supplies this label
-                }
-                c.best[h.Addr] = corpseBestEnt{ent: h, rank: rank}
-        }
-        c.recomputeLabels()
-        if c.warmed < len(c.ids)-1 {
-                c.warmed++
-                if c.warmed == len(c.ids)-1 && !c.warmDone {
-                        c.warmDone = true
-                        return true
-                }
-        }
-        return false
-}
-
-// recomputeLabels rebuilds the sorted fold input from best.
-func (c *corpseGenCache) recomputeLabels() {
-        out := make([]hostEntry, 0, len(c.best))
-        for _, b := range c.best {
-                out = append(out, b.ent)
-        }
-        sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
-        c.labels = out
-}
-
-// seedFromFullMerge installs the Gen>0 slice of a full all-gens merge —
-// the exact end state a completed round-robin sweep converges to. Used by
-// the legacy error path, which already paid for the full dump.
-func (c *corpseGenCache) seedFromFullMerge(ids []int, merged []hostEntry) {
-        c.ids = append([]int(nil), ids...)
-        c.best = map[string]corpseBestEnt{}
-        for _, h := range merged {
-                if h.Gen > 0 {
-                        c.best[h.Addr] = corpseBestEnt{ent: h, rank: h.Gen}
-                }
-        }
-        if n := len(ids) - 1; n > 0 {
-                c.warmed = n
-        } else {
-                c.warmed = 0
-        }
-        c.cursor = 0
-        c.warmDone = true
-        c.recomputeLabels()
-}
-
-// fold appends cached corpse labels that the live merge does not have —
-// the same "live wins per label" rule the full merge applies to corpse
-// entries. The returned slice may alias live when there is nothing to add.
-func (c *corpseGenCache) fold(live []hostEntry) []hostEntry {
-        if len(c.labels) == 0 {
-                return live
-        }
-        have := make(map[string]bool, len(live))
-        for _, h := range live {
-                have[h.Addr] = true
-        }
-        out := live
-        for _, h := range c.labels {
-                if !have[h.Addr] {
-                        out = append(out, h)
-                }
-        }
-        return out
-}
-
-// readGenTagged dumps ONE map by its rank in mapIDs and tags every entry
-// with that rank. readMapGens cannot be reused here: it ranks by the list
-// passed to it, so a single-element list would tag a corpse as gen 0
-// (live).
-func readGenTagged(mapIDs []int, rank int) ([]map[string]interface{}, error) {
-        raw, err := readRemoteHostMapByID(mapIDs[rank])
-        if err != nil {
-                return nil, err
-        }
-        for i := range raw {
-                raw[i]["map_gen"] = float64(rank)
-        }
-        return raw, nil
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func readBPFMap() ([]hostEntry, error) {
-        // v0.9.133: resolve the id set up front; the sweep plan and the
-        // reload reset both hang off it.
+        // v0.9.134: live dump + per-cycle corpse key discovery + targeted
+        // value lookups. Everything is fresh every cycle (the v0.9.128-131
+        // invariant the leaderboard<->swap agreement is built on); nothing
+        // caches parsed values across cycles.
         mapIDs, idErr := resolveRemoteHostMapIDs()
-
-        corpseCacheMu.Lock()
-        corpseCache.calls++
-        sweepRank := 0
-        reload := false
-        if idErr == nil {
-                reload = corpseCache.noteIDs(mapIDs)
-                sweepRank = corpseCache.nextSweepRank()
-        }
-        corpseCacheMu.Unlock()
-        if reload && len(mapIDs) > 1 {
-                fmt.Fprintf(os.Stderr, "corpse cache: map set changed (%d generations) — re-warming corpse data 1 gen/cycle\n", len(mapIDs))
+        if idErr == nil && !sameIntIDs(lastCorpseIDSet, mapIDs) {
+                lastCorpseIDSet = append([]int(nil), mapIDs...)
+                if len(mapIDs) > 1 {
+                        fmt.Fprintf(os.Stderr, "corpse view: %d remote_host_map generations — reading corpse-carried labels fresh every cycle\n", len(mapIDs))
+                }
         }
 
         if idErr == nil && len(mapIDs) > 0 {
-                // (1) Sweep step: dump ONE corpse generation (round-robin).
-                // A dump failure keeps the previous slice — corpse data is
-                // frozen, so a stale slice is still correct; the id-set
-                // check catches maps that actually disappear.
-                if sweepRank > 0 {
-                        if raw, err := readGenTagged(mapIDs, sweepRank); err == nil {
-                                if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
-                                        corpseCacheMu.Lock()
-                                        warmDone := corpseCache.storeGen(sweepRank, merged)
-                                        corpseCacheMu.Unlock()
-                                        if warmDone {
-                                                fmt.Fprintf(os.Stderr, "corpse cache: warmup complete (%d corpse gens, %d labels) — steady state\n",
-                                                        len(mapIDs)-1, len(corpseCache.labels))
-                                        }
-                                }
-                        }
-                }
-                // (2) Live dump: ONLY the newest generation.
+                // (1) Live dump: ONLY the newest generation — fresh, complete
+                // for its labels from cycle 1.
                 if raw, err := readMapGens(mapIDs[:1]); err == nil {
-                        if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
-                                corpseCacheMu.Lock()
-                                out := corpseCache.fold(merged)
-                                corpseCacheMu.Unlock()
-                                // mergeBPFMapEntries cached the live-only merge for the
-                                // fallback path; replace it with the folded result so a
-                                // fallback snapshot still carries the corpse-only labels.
+                        live, mErr := mergeBPFMapEntriesCore(raw)
+                        if mErr == nil {
+                                out := live
+                                if len(mapIDs) > 1 {
+                                        // (2) Corpse-carried labels: key-set discovery
+                                        // over every corpse generation + value fetch ONLY
+                                        // for labels the live map lacks (newest carrier).
+                                        // Fresh every cycle — a streak/tracker patch a
+                                        // corpse received seconds ago is on the
+                                        // leaderboard THIS cycle.
+                                        liveLabels := make(map[string]bool, len(live))
+                                        for i := range live {
+                                                liveLabels[live[i].Addr] = true
+                                        }
+                                        out = append(out, readCorpseCarriedRaw(mapIDs, liveLabels)...)
+                                }
                                 if collectorMode.CacheBPFMap {
                                         bpfMapCache = out
                                         bpfMapCacheErr = nil
                                         bpfMapCacheAt = time.Now()
+                                        bpfMapCacheSize = len(raw)
                                 }
                                 return out, nil
                         }
@@ -456,11 +532,6 @@ func readBPFMap() ([]hostEntry, error) {
                 // (rate_ema, streaks, swap_score) out of the leaderboard.
                 bpfMapCacheSize = len(raw)
                 if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
-                        if ids, rErr := resolveRemoteHostMapIDs(); rErr == nil {
-                                corpseCacheMu.Lock()
-                                corpseCache.seedFromFullMerge(ids, merged)
-                                corpseCacheMu.Unlock()
-                        }
                         return merged, nil
                 }
                 return mergeBPFMapEntries(raw)
@@ -527,6 +598,23 @@ func readBPFMap() ([]hostEntry, error) {
 // []hostEntry. This is the common merge logic extracted from readBPFMap
 // so both code paths share it.
 func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
+        out, err := mergeBPFMapEntriesCore(raw)
+        if err != nil {
+                return nil, err
+        }
+        // v0.9.33: cache the result for CacheBPFMap mode (legacy paths).
+        if collectorMode.CacheBPFMap {
+                bpfMapCache = out
+                bpfMapCacheErr = nil
+                bpfMapCacheAt = time.Now()
+        }
+        return out, nil
+}
+
+// mergeBPFMapEntriesCore is the pure merge (no bpfMapCache side effect)
+// used by the v0.9.134 steady path, which composes two merges per cycle
+// (live + selected corpse entries) and manages the fallback cache itself.
+func mergeBPFMapEntriesCore(raw []map[string]interface{}) ([]hostEntry, error) {
         // Merge by final labeled addr: sum instances, keep the entry
         // with more instances for the other fields (matches Python).
         merged := map[string]*hostEntry{}
@@ -641,15 +729,6 @@ func mergeBPFMapEntries(raw []map[string]interface{}) ([]hostEntry, error) {
         out := make([]hostEntry, 0, len(order))
         for _, addr := range order {
                 out = append(out, *merged[addr])
-        }
-        // v0.9.33: cache the result for CacheBPFMap mode
-        if collectorMode.CacheBPFMap {
-                bpfMapCache = out
-                bpfMapCacheErr = nil
-                bpfMapCacheAt = time.Now()
-                if bpfMapCacheSize == 0 {
-                        bpfMapCacheSize = len(raw)
-                }
         }
         return out, nil
 }
