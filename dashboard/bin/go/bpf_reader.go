@@ -180,49 +180,71 @@ var (
 const bpfMapCacheTTL = 60 * time.Second
 
 // ============================================================================
-// v0.9.132: frozen-generation cache — stop paying the corpse tax every cycle
+// v0.9.133: incremental corpse cache — flat per-cycle cost, no all-gens
+// spikes (supersedes the v0.9.132 frozen-generation cache)
 // ============================================================================
 //
-// v0.9.128 (correctness) made every cycle dump EVERY remote_host_map
-// generation, and v0.9.129 added a full all-gens scan in the picker
-// writeback. Corpse generations are FROZEN by definition — the daemon
-// abandoned them at reload and nothing writes them again — and the
-// v0.9.128 merge rules mean a corpse entry only contributes when the live
-// map does NOT have that label (same label → "gen > existing.Gen →
-// continue"). On hosts where reloads accumulated several generations this
-// multiplied the per-cycle syscall + allocation load (each 1024-byte entry
-// parses into ~230 Go objects; at 30s cycles that is pure GC churn for
-// data that cannot change) — the "corpse tax" that helped pin 1-vCPU/1GB
-// hosts at 100% CPU.
+// v0.9.132 removed the per-cycle corpse tax but kept TWO all-gens dumps:
+// the every-10th-cycle cache refresh, and the first call after startup
+// (plus every reload). On a host with N accumulated generations ONE 30s
+// cycle still dumped and parsed N x ~324 entries (~165ms CPU + ~120MB of
+// allocations at N=16, real fleet geometry) — a CPU/GC spike every ~5
+// minutes, and at startup the single largest allocation event of the
+// process's life. Worse: readMapGens holds ALL generations' parsed entries
+// live in one slice until the merge returns, so at N > ~30 the live heap
+// alone (~240MB) walks through the watchdog's strict RSS arm (250MB, no
+// startup grace, 2-strike kill) -> kill -> systemd restart -> identical
+// spike -> the memory edition of the suicide loop v0.9.132 only gave a
+// CPU-arm grace.
 //
-// The cache stores only the merge CONTRIBUTION of the corpse generations:
-// the final hostEntry list for labels the live map lacks (the Gen > 0
-// slice of the last full merge). Steady-state cycles dump ONLY the newest
-// map (gen 0 — the live one) and fold the cached contribution back in.
-// Output equivalence:
+// v0.9.133 makes the cost FLAT: every dump call reads the live map plus
+// AT MOST ONE corpse generation (round-robin), no matter how many
+// generations exist. No call ever parses more than 2 maps.
 //
-//   - corpse values are frozen, so a cached corpse entry is byte-equal to
-//     a fresh dump of the same map;
-//   - the fold applies the same "live wins per label" rule the full merge
-//     applies to corpse entries (skip when live has the label);
-//   - two corpse gens carrying the same label were already resolved by
-//     the full merge at refresh time (newest corpse wins) — the cached
-//     entry is that resolution.
+// The cache stores, per corpse-carried label, the entry of the NEWEST
+// corpse generation carrying it — the same value the full merge's
+// generation rules pick (a newer gen replaces outright, an older gen is
+// skipped). Refreshing generation rank k stores k's entries only where k
+// is the newest carrier: an existing cache entry with a LOWER rank (a
+// NEWER generation) keeps the label; a HIGHER rank (older) is overwritten.
+// Because corpses are frozen, entries older than one sweep are still
+// correct; the sweep only refreshes what the collector itself can write
+// into a corpse (picker-writeback tracker fields, every 10th pass). After
+// one full round-robin sweep the cache equals the Gen>0 slice of the full
+// all-gens merge — proven by test, including randomized generation
+// contents (v0_9_133_test.go).
 //
-// A full all-gens pass re-dumps and rebuilds the cache every
-// corpseCacheRefreshEvery dump calls (~5 min at 30s cycles) and whenever
-// the map id set changes (a reload re-ranks generations), so a label the
-// live map drops reappears within one refresh window — the only visible
-// difference from the v0.9.128-131 behaviour, bounded at one window.
+// Differences from v0.9.132, all improvements:
+//   - the every-10-cycle refresh spike is gone (one corpse map per cycle);
+//   - the startup/reload full dump is gone: warmup is incremental, one
+//     corpse generation per cycle (corpse-only labels appear over the
+//     first N cycles — logged; the live map is complete from cycle 1);
+//   - when the live map DROPS a label, the corpse fallback now appears
+//     the NEXT cycle. v0.9.132 needed the next 10-cycle refresh to even
+//     notice: its refresh-time Gen>0 slice never contained labels the
+//     then-live map carried, so a newly-dropped label lost its corpse
+//     history for up to 5 minutes.
+//
+// A reload (id set change) re-ranks generations, so the cache resets and
+// re-warms incrementally — deliberately NOT a one-shot full rebuild: the
+// reload moment is exactly when the tuner is re-initializing BPF and the
+// box is busiest; the last thing to add there is an N-map dump burst.
+// The legacy error path still computes a full all-gens merge when it runs
+// (rare); it seeds the cache from that merge for free.
 
-const corpseCacheRefreshEvery = 10 // dump calls; 30s cycles → ~5 min
+type corpseBestEnt struct {
+        ent  hostEntry
+        rank int // generation rank that supplied it (1 = newest corpse; 0 = live, unused here)
+}
 
 type corpseGenCache struct {
-        built            bool
-        ids              []int      // map id set the cache was built from (newest first)
-        labels           []hostEntry // corpse-only merged entries (Gen > 0), sorted by Addr
-        lastRefreshCall  int
-        calls            int
+        ids     []int                    // id set the cache is built from, newest first; len = generations
+        best    map[string]corpseBestEnt // corpse-carried label -> newest carrier's entry
+        labels  []hostEntry              // best values, sorted by Addr (the fold input)
+        cursor  int                      // round-robin position over corpse ranks 1..len(ids)-1
+        warmed  int                      // sweep steps completed since the last reset
+        warmDone bool                    // "warmup complete" logged once
+        calls   int                      // dump calls seen (diagnostics)
 }
 
 var (
@@ -243,34 +265,95 @@ func sameIntIDs(a, b []int) bool {
         return true
 }
 
-// corpseRefreshDue is the pure cadence/invalidity decision for the cache
-// (unit-tested in v0_9_132_perf_test.go).
-func corpseRefreshDue(c *corpseGenCache, call int, ids []int) bool {
-        if !c.built {
-                return true
+// noteIDs records the current id set and reports whether it changed (a
+// reload re-ranks generations, so a change resets the cache for an
+// incremental re-warm). Same set -> no change.
+func (c *corpseGenCache) noteIDs(ids []int) bool {
+        if c.ids != nil && sameIntIDs(c.ids, ids) {
+                return false
         }
-        if !sameIntIDs(c.ids, ids) {
-                return true // reload: id set changed → ranks and liveness moved
-        }
-        return call-c.lastRefreshCall >= corpseCacheRefreshEvery
+        c.ids = append([]int(nil), ids...)
+        c.best = map[string]corpseBestEnt{}
+        c.labels = nil
+        c.cursor = 0
+        c.warmed = 0
+        c.warmDone = false
+        return true
 }
 
-// rebuild stores the Gen > 0 slice of a full all-gens merge.
-func (c *corpseGenCache) rebuild(ids []int, merged []hostEntry, call int) {
-        c.ids = append([]int(nil), ids...)
-        c.labels = c.labels[:0]
+// nextSweepRank picks the next corpse generation to refresh (round-robin
+// over ranks 1..len(ids)-1) and advances the cursor. Returns 0 when there
+// are no corpse generations. The cursor advances per ATTEMPT, so a
+// permanently unreadable corpse is retried once per round instead of
+// stalling the sweep (its previous slice — frozen data — stays cached).
+func (c *corpseGenCache) nextSweepRank() int {
+        corpses := len(c.ids) - 1
+        if corpses <= 0 {
+                return 0
+        }
+        rank := c.cursor + 1
+        c.cursor = (c.cursor + 1) % corpses
+        return rank
+}
+
+// storeGen folds one freshly dumped + merged corpse generation (rank >= 1)
+// into the cache. k's entry wins a label only when no NEWER corpse
+// generation (lower rank) already supplies it. Returns true exactly once,
+// when the post-reset warmup completes (for the one-shot log line).
+func (c *corpseGenCache) storeGen(rank int, merged []hostEntry) bool {
+        if rank <= 0 || rank >= len(c.ids) {
+                return false
+        }
         for _, h := range merged {
-                if h.Gen > 0 {
-                        c.labels = append(c.labels, h)
+                if cur, ok := c.best[h.Addr]; ok && cur.rank < rank {
+                        continue // a newer corpse generation supplies this label
+                }
+                c.best[h.Addr] = corpseBestEnt{ent: h, rank: rank}
+        }
+        c.recomputeLabels()
+        if c.warmed < len(c.ids)-1 {
+                c.warmed++
+                if c.warmed == len(c.ids)-1 && !c.warmDone {
+                        c.warmDone = true
+                        return true
                 }
         }
-        sort.Slice(c.labels, func(i, j int) bool { return c.labels[i].Addr < c.labels[j].Addr })
-        c.built = true
-        c.lastRefreshCall = call
+        return false
 }
 
-// fold appends cached corpse-only labels that the live merge does not have
-// — the same "live wins per label" rule the full merge applies to corpse
+// recomputeLabels rebuilds the sorted fold input from best.
+func (c *corpseGenCache) recomputeLabels() {
+        out := make([]hostEntry, 0, len(c.best))
+        for _, b := range c.best {
+                out = append(out, b.ent)
+        }
+        sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
+        c.labels = out
+}
+
+// seedFromFullMerge installs the Gen>0 slice of a full all-gens merge —
+// the exact end state a completed round-robin sweep converges to. Used by
+// the legacy error path, which already paid for the full dump.
+func (c *corpseGenCache) seedFromFullMerge(ids []int, merged []hostEntry) {
+        c.ids = append([]int(nil), ids...)
+        c.best = map[string]corpseBestEnt{}
+        for _, h := range merged {
+                if h.Gen > 0 {
+                        c.best[h.Addr] = corpseBestEnt{ent: h, rank: h.Gen}
+                }
+        }
+        if n := len(ids) - 1; n > 0 {
+                c.warmed = n
+        } else {
+                c.warmed = 0
+        }
+        c.cursor = 0
+        c.warmDone = true
+        c.recomputeLabels()
+}
+
+// fold appends cached corpse labels that the live merge does not have —
+// the same "live wins per label" rule the full merge applies to corpse
 // entries. The returned slice may alias live when there is nothing to add.
 func (c *corpseGenCache) fold(live []hostEntry) []hostEntry {
         if len(c.labels) == 0 {
@@ -289,58 +372,82 @@ func (c *corpseGenCache) fold(live []hostEntry) []hostEntry {
         return out
 }
 
+// readGenTagged dumps ONE map by its rank in mapIDs and tags every entry
+// with that rank. readMapGens cannot be reused here: it ranks by the list
+// passed to it, so a single-element list would tag a corpse as gen 0
+// (live).
+func readGenTagged(mapIDs []int, rank int) ([]map[string]interface{}, error) {
+        raw, err := readRemoteHostMapByID(mapIDs[rank])
+        if err != nil {
+                return nil, err
+        }
+        for i := range raw {
+                raw[i]["map_gen"] = float64(rank)
+        }
+        return raw, nil
+}
+
 func readBPFMap() ([]hostEntry, error) {
-        // v0.9.132: resolve the id set up front — the steady-state path needs
-        // it to decide between a full refresh pass and a live-only dump.
+        // v0.9.133: resolve the id set up front; the sweep plan and the
+        // reload reset both hang off it.
         mapIDs, idErr := resolveRemoteHostMapIDs()
 
         corpseCacheMu.Lock()
         corpseCache.calls++
-        refresh := idErr == nil && corpseRefreshDue(&corpseCache, corpseCache.calls, mapIDs)
-        if idErr != nil {
-                corpseCache.built = false // can't plan — force a refresh next time
+        sweepRank := 0
+        reload := false
+        if idErr == nil {
+                reload = corpseCache.noteIDs(mapIDs)
+                sweepRank = corpseCache.nextSweepRank()
         }
         corpseCacheMu.Unlock()
+        if reload && len(mapIDs) > 1 {
+                fmt.Fprintf(os.Stderr, "corpse cache: map set changed (%d generations) — re-warming corpse data 1 gen/cycle\n", len(mapIDs))
+        }
 
-        if idErr == nil {
-                if refresh {
-                        // Full pass: dump EVERY generation, merge, rebuild the cache.
-                        // Identical to the v0.9.128-131 per-cycle behaviour.
-                        raw, err := readMapGens(mapIDs)
-                        if err == nil {
+        if idErr == nil && len(mapIDs) > 0 {
+                // (1) Sweep step: dump ONE corpse generation (round-robin).
+                // A dump failure keeps the previous slice — corpse data is
+                // frozen, so a stale slice is still correct; the id-set
+                // check catches maps that actually disappear.
+                if sweepRank > 0 {
+                        if raw, err := readGenTagged(mapIDs, sweepRank); err == nil {
                                 if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
                                         corpseCacheMu.Lock()
-                                        corpseCache.rebuild(mapIDs, merged, corpseCache.calls)
+                                        warmDone := corpseCache.storeGen(sweepRank, merged)
                                         corpseCacheMu.Unlock()
-                                        return merged, nil
-                                }
-                        }
-                        // fall through to the legacy path on any failure
-                } else if len(mapIDs) > 0 {
-                        // Steady state: dump ONLY the newest generation (the live map).
-                        if raw, err := readMapGens(mapIDs[:1]); err == nil {
-                                if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
-                                        corpseCacheMu.Lock()
-                                        out := corpseCache.fold(merged)
-                                        corpseCacheMu.Unlock()
-                                        // mergeBPFMapEntries cached the live-only merge for the
-                                        // fallback path; replace it with the folded result so a
-                                        // fallback snapshot still carries the corpse-only labels.
-                                        if collectorMode.CacheBPFMap {
-                                                bpfMapCache = out
-                                                bpfMapCacheErr = nil
-                                                bpfMapCacheAt = time.Now()
+                                        if warmDone {
+                                                fmt.Fprintf(os.Stderr, "corpse cache: warmup complete (%d corpse gens, %d labels) — steady state\n",
+                                                        len(mapIDs)-1, len(corpseCache.labels))
                                         }
-                                        return out, nil
                                 }
                         }
-                        // fall through to the legacy path on any failure
                 }
+                // (2) Live dump: ONLY the newest generation.
+                if raw, err := readMapGens(mapIDs[:1]); err == nil {
+                        if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
+                                corpseCacheMu.Lock()
+                                out := corpseCache.fold(merged)
+                                corpseCacheMu.Unlock()
+                                // mergeBPFMapEntries cached the live-only merge for the
+                                // fallback path; replace it with the folded result so a
+                                // fallback snapshot still carries the corpse-only labels.
+                                if collectorMode.CacheBPFMap {
+                                        bpfMapCache = out
+                                        bpfMapCacheErr = nil
+                                        bpfMapCacheAt = time.Now()
+                                }
+                                return out, nil
+                        }
+                }
+                // fall through to the legacy path on any failure
         }
 
         // Legacy path (v0.9.128): dump EVERY remote_host_map generation by ID,
         // newest first, tagged with its generation index. Kept as the fallback
         // for read errors, and as the whole path when id resolution failed.
+        // It re-pays the full dump cost ONCE on the error path and seeds the
+        // incremental cache from the result, so the next cycle is flat again.
         raw, sysErr := readBPFMapSyscall()
         if sysErr == nil && len(raw) >= 0 {
                 // v0.9.127: no count-based early return here. The full dump was
@@ -348,6 +455,14 @@ func readBPFMap() ([]hostEntry, error) {
                 // when the count matches froze every in-place metric update
                 // (rate_ema, streaks, swap_score) out of the leaderboard.
                 bpfMapCacheSize = len(raw)
+                if merged, mErr := mergeBPFMapEntries(raw); mErr == nil {
+                        if ids, rErr := resolveRemoteHostMapIDs(); rErr == nil {
+                                corpseCacheMu.Lock()
+                                corpseCache.seedFromFullMerge(ids, merged)
+                                corpseCacheMu.Unlock()
+                        }
+                        return merged, nil
+                }
                 return mergeBPFMapEntries(raw)
         }
         // v0.9.111: tell the operator WHY we are forking bpftool (once/10min).

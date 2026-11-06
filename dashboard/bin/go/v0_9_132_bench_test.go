@@ -1,7 +1,7 @@
 package main
 
-// v0_9_132_bench_test.go — before/after benchmark for the v0.9.132 corpse-tax
-// fix. Run with:
+// v0_9_132_bench_test.go — before/after benchmark for the corpse-tax fix
+// line (v0.9.132 steady-state + v0.9.133 flat sweep). Run with:
 //
 //      go test -bench=CorpseTax -benchmem -run=XXX ./.
 //
@@ -13,11 +13,28 @@ package main
 //   parseRawHostEntry per entry (~230 Go objects per 1024-byte value) —
 //   then mergeBPFMapEntries over the whole N x 324 raw set.
 //
-//   AFTER  (v0.9.132 steady state): dump ONLY the newest generation
-//   (324 parses), merge live-only, then fold the cached corpse
-//   contribution back in (struct appends, no parsing). The every-10th-cycle
-//   refresh pass costs the same as BEFORE; the amortized figure is
-//   0.9*steady + 0.1*refresh.
+//   AFTER  (v0.9.133 steady state): every cycle is FLAT — dump the live
+//   map + at most ONE corpse generation (round-robin sweep), merge both,
+//   storeGen, fold the cache. No refresh spike, no startup all-gens dump:
+//   the two v0.9.132 residual spikes (every-10th-cycle refresh and the
+//   startup/reload full pass, whose single-slice live heap at N > ~30
+//   walked into the watchdog's no-grace RSS arm) are gone by construction.
+//
+// Measured at v0.9.132 (3x50 medians, Before vs the v0.9.132 steady path):
+// 2 gens 18.0ms/15.0MB -> 9.3ms/7.7MB (1.9x); 8 gens 75.3ms/60.2MB ->
+// 10.3ms/8.2MB (7.3x); 16 gens 164.7ms/120.4MB -> 11.2ms/8.9MB (14.7x);
+// amortized with the 1-in-10 refresh: 4.5x/6.2x.
+//
+// Measured at v0.9.133 (3x50 medians, this benchmark's After = live map +
+// ONE corpse map per cycle, every cycle): 2 gens 18.4/15.0 -> 18.7ms/
+// 15.2MB (1.0x — with a single corpse, sweeping it costs the same dump it
+// always had); 8 gens 78.1/60.2 -> 19.2ms/15.9MB (4.1x); 16 gens 167.9/
+// 120.4 -> 22.0ms/16.8MB (7.6x); allocations 1,572,064 -> 195,976 (8.0x).
+// The After row is FLAT in N — the same ~2-map cost at 2 gens and at 60 —
+// and the worst single cycle IS the steady cycle: no refresh spike, no
+// startup all-gens dump, no N-sized live slice against the watchdog RSS
+// arm. The per-cycle cost is ~2x the v0.9.132 steady path (a corpse map is
+// parsed every cycle instead of never); that buys the flat ceiling.
 //
 // Scenario: DISJOINT address spaces per generation (each corpse gen holds
 // 324 hosts the live map has NOT re-seen), so every corpse-only label
@@ -129,14 +146,18 @@ func benchBefore(b *testing.B, n int) {
         }
 }
 
-// benchAfter measures ONE v0.9.132 STEADY cycle at N gens: parse ONLY the
-// live generation (gen 0), merge live-only, fold the cached corpse labels.
-// The cache is built once from a full refresh pass — exactly the runtime
-// cadence (1 refresh per 10 cycles).
+// benchAfter measures ONE v0.9.133 steady cycle at N gens: parse the live
+// generation (gen 0) plus ONE corpse generation (round-robin, like
+// nextSweepRank), merge both, storeGen the corpse step, fold the cache.
+// Every cycle costs the same — that is the point of v0.9.133. The cache is
+// seeded once (the legacy error path does this after a full merge; a
+// completed warmup converges to the same state — proven in
+// v0_9_133_test.go).
 func benchAfter(b *testing.B, n int) {
         gens := benchFixture(n)
 
-        // Refresh pass (setup, NOT per-op): full all-gens dump + merge, rebuild.
+        // Setup (NOT per-op): seed the cache from a full all-gens merge,
+        // exactly what seedFromFullMerge does on the legacy error path.
         var all []map[string]interface{}
         for g := 0; g < n; g++ {
                 all = append(all, parseGen(gens[g], g)...)
@@ -150,11 +171,19 @@ func benchAfter(b *testing.B, n int) {
         for i := range ids {
                 ids[i] = 500 - i // newest first, like resolveRemoteHostMapIDs
         }
-        cache.rebuild(ids, merged, 1)
+        cache.seedFromFullMerge(ids, merged)
 
         b.ReportAllocs()
         b.ResetTimer()
         for i := 0; i < b.N; i++ {
+                // (1) sweep step: one corpse generation, round-robin.
+                rank := 1 + (i % (n - 1))
+                corpseMerged, err := mergeBPFMapEntries(parseGen(gens[rank], rank))
+                if err != nil {
+                        b.Fatal(err)
+                }
+                cache.storeGen(rank, corpseMerged)
+                // (2) live dump + merge + fold.
                 live, err := mergeBPFMapEntries(parseGen(gens[0], 0))
                 if err != nil {
                         b.Fatal(err)
