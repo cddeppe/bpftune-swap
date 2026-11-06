@@ -395,6 +395,33 @@ static int pin_alias_map(struct bpftuner *tuner)
         return 0;
 }
 
+/* 0.4.108: count remote_host_map generations present system-wide (see
+ * init()). Uses the same id-walk idiom as the old-attachment sweep in
+ * libbpftune.c. Needs CAP_BPF (or root) to walk ids; a failure simply
+ * counts nothing and the log line is skipped. */
+static int count_remote_host_maps(void)
+{
+        struct bpf_map_info info = {};
+        __u32 last_id = 0, next_id = 0;
+        __u32 len = sizeof(info);
+        int count = 0, fd;
+
+        while (bpf_map_get_next_id(last_id, &next_id) == 0) {
+                last_id = next_id;
+                fd = bpf_map_get_fd_by_id(next_id);
+                if (fd < 0)
+                        continue;
+                memset(&info, 0, sizeof(info));
+                len = sizeof(info);
+                if (!bpf_obj_get_info_by_fd(fd, &info, &len) &&
+                    !strncmp(info.name, "remote_host_map",
+                             sizeof(info.name)))
+                        count++;
+                close(fd);
+        }
+        return count;
+}
+
 int init(struct bpftuner *tuner)
 {
         struct bpftunable *t;
@@ -419,6 +446,23 @@ int init(struct bpftuner *tuner)
          */
         bpftuner_cgroup_detach(tuner, CONN_TUNER_BPF, BPF_CGROUP_SOCK_OPS);
         bpftuner_cgroup_detach(tuner, CONN_TUNER_VOTE_BPF, BPF_CGROUP_SOCK_OPS);
+
+        /* 0.4.108: count leftover remote_host_map generations BEFORE we
+         * create ours. Each survivor is a corpse — a map from a previous
+         * tuner life that is still referenced (leaked skeleton fds or a
+         * zombie cgroup attachment the sweep just tried to remove). The
+         * collector merges every generation it finds, so each one of
+         * these is per-cycle cost + stale-data risk on the dashboard.
+         * Logged so one daemon restart PROVES whether the sweep works:
+         * 0 here means clean; >0 means holders survived THIS restart. */
+        {
+                int leftovers = count_remote_host_maps();
+
+                if (leftovers > 0)
+                        bpftune_log(BPFTUNE_LOG_LEVEL,
+                                    "init: %d leftover remote_host_map generation(s) after old-attachment sweep\n",
+                                    leftovers);
+        }
 
         err = bpftuner_bpf_init(tcp_conn, tuner, NULL);
         if (err)
@@ -1140,8 +1184,19 @@ static void start_reanchor(struct bpftuner *tuner)
         struct bpf_map *map;
         int fd;
 
-        if (reanchor_started)
-                return;
+        if (reanchor_started) {
+                /* 0.4.108: init() runs again when the tuner is re-loaded
+                 * under a live daemon (inotify IN_CREATE). The old guard
+                 * silently returned, leaving the reanchor worker on the
+                 * PREVIOUS map generation's fd: after a re-init the live
+                 * map stopped receiving reanchor updates entirely (stale
+                 * rate_best_i/rate_best_v swap targets — the collector
+                 * has patched around this since v0.9.129). Stop the
+                 * worker so it restarts on the new fd below. */
+                bpftune_log(BPFTUNE_LOG_LEVEL,
+                            "reanchor: map re-initialized; retargeting worker to the new generation\n");
+                stop_reanchor();
+        }
 
         map = bpftuner_bpf_map_get(tcp_conn, tuner, remote_host_map);
         if (!map) {

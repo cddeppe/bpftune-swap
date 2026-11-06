@@ -1,3 +1,46 @@
+bpftune (0.4.108) unstable; urgency=medium
+
+  * corpse maps: stop creating them, prove their existence at init.
+    Based on 0.4.106 EXACTLY (the deployed fleet version) — deliberately
+    does NOT include the unreleased 0.4.107 tail-call work.
+    Root cause chain (why remote_host_map generations accumulate and why
+    a daemon restart does not reliably clear them):
+    - inotify IN_DELETE handler never matched a tuner (strstr of the bare
+      file name against the tuner's FULL path — always longer, never a
+      substring), so removing a .so left its tuner registered and its BPF
+      object (skeleton fds, sockops attachments, map generations) alive
+      forever;
+    - inotify IN_CREATE appended a DUPLICATE tuner for the same library
+      without fini'ing the previous one: the old skeleton kept the old
+      map generation's fds open (the "corpse" maps the collector has to
+      merge around), and the old tuner's reanchor worker kept the old fd
+      (stale rate_best_i/rate_best_v swap targets — collector patched
+      around it since v0.9.129);
+    - cgroup sockops attachments are BPF_F_ALLOW_MULTI: they outlive the
+      process that attached them, and bpf_prog_detach2 removes ONE
+      attachment per call, so a double-attach (the 0.4.79 restart race)
+      could survive the startup sweep.
+    Fixes:
+    - bpftune.c: IN_DELETE now matches on the file name (basename of
+      tuner->name vs event->name);
+    - libbpftune.c: __bpftuner_init finis (detach + save state +
+      destroy skeleton) any ACTIVE tuner of the same library name BEFORE
+      the new init(), so no duplicate is ever appended and the freshest
+      state is restored;
+    - libbpftune.c: the startup old-attachment sweep now loops
+      bpf_prog_detach2 until it fails (max 8) and logs the count at
+      LOG_NOTICE;
+    - tcp_conn_tuner.c: start_reanchor no longer silently returns when
+      already started — it retargets the worker to the re-initialized
+      map (stop + restart on the new fd);
+    - tcp_conn_tuner.c: init() logs the number of leftover
+      remote_host_map generations present after the old-attachment
+      sweep. 0 = clean; >0 = holders survived this daemon start (leaked
+      fds from another process or a zombie attachment the sweep could
+      not remove) — one restart now PROVES whether the sweep works.
+
+ -- cddeppe <91772433+cddeppe@users.noreply.github.com>  Fri, 06 Nov 2026 21:13:21 +0000
+
 bpftune (0.4.106) unstable; urgency=medium
 
   * net_buffer_tuner: fix aggressive netdev_budget_usecs increases on

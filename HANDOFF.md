@@ -1573,6 +1573,70 @@ Fixed in installer source and on all four hosts.
 - **`rate=` in met printk is `rate_term`, not a rate.**  If an
   analysis claims a rate divergence, check which field was read.
 
+## SESSION 2026-11-06 — 0.4.108: corpse maps stopped at the source (based on 0.4.106)
+
+Branch: `v0.4.108-corpse-fix` off tag `v0.4.106` (the DEPLOYED version —
+all hosts run 0.4.106; the unreleased 0.4.107 tail-call work on `main` is
+deliberately NOT included).
+
+Why: the collector side has merged multiple remote_host_map generations
+since v0.9.128 ("corpse" maps — frozen values, held alive, nothing
+writing them).  Hosts accumulated 16+ generations.  Operational fact: a
+daemon restart does NOT reliably clear them.  This release closes every
+leak path that creates them under a running daemon, and adds the init-time
+count that proves the leftover situation on every start.
+
+The corpse factory (all four verified in the 0.4.106 source):
+
+1. `bpftune.c` inotify IN_DELETE: `strstr(event->name, tuner->name)`
+   compared the bare file name ("libtcp_conn_tuner.so") against the
+   tuner's FULL path — never a match.  A removed .so's tuner stayed
+   registered forever: skeleton fds open (map generations), sockops
+   progs attached.
+2. `libbpftune.c` __bpftuner_init: IN_CREATE of the same .so name
+   APPENDED a duplicate tuner (the stale header comment even claims "or
+   replace existing inactive tuner" — it did neither).  Old object
+   leaked: progs still attached (BPF_F_ALLOW_MULTI), old map alive on
+   the old skeleton's fds, nothing writing it (its reanchor worker held
+   the old fd — the stale-swap-target bug the collector's
+   picker_writeback.go has patched around since v0.9.129).
+3. `libbpftune.c` startup sweep: bpf_prog_detach2 removes ONE
+   attachment per call; the 0.4.79 restart race could double-attach, so
+   a single detach could leave a zombie.  ZOMBIE ATTACHED PROGS PIN
+   THEIR MAPS — this is why a kill -9'd daemon leaves generations that
+   only the NEXT start's sweep can clear (and why a failed sweep makes
+   "restart does not take care of it" true).
+4. `tcp_conn_tuner.c` start_reanchor: `if (reanchor_started) return;`
+   kept the worker on the OLD map fd across any re-init without fini.
+
+Fixes (see debian/changelog 0.4.108 for the user-facing summary):
+- IN_DELETE matches on the basename;
+- __bpftuner_init finis same-name ACTIVE tuners before the new init
+  (state saved first, so the new restore reads the freshest data);
+- the sweep loops detach2 until failure (max 8) and logs the count;
+- start_reanchor retargets (stop + restart) instead of returning;
+- init() logs "N leftover remote_host_map generation(s) after
+  old-attachment sweep" — the fleet diagnostic: 0 = clean, >0 = holders
+  survived THIS restart (name it and it can be hunted).
+
+Verification in the build sandbox: bpftune.c and libbpftune.c compile
+clean with gcc -fsyntax-only -Wall -Wextra against libbpf 1.5.0 headers
+(only pre-existing sign-compare warnings); the new tuner-side functions
+compile verbatim in an extraction harness.  Full .bpf.o/skeleton build
+needs clang+bpftool (not available in sandbox) — build the .deb on the
+arm64 builder before deploying.
+
+Deploy notes:
+- The collector's v0.9.133 (flat corpse cost) makes the collector safe
+  REGARDLESS of generation count — 0.4.108 stops the pileup at the
+  source.  Ship order does not matter; both are independent.
+- After deploying 0.4.108, one daemon restart per host should log
+  "0 leftover" within the first init.  If it logs >0, the journal line
+  tells us exactly which hosts still hold zombie references — that is
+  the "restart doesn't fix it" case, and now it is observable.
+- Collector update-dashboard/deploy scripts are untouched.
+
+
 ## SESSION 2026-09-18 (morning) — 0.4.45 swap target uses rate EMA
 
 Replaces the composite-metric swap TARGET with a per-algorithm rate

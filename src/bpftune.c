@@ -161,7 +161,17 @@ void *inotify_thread(void *arg)
 					ringbuf_map_fd = bpftuner_ring_buffer_map_fd(tuner);
 			} else if (event->mask & IN_DELETE) {
 				bpftune_for_each_tuner(tuner) {
-					if (!strstr(event->name, tuner->name))
+					/* 0.4.108: match on the FILE NAME.  The old
+					 * strstr(event->name, tuner->name) compared the bare
+					 * file name against the tuner's FULL path (always
+					 * longer) and never matched, so removing a .so left
+					 * its tuner registered and its BPF object (skeleton
+					 * fds, sockops attachments, map generations) alive
+					 * forever. */
+					const char *base = strrchr(tuner->name, '/');
+
+					base = base ? base + 1 : tuner->name;
+					if (!base || strcmp(base, event->name))
 						continue;
 					bpftune_log(BPFTUNE_LOG_LEVEL, "removed '%s', fini tuner %s\n",
 						    library_path, tuner->name);

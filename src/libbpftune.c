@@ -460,10 +460,23 @@ void bpftuner_cgroup_detach(struct bpftuner *tuner, const char *prog_name,
 				continue;
 			if (!bpf_obj_get_info_by_fd(prog_fd, &info, &info_len) &&
 			    strncmp(info.name, prog_name, sizeof(info.name) - 1) == 0) {
-				bpftune_log(LOG_DEBUG, "detaching old BPF program '%s'\n",
-					    prog_name); 
-				if (bpf_prog_detach2(prog_fd, cgroup_fd,
-						     attach_type)) {
+				int detached = 0;
+
+				/* 0.4.108: BPF_F_ALLOW_MULTI allows the same prog
+				 * to be attached several times (the 0.4.79 restart
+				 * race could double-attach), and bpf_prog_detach2
+				 * removes ONE attachment per call.  Loop until it
+				 * fails so no zombie attachment survives the sweep.
+				 */
+				while (detached < 8 &&
+				       !bpf_prog_detach2(prog_fd, cgroup_fd,
+							 attach_type))
+					detached++;
+				if (detached) {
+					bpftune_log(BPFTUNE_LOG_LEVEL,
+						    "detached %d old attachment(s) of BPF program '%s'\n",
+						    detached, prog_name);
+				} else if (errno != ENOENT) {
 					err = -errno;
 					bpftune_log(LOG_ERR,
 						    "error detaching old prog %s fd %d, cgroup fd %d: %s\n",
@@ -826,6 +839,38 @@ static struct bpftuner *__bpftuner_init(const char *path, int fd)
 	}
 	/* optional summarize function */
 	tuner->summarize = dlsym(tuner->handle, "summarize");
+
+	/* 0.4.108: a tuner .so can be re-created under a running daemon
+	 * (inotify IN_CREATE after an upgrade).  The old code APPENDED a
+	 * duplicate tuner and leaked the previous one's BPF object: its
+	 * skeleton kept the old remote_host_map generation's fds open (the
+	 * "corpse" maps the collector has to merge around), and nothing ever
+	 * ran its fini.  Fini (detach progs, save state, destroy skeleton)
+	 * any ACTIVE tuner of the same library name first -- BEFORE the new
+	 * init(), so the old tuner's state save is not clobbered and the new
+	 * restore reads the freshest state.
+	 */
+	{
+		const char *newbase = strrchr(path, '/');
+		const char *tbase;
+		unsigned int i;
+
+		newbase = newbase ? newbase + 1 : path;
+		for (i = 0; i < bpftune_num_tuners; i++) {
+			struct bpftuner *t = bpftune_tuners[i];
+
+			if (!t || !t->name || t->state != BPFTUNE_ACTIVE)
+				continue;
+			tbase = strrchr(t->name, '/');
+			tbase = tbase ? tbase + 1 : t->name;
+			if (strcmp(tbase, newbase))
+				continue;
+			bpftune_log(BPFTUNE_LOG_LEVEL,
+				    "lib %s re-created under a running daemon: fini'ing existing tuner %s (state saved, old BPF object freed)\n",
+				    newbase, t->name);
+			bpftuner_fini(t, BPFTUNE_INACTIVE);
+		}
+	}
 
 	bpftune_log(LOG_DEBUG, "calling init for '%s\n", path);
 	err = tuner->init(tuner);
